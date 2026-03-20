@@ -1,0 +1,88 @@
+name: 🐛 Bug Report
+description: Report a bug or crash
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below to help us investigate.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of the project is affected?
+      options:
+        - Modloader Core (C++)
+        - Lua API
+        - Specific Mod
+        - Deploy Tools
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: quest-model
+    attributes:
+      label: Quest Model
+      description: Which Quest headset are you using?
+      placeholder: "e.g., Quest 3, Quest 2, Quest Pro"
+    validations:
+      required: true
+
+  - type: input
+    id: game-version
+    attributes:
+      label: Game & Modloader Version
+      description: Game version and modloader version
+      placeholder: "e.g., RE4 VR 1.0.3, Modloader v3.0.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear description of what the bug is.
+      placeholder: "What happened? What did you expect to happen?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this issue?
+      placeholder: |
+        1. Install mod X
+        2. Launch the game
+        3. Open the debug menu
+        4. Select option Y
+        5. Crash occurs
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Paste relevant log output here. Get logs with:
+        `python tools/deploy.py log` (UEModLoader.log)
+        `python tools/deploy.py tombstones` (crash dumps)
+      render: text
+
+  - type: textarea
+    id: mod-code
+    attributes:
+      label: Relevant Mod Code
+      description: If this involves a specific mod, paste the relevant code.
+      render: lua
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other information that might help.

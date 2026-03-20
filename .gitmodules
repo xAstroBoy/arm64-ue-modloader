@@ -1,0 +1,3 @@
+[submodule "modloader/third_party/dobby"]
+	path = modloader/third_party/dobby
+	url = https://github.com/jmpews/Dobby.git

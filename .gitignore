@@ -1,0 +1,103 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Quest UE4 Modloader — .gitignore
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Build output ──────────────────────────────────────────────────────
+modloader/build/
+*.so
+*.o
+*.a
+*.obj
+*.lib
+*.dll
+*.dylib
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+.ninja_deps
+.ninja_log
+build.ninja
+
+# ── Game assets (copyrighted — NEVER commit) ──────────────────────────
+PAKS/
+PAKS_extracted/
+
+# ── SDK dump (auto-generated from device, 5400+ files) ───────────────
+Current Modloader SDK/
+
+# ── Reference projects (vendored, not ours) ──────────────────────────
+RE-UE4SS/
+
+# ── sol2 full repo clone (only sol2/include/ is used) ────────────────
+modloader/third_party/sol2_repo/
+
+# ── Junk / experimental ──────────────────────────────────────────────
+Junk/
+
+# ── Logs & crash dumps ───────────────────────────────────────────────
+logs/
+*.log
+*.tombstone
+
+# ── Local deploy configs (contain device IPs, paths) ─────────────────
+_sftp_batch.txt
+_sftp_deploy.txt
+
+# ── Test scripts (personal, device-specific) ─────────────────────────
+testers/
+tools/_*.py
+tools/test_*.py
+tools/bridge_test.py
+tools/raw_*.py
+tools/*_probe*.py
+tools/probe_*.py
+tools/menu_probe*.py
+tools/deep_probe.py
+tools/*_diag.py
+tools/modify_*.py
+tools/stress_test.py
+tools/launchre4.py
+tools/__pycache__/
+tools/*.log
+tools/extracted_pak/
+tools/bin/
+tools/repak/
+
+# ── Backup / old version files ───────────────────────────────────────
+*_backup.lua
+*.bak
+*.orig
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# ── IDE / Editor ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── APK & signing ────────────────────────────────────────────────────
+*.apk
+*.idsig
+*.keystore
+
+# ── SSH keys (NEVER commit) ──────────────────────────────────────────
+*.pem
+*.key
+id_rsa*
+quest_root*
+
+# ── Lua IntelliSense (local config) ──────────────────────────────────
+.luarc.json
+
+# ── UE4SS reference doc (large) ──────────────────────────────────────
+UE4SS_LUA_API_COMPLETE_REFERENCE.md

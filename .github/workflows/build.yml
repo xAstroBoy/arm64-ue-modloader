@@ -1,0 +1,108 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NDK_VERSION: '23.1.7779620'
+  CMAKE_VERSION: '3.22.1'
+
+jobs:
+  build:
+    name: Build libmodloader.so
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;23.1.7779620'
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: Configure CMake
+        working-directory: modloader
+        run: |
+          mkdir -p build && cd build
+          cmake -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+
+      - name: Build
+        working-directory: modloader/build
+        run: ninja -j$(nproc)
+
+      - name: Verify output
+        run: |
+          ls -la modloader/build/libmodloader.so
+          file modloader/build/libmodloader.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmodloader-arm64
+          path: modloader/build/libmodloader.so
+          retention-days: 30
+
+  package:
+    name: Package Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libmodloader-arm64
+          path: release/
+
+      - name: Package mods
+        run: |
+          mkdir -p release/mods
+          # Copy all mods
+          for mod in mods/*/; do
+            mod_name=$(basename "$mod")
+            mkdir -p "release/mods/$mod_name"
+            cp "$mod"*.lua "release/mods/$mod_name/" 2>/dev/null || true
+            cp "$mod"*.pak "release/mods/$mod_name/" 2>/dev/null || true
+          done
+          # Copy tools
+          mkdir -p release/tools
+          cp tools/deploy.py release/tools/
+          # Copy examples
+          cp -r examples/ release/examples/ 2>/dev/null || true
+          # Copy docs
+          cp README.md release/
+          cp LICENSE release/
+          cp docs/LUA_API.md release/
+
+      - name: Create archive
+        run: |
+          cd release
+          zip -r ../quest-ue4-modloader-${{ github.ref_name }}.zip .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: quest-ue4-modloader-${{ github.ref_name }}.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
