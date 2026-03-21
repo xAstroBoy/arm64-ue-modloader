@@ -80,7 +80,7 @@ The modloader is injected as a shared library (`libmodloader.so`) and provides:
 
 - **Meta Quest** (Quest 2/3/Pro) with developer mode enabled
 - **ADB** installed and device connected (USB or wireless)
-- **Root access** on Quest (required for library injection)
+- *APK Patching* Required to load libmodloader.so 
 - **Android NDK r23c** (for building from source — see [Building](#building))
 - **Python 3.8+** (for deployment tools)
 
