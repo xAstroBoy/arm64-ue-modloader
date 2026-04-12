@@ -9,7 +9,6 @@ on:
 
 env:
   NDK_VERSION: '23.1.7779620'
-  CMAKE_VERSION: '3.22.1'
 
 jobs:
   build:
@@ -23,19 +22,23 @@ jobs:
           submodules: recursive
 
       - name: Setup Android NDK
-        uses: android-actions/setup-android@v3
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
         with:
-          packages: 'ndk;23.1.7779620'
+          ndk-version: r23c
+          add-to-path: false
 
       - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@master
 
       - name: Configure CMake
         working-directory: modloader
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           mkdir -p build && cd build
           cmake -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-24 \
             -DANDROID_STL=c++_static \
@@ -76,13 +79,16 @@ jobs:
 
       - name: Package mods
         run: |
-          mkdir -p release/mods
-          # Copy all mods
-          for mod in mods/*/; do
-            mod_name=$(basename "$mod")
-            mkdir -p "release/mods/$mod_name"
-            cp "$mod"*.lua "release/mods/$mod_name/" 2>/dev/null || true
-            cp "$mod"*.pak "release/mods/$mod_name/" 2>/dev/null || true
+          # Copy game-specific mods (re4, pfx, etc.)
+          for game_dir in mods/*/; do
+            game=$(basename "$game_dir")
+            for mod in "$game_dir"*/; do
+              [ -d "$mod" ] || continue
+              mod_name=$(basename "$mod")
+              mkdir -p "release/mods/$game/$mod_name"
+              cp "$mod"*.lua "release/mods/$game/$mod_name/" 2>/dev/null || true
+              cp "$mod"*.pak "release/mods/$game/$mod_name/" 2>/dev/null || true
+            done
           done
           # Copy tools
           mkdir -p release/tools
