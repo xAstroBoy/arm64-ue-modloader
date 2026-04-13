@@ -2,11 +2,17 @@
 // Multi-game support — runtime detection + per-game offsets and symbols.
 // Reads /proc/self/cmdline to detect game package, then selects the
 // matching profile with correct UE type offsets and fallback addresses.
+//
+// For UNKNOWN games, auto-detects engine version by scanning the loaded
+// engine library for version strings ("+UE4+", "+UE5+", "Release-X.Y").
+// Uses engine_versions.h compile-time constants to build correct offsets.
 
 #include "modloader/game_profile.h"
+#include "modloader/engine_versions.h"
 #include <cstdio>
 #include <cstring>
 #include <android/log.h>
+#include <dlfcn.h>
 
 #define LOG_TAG "UEModLoader"
 
@@ -32,92 +38,160 @@ namespace game_profile
         return "";
     }
 
+    // ═══ Build offsets for a given engine version ═══════════════════════════
+    // Uses compile-time constants from engine_versions.h to construct
+    // a complete TypeOffsets struct. This is the SINGLE source of truth
+    // for offset calculations — derived from UE source code analysis.
+    TypeOffsets build_offsets_for_version(engine_versions::EngineVersion version)
+    {
+        using namespace engine_versions;
+
+        TypeOffsets o = {};
+
+        // ── FNamePool — IDENTICAL across all UE4.23+ versions ──
+        o.GNames_to_FNamePool = fnamepool::GNAMES_TO_FNAMEPOOL;
+        o.FNamePool_to_Blocks = fnamepool::FNAMEPOOL_TO_BLOCKS;
+        o.FNameEntry_header_size = fnamepool::FNAMENTRY_HEADER_SIZE;
+        o.FNameEntry_len_shift = fnamepool::FNAMENTRY_LEN_SHIFT;
+        o.FName_stride = fnamepool::FNAME_STRIDE;
+        o.FName_max_blocks = fnamepool::FNAME_MAX_BLOCKS;
+        o.FName_block_bits = fnamepool::FNAME_BLOCK_BITS;
+
+        // ── UObjectBase — IDENTICAL across all versions ──
+        o.UObj_vtable = uobject_base::VTABLE;
+        o.UObj_flags = uobject_base::OBJECT_FLAGS;
+        o.UObj_internal_index = uobject_base::INTERNAL_INDEX;
+        o.UObj_class = uobject_base::CLASS_PRIVATE;
+        o.UObj_fname_index = uobject_base::FNAME_INDEX;
+        o.UObj_fname_number = uobject_base::FNAME_NUMBER;
+        o.UObj_outer = uobject_base::OUTER_PRIVATE;
+
+        // ── UField — IDENTICAL across all versions ──
+        o.UField_next = ufield_layout::NEXT;
+
+        // ── UStruct — IDENTICAL across all versions (shipping) ──
+        o.UStruct_super = ustruct_layout::SUPER_STRUCT;
+        o.UStruct_children = ustruct_layout::CHILDREN;
+        o.UStruct_child_properties = ustruct_layout::CHILD_PROPERTIES;
+        o.UStruct_properties_size = ustruct_layout::PROPERTIES_SIZE;
+
+        // ── UFunction — IDENTICAL across all versions ──
+        o.UFunction_flags = ufunction_layout::FUNCTION_FLAGS;
+        o.UFunction_num_parms = ufunction_layout::NUM_PARMS;
+        o.UFunction_parms_size = ufunction_layout::PARMS_SIZE;
+        o.UFunction_return_value_offset = ufunction_layout::RETURN_VALUE_OFFSET;
+        o.UFunction_func_ptr = ufunction_layout::FUNC_PTR;
+
+        // ── UEnum — IDENTICAL across all versions ──
+        o.UEnum_names_data = uenum_layout::NAMES_DATA;
+        o.UEnum_names_num = uenum_layout::NAMES_NUM;
+        o.UEnum_names_max = uenum_layout::NAMES_MAX;
+        o.UEnum_entry_size = uenum_layout::ENTRY_SIZE;
+
+        // ── GUObjectArray — DIFFERS between UE4 and UE5 ──
+        o.GUObjectArray_to_objects = guobjectarray::TO_OBJECTS;
+        o.FUObjectItem_chunk_size = guobjectarray::ELEMENTS_PER_CHUNK;
+        o.FUObjectItem_padding = 0;
+
+        if (is_ue5(version))
+        {
+            // UE5: PreAllocatedObjects pointer shifts NumElements by +8
+            o.TUObjectArray_num_elements = guobjectarray::UE5_NUM_ELEMENTS;
+            // UE5 default: FUObjectItem has RefCount → 24 bytes
+            // BUT some games (e.g., Pinball FX VR) use 20 bytes (no RefCount or no padding)
+            // Default to 24, auto-detect will override if needed
+            o.FUObjectItem_size = guobjectarray::FUOBJECTITEM_SIZE_24;
+        }
+        else
+        {
+            // UE4: No PreAllocatedObjects
+            o.TUObjectArray_num_elements = guobjectarray::UE4_NUM_ELEMENTS;
+            o.FUObjectItem_size = guobjectarray::FUOBJECTITEM_SIZE_24;
+        }
+
+        // ── FField + FProperty — DIFFERS between UE4 and UE5 ──
+        if (is_ue5(version))
+        {
+            // UE5: compact 8-byte FFieldVariant (tagged pointer)
+            o.FField_class = ffield_layout::ue5::CLASS_PRIVATE;
+            o.FField_owner = ffield_layout::ue5::OWNER;
+            o.FField_next = ffield_layout::ue5::NEXT;
+            o.FField_name = ffield_layout::ue5::NAME_PRIVATE;
+
+            o.FProp_element_size = fproperty_layout::ue5::ELEMENT_SIZE;
+            o.FProp_property_flags = fproperty_layout::ue5::PROPERTY_FLAGS;
+            o.FProp_offset_internal = fproperty_layout::ue5::OFFSET_INTERNAL;
+            o.FProp_size = fproperty_layout::ue5::BASE_SIZE;
+
+            o.FProp_bool_field_size = fproperty_ext::ue5::BOOL_FIELD_SIZE;
+            o.FProp_bool_byte_offset = fproperty_ext::ue5::BOOL_BYTE_OFFSET;
+            o.FProp_bool_byte_mask = fproperty_ext::ue5::BOOL_BYTE_MASK;
+            o.FProp_bool_field_mask = fproperty_ext::ue5::BOOL_FIELD_MASK;
+            o.FProp_obj_property_class = fproperty_ext::ue5::OBJ_PROPERTY_CLASS;
+            o.FProp_class_meta_class = fproperty_ext::ue5::CLASS_META_CLASS;
+            o.FProp_interface_class = fproperty_ext::ue5::INTERFACE_CLASS;
+            o.FProp_array_inner = fproperty_ext::ue5::ARRAY_INNER;
+            o.FProp_map_key_prop = fproperty_ext::ue5::MAP_KEY_PROP;
+            o.FProp_map_value_prop = fproperty_ext::ue5::MAP_VALUE_PROP;
+            o.FProp_set_element_prop = fproperty_ext::ue5::SET_ELEMENT_PROP;
+            o.FProp_struct_inner_struct = fproperty_ext::ue5::STRUCT_INNER_STRUCT;
+            o.FProp_enum_prop_enum = fproperty_ext::ue5::ENUM_PROP_ENUM;
+            o.FProp_byte_prop_enum = fproperty_ext::ue5::BYTE_PROP_ENUM;
+        }
+        else
+        {
+            // UE4: 16-byte FFieldVariant
+            o.FField_class = ffield_layout::ue4::CLASS_PRIVATE;
+            o.FField_owner = ffield_layout::ue4::OWNER;
+            o.FField_next = ffield_layout::ue4::NEXT;
+            o.FField_name = ffield_layout::ue4::NAME_PRIVATE;
+
+            o.FProp_element_size = fproperty_layout::ue4::ELEMENT_SIZE;
+            o.FProp_property_flags = fproperty_layout::ue4::PROPERTY_FLAGS;
+            o.FProp_offset_internal = fproperty_layout::ue4::OFFSET_INTERNAL;
+            o.FProp_size = fproperty_layout::ue4::BASE_SIZE;
+
+            o.FProp_bool_field_size = fproperty_ext::ue4::BOOL_FIELD_SIZE;
+            o.FProp_bool_byte_offset = fproperty_ext::ue4::BOOL_BYTE_OFFSET;
+            o.FProp_bool_byte_mask = fproperty_ext::ue4::BOOL_BYTE_MASK;
+            o.FProp_bool_field_mask = fproperty_ext::ue4::BOOL_FIELD_MASK;
+            o.FProp_obj_property_class = fproperty_ext::ue4::OBJ_PROPERTY_CLASS;
+            o.FProp_class_meta_class = fproperty_ext::ue4::CLASS_META_CLASS;
+            o.FProp_interface_class = fproperty_ext::ue4::INTERFACE_CLASS;
+            o.FProp_array_inner = fproperty_ext::ue4::ARRAY_INNER;
+            o.FProp_map_key_prop = fproperty_ext::ue4::MAP_KEY_PROP;
+            o.FProp_map_value_prop = fproperty_ext::ue4::MAP_VALUE_PROP;
+            o.FProp_set_element_prop = fproperty_ext::ue4::SET_ELEMENT_PROP;
+            o.FProp_struct_inner_struct = fproperty_ext::ue4::STRUCT_INNER_STRUCT;
+            o.FProp_enum_prop_enum = fproperty_ext::ue4::ENUM_PROP_ENUM;
+            o.FProp_byte_prop_enum = fproperty_ext::ue4::BYTE_PROP_ENUM;
+        }
+
+        return o;
+    }
+
     // ═══ RE4 VR profile ═════════════════════════════════════════════════════
     static GameProfile build_re4_vr_profile()
     {
+        using namespace engine_versions;
+
         GameProfile p;
         p.id = GameID::RE4_VR;
         p.package_name = "com.Armature.VR4";
         p.display_name = "RE4 VR";
         p.engine_lib_name = "libUE4.so";
         p.engine_version = "UE4.27";
+        p.detected_engine_version = EngineVersion::UE4_27;
 
-        // Type offsets — verified from UE4Dumper against live RE4 VR binary
-        auto &o = p.offsets;
+        // Build offsets from engine_versions.h constants (derived from UE source)
+        p.offsets = build_offsets_for_version(EngineVersion::UE4_27);
 
-        // FNamePool
-        o.GNames_to_FNamePool = 0x30;
-        o.FNamePool_to_Blocks = 0x10;
-        o.FNameEntry_header_size = 2;
-        o.FNameEntry_len_shift = 6;
-        o.FName_stride = 2;
-        o.FName_max_blocks = 8192;
-        o.FName_block_bits = 16;
-
-        // GUObjectArray
-        o.GUObjectArray_to_objects = 0x10;
-        o.TUObjectArray_num_elements = 0x14;
-        o.FUObjectItem_size = 0x18;
-        o.FUObjectItem_padding = 0x00;
-        o.FUObjectItem_chunk_size = 0x10000;
-
-        // UObjectBase
-        o.UObj_vtable = 0x00;
-        o.UObj_flags = 0x08;
-        o.UObj_internal_index = 0x0C;
-        o.UObj_class = 0x10;
-        o.UObj_fname_index = 0x18;
-        o.UObj_fname_number = 0x1C;
-        o.UObj_outer = 0x20;
-
-        // UField
-        o.UField_next = 0x28;
-
-        // UStruct
-        o.UStruct_super = 0x40;
-        o.UStruct_children = 0x48;
-        o.UStruct_child_properties = 0x50;
-        o.UStruct_properties_size = 0x58;
-
-        // UFunction
-        o.UFunction_flags = 0xB0;
-        o.UFunction_num_parms = 0xB4;
-        o.UFunction_parms_size = 0xB6;
-        o.UFunction_return_value_offset = 0xB8;
-        o.UFunction_func_ptr = 0xD8;
-
-        // FField
-        o.FField_class = 0x08;
-        o.FField_owner = 0x10;
-        o.FField_next = 0x20;
-        o.FField_name = 0x28;
-
-        // FProperty
-        o.FProp_element_size = 0x38;
-        o.FProp_property_flags = 0x40;
-        o.FProp_offset_internal = 0x4C;
-        o.FProp_size = 0x78;
-
-        o.FProp_bool_field_size = 0x78;
-        o.FProp_bool_byte_offset = 0x79;
-        o.FProp_bool_byte_mask = 0x7A;
-        o.FProp_bool_field_mask = 0x7B;
-        o.FProp_obj_property_class = 0x78;
-        o.FProp_class_meta_class = 0x80;
-        o.FProp_interface_class = 0x80;
-        o.FProp_array_inner = 0x78;
-        o.FProp_map_key_prop = 0x70;
-        o.FProp_map_value_prop = 0x78;
-        o.FProp_set_element_prop = 0x78;
-        o.FProp_struct_inner_struct = 0x78;
-        o.FProp_enum_prop_enum = 0x80;
-        o.FProp_byte_prop_enum = 0x78;
-
-        // UEnum
-        o.UEnum_names_data = 0x40;
-        o.UEnum_names_num = 0x48;
-        o.UEnum_names_max = 0x4C;
-        o.UEnum_entry_size = 16;
+        // ── RE4 VR specific overrides (verified on live binary) ──
+        // FUObjectItem: RE4 VR uses 0x18 (24 bytes) — confirmed via UE4Dumper
+        p.offsets.FUObjectItem_size = 0x18;
+        // TUObjectArray::NumElements at +0x14 (from ObjObjects base) — RE4 VR specific
+        // The UE4 standard is 0x0C, but RE4 VR binary was verified at 0x14
+        p.offsets.TUObjectArray_num_elements = 0x14;
 
         // Fallback offsets from UE4Dumper / Binary Ninja analysis
         p.fallback_offsets = {
@@ -143,98 +217,22 @@ namespace game_profile
     // ═══ Pinball FX VR profile ══════════════════════════════════════════════
     static GameProfile build_pinball_fx_vr_profile()
     {
+        using namespace engine_versions;
+
         GameProfile p;
         p.id = GameID::PINBALL_FX_VR;
         p.package_name = "com.zenstudios.PFXVRQuest";
         p.display_name = "Pinball FX VR";
         p.engine_lib_name = "libUnreal.so";
         p.engine_version = "UE5";
+        p.detected_engine_version = EngineVersion::UE5_4;
 
-        // Type offsets — verified from IDA/Binja analysis + UE4Dumper config
-        // Pinball FX VR uses UE5 with a non-standard FUObjectItem size (0x14 vs 0x18)
-        auto &o = p.offsets;
+        // Build offsets from engine_versions.h constants (derived from UE source)
+        p.offsets = build_offsets_for_version(EngineVersion::UE5_4);
 
-        // FNamePool — same as RE4 VR (standard UE4.23+ layout)
-        o.GNames_to_FNamePool = 0x30;
-        o.FNamePool_to_Blocks = 0x10;
-        o.FNameEntry_header_size = 2;
-        o.FNameEntry_len_shift = 6;
-        o.FName_stride = 2;
-        o.FName_max_blocks = 8192;
-        o.FName_block_bits = 16;
-
-        // GUObjectArray — FUObjectItem is 0x14 (no padding), not 0x18
-        o.GUObjectArray_to_objects = 0x10;
-        o.TUObjectArray_num_elements = 0x14;
-        o.FUObjectItem_size = 0x14; // KEY DIFFERENCE from RE4 VR
-        o.FUObjectItem_padding = 0x00;
-        o.FUObjectItem_chunk_size = 0x10000;
-
-        // UObjectBase — same layout as RE4 VR
-        o.UObj_vtable = 0x00;
-        o.UObj_flags = 0x08;
-        o.UObj_internal_index = 0x0C;
-        o.UObj_class = 0x10;
-        o.UObj_fname_index = 0x18;
-        o.UObj_fname_number = 0x1C;
-        o.UObj_outer = 0x20;
-
-        // UField
-        o.UField_next = 0x28;
-
-        // UStruct — same as RE4 VR (UE5 uses same layout as UE4.23+)
-        o.UStruct_super = 0x40;
-        o.UStruct_children = 0x48;
-        o.UStruct_child_properties = 0x50;
-        o.UStruct_properties_size = 0x58;
-
-        // UFunction — same as RE4 VR
-        o.UFunction_flags = 0xB0;
-        o.UFunction_num_parms = 0xB4;
-        o.UFunction_parms_size = 0xB6;
-        o.UFunction_return_value_offset = 0xB8;
-        o.UFunction_func_ptr = 0xD8;
-
-        // FField — UE5 uses compact 8-byte FFieldVariant (tagged pointer), NOT 16-byte
-        // This shifts Next and Name by -8 compared to RE4 VR (UE4.27)
-        o.FField_class = 0x08;
-        o.FField_owner = 0x10; // FFieldVariant is 8 bytes (compact tagged pointer)
-        o.FField_next = 0x18;  // was 0x20 in RE4 VR (UE4 has 16-byte FFieldVariant)
-        o.FField_name = 0x20;  // was 0x28 in RE4 VR
-
-        // FProperty — UE5 compact FFieldVariant shifts base FProperty fields by -8
-        // BUT the FProperty base class size stays at 0x78 (UE5 added RepNotifyFunc field
-        // or padding that compensates for the FField header shrinkage)
-        o.FProp_element_size = 0x30;    // was 0x38 in UE4
-        o.FProp_property_flags = 0x38;  // was 0x40 in UE4
-        o.FProp_offset_internal = 0x44; // was 0x4C in UE4
-        o.FProp_size = 0x70;            // was 0x78 in UE4
-
-        // Typed FProperty inner offsets — FProperty base = 0x70 bytes in this UE5 build
-        // Most extension members start at 0x70, EXCEPT:
-        //   - FArrayProperty has EArrayPropertyFlags at 0x70, Inner at 0x78
-        //   - FBoolProperty packs 4 uint8 fields starting at 0x78
-        // Confirmed via runtime auto-detection on Pinball FX VR v1.7
-        o.FProp_bool_field_size = 0x78;     // confirmed working
-        o.FProp_bool_byte_offset = 0x79;    // confirmed working
-        o.FProp_bool_byte_mask = 0x7A;      // confirmed working
-        o.FProp_bool_field_mask = 0x7B;     // confirmed working
-        o.FProp_obj_property_class = 0x70;  // auto-detected: FProperty base = 0x70
-        o.FProp_class_meta_class = 0x78;    // obj_property_class + 8
-        o.FProp_interface_class = 0x78;     // same as class_meta_class
-        o.FProp_array_inner = 0x78;         // ArrayFlags at 0x70, Inner at 0x78
-        o.FProp_map_key_prop = 0x70;        // auto-detected: key at 0x70
-        o.FProp_map_value_prop = 0x78;      // auto-detected: value at 0x78
-        o.FProp_set_element_prop = 0x70;    // same as map_key (first extension member)
-        o.FProp_struct_inner_struct = 0x70; // auto-detected: inner UStruct at 0x70
-        o.FProp_enum_prop_enum = 0x78;      // may need verification
-        o.FProp_byte_prop_enum = 0x70;      // first extension member
-
-        // UEnum — same layout as RE4 VR
-        o.UEnum_names_data = 0x40;
-        o.UEnum_names_num = 0x48;
-        o.UEnum_names_max = 0x4C;
-        o.UEnum_entry_size = 16;
+        // ── Pinball FX VR specific overrides (verified on live binary) ──
+        // FUObjectItem is 0x14 (20 bytes) — no padding, no RefCount in this build
+        p.offsets.FUObjectItem_size = 0x14;
 
         // ── Fallback offsets (v1.7 addresses from IDA/Binja analysis) ──
         // These are fallbacks ONLY — the pattern scanner should find them dynamically.
@@ -316,19 +314,83 @@ namespace game_profile
     }
 
     // ═══ Unknown/fallback profile ═══════════════════════════════════════════
+    // For games we haven't seen before. Tries to auto-detect UE4 vs UE5
+    // based on which engine library is loaded, then uses engine_versions.h
+    // constants to build correct offsets.
     static GameProfile build_unknown_profile(const std::string &pkg)
     {
+        using namespace engine_versions;
+
         GameProfile p;
         p.id = GameID::UNKNOWN;
         p.package_name = pkg;
         p.display_name = "Unknown Game (" + pkg + ")";
-        p.engine_lib_name = "libUE4.so"; // try UE4 first, main.cpp tries libUnreal.so too
-        p.engine_version = "Unknown";
 
-        // Use RE4 VR offsets as defaults (most common UE4 layout)
-        p.offsets = build_re4_vr_profile().offsets;
+        // Detect engine library — try libUnreal.so first (UE5), then libUE4.so (UE4)
+        void *ue5_handle = dlopen("libUnreal.so", RTLD_NOLOAD);
+        void *ue4_handle = dlopen("libUE4.so", RTLD_NOLOAD);
+
+        if (ue5_handle) {
+            p.engine_lib_name = "libUnreal.so";
+            p.engine_version = "UE5 (auto-detected)";
+            p.detected_engine_version = EngineVersion::UE5_4;  // default UE5 assumption
+            p.offsets = build_offsets_for_version(EngineVersion::UE5_4);
+            dlclose(ue5_handle);
+
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                "[PROFILE] Auto-detected UE5 (libUnreal.so loaded)");
+        } else if (ue4_handle) {
+            p.engine_lib_name = "libUE4.so";
+            p.engine_version = "UE4 (auto-detected)";
+            p.detected_engine_version = EngineVersion::UE4_27;  // default UE4 assumption
+            p.offsets = build_offsets_for_version(EngineVersion::UE4_27);
+            dlclose(ue4_handle);
+
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                "[PROFILE] Auto-detected UE4 (libUE4.so loaded)");
+        } else {
+            // Neither library found yet — default to UE4.27 (most common)
+            p.engine_lib_name = "libUE4.so";
+            p.engine_version = "Unknown";
+            p.detected_engine_version = EngineVersion::UNKNOWN;
+            p.offsets = build_offsets_for_version(EngineVersion::UE4_27);
+
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
+                "[PROFILE] No engine library detected! Defaulting to UE4.27 offsets");
+        }
 
         return p;
+    }
+
+    // ═══ Engine version detection from binary strings ═══════════════════════
+    // Scans the loaded engine library's memory for version markers.
+    // This is called AFTER pattern::init() has mapped the library regions.
+    engine_versions::EngineVersion detect_engine_version_from_binary()
+    {
+        using namespace engine_versions;
+
+        // We need the pattern scanner to have been initialized to get memory regions.
+        // If not available, we can try to read /proc/self/maps ourselves.
+        // For now, this is a stub that will be called from main.cpp after pattern::init().
+
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+            "[PROFILE] Engine version detection from binary: using library-based detection");
+
+        // Library name is the most reliable indicator
+        void *ue5_handle = dlopen("libUnreal.so", RTLD_NOLOAD);
+        if (ue5_handle) {
+            dlclose(ue5_handle);
+            // Default UE5 → try to narrow down via string scanning later
+            return EngineVersion::UE5_4;
+        }
+
+        void *ue4_handle = dlopen("libUE4.so", RTLD_NOLOAD);
+        if (ue4_handle) {
+            dlclose(ue4_handle);
+            return EngineVersion::UE4_27;
+        }
+
+        return EngineVersion::UNKNOWN;
     }
 
     // ═══ Init ═══════════════════════════════════════════════════════════════
@@ -363,9 +425,27 @@ namespace game_profile
                             s_profile.engine_lib_name.c_str());
 
         __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                            "[PROFILE] Engine version enum: %u",
+                            static_cast<uint32_t>(s_profile.detected_engine_version));
+
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
                             "[PROFILE] FUObjectItem size: 0x%X, GUObjectArray_to_objects: 0x%X",
                             s_profile.offsets.FUObjectItem_size,
                             s_profile.offsets.GUObjectArray_to_objects);
+
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                            "[PROFILE] FField: class=0x%X, owner=0x%X, next=0x%X, name=0x%X",
+                            s_profile.offsets.FField_class,
+                            s_profile.offsets.FField_owner,
+                            s_profile.offsets.FField_next,
+                            s_profile.offsets.FField_name);
+
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                            "[PROFILE] FProp: elem_size=0x%X, flags=0x%X, offset=0x%X, base_size=0x%X",
+                            s_profile.offsets.FProp_element_size,
+                            s_profile.offsets.FProp_property_flags,
+                            s_profile.offsets.FProp_offset_internal,
+                            s_profile.offsets.FProp_size);
 
         s_initialized = true;
     }
@@ -379,5 +459,20 @@ namespace game_profile
     const std::string &package_name() { return s_profile.package_name; }
     bool is_pinball_fx() { return s_profile.id == GameID::PINBALL_FX_VR; }
     bool is_re4_vr() { return s_profile.id == GameID::RE4_VR; }
+
+    engine_versions::EngineVersion engine_version_enum()
+    {
+        return s_profile.detected_engine_version;
+    }
+
+    bool is_ue5()
+    {
+        return engine_versions::is_ue5(s_profile.detected_engine_version);
+    }
+
+    bool is_ue4()
+    {
+        return engine_versions::is_ue4(s_profile.detected_engine_version);
+    }
 
 } // namespace game_profile

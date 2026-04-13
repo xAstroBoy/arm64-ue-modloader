@@ -4,12 +4,16 @@
 // Reads /proc/self/maps to find the executable and data segments
 // Pattern format: "48 8B 05 ?? ?? ?? ?? 48 85 C0" where ?? = wildcard
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  // for memmem on Android/Bionic
+#endif
 #include "modloader/pattern_scanner.h"
 #include "modloader/game_profile.h"
 #include "modloader/logger.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <string.h>  // for memmem
 #include <vector>
 #include <sstream>
 #include <string>
@@ -287,5 +291,73 @@ namespace pattern
     uintptr_t text_end() { return s_text_end; }
     uintptr_t data_start() { return s_data_start; }
     uintptr_t data_end() { return s_data_end; }
+
+    // ═══ String scanning ════════════════════════════════════════════════════
+    // Search for a null-terminated string in all readable regions.
+    // Used for engine version detection (searching .rodata for version markers).
+
+    void *find_string(const char *needle)
+    {
+        if (!needle || !needle[0])
+            return nullptr;
+
+        size_t needle_len = strlen(needle);
+
+        for (const auto &region : s_regions)
+        {
+            if (!region.readable)
+                continue;
+            // Skip executable-only regions (we want .rodata / .data)
+            // Actually, .rodata is typically in a readable non-writable region
+            size_t region_size = region.end - region.start;
+            if (region_size < needle_len)
+                continue;
+
+            const char *mem = reinterpret_cast<const char *>(region.start);
+            const char *result = static_cast<const char *>(
+                memmem(mem, region_size, needle, needle_len));
+            if (result)
+            {
+                logger::log_info("PATTERN", "String '%s' found at 0x%lX in region 0x%lX-0x%lX",
+                                 needle, reinterpret_cast<uintptr_t>(result),
+                                 region.start, region.end);
+                return const_cast<void *>(static_cast<const void *>(result));
+            }
+        }
+
+        logger::log_warn("PATTERN", "String '%s' not found in any region", needle);
+        return nullptr;
+    }
+
+    std::vector<void *> find_string_all(const char *needle)
+    {
+        std::vector<void *> results;
+        if (!needle || !needle[0])
+            return results;
+
+        size_t needle_len = strlen(needle);
+
+        for (const auto &region : s_regions)
+        {
+            if (!region.readable)
+                continue;
+            size_t region_size = region.end - region.start;
+            if (region_size < needle_len)
+                continue;
+
+            const char *mem = reinterpret_cast<const char *>(region.start);
+            size_t offset = 0;
+            while (offset <= region_size - needle_len)
+            {
+                const char *result = static_cast<const char *>(
+                    memmem(mem + offset, region_size - offset, needle, needle_len));
+                if (!result)
+                    break;
+                results.push_back(const_cast<void *>(static_cast<const void *>(result)));
+                offset = (result - mem) + 1;
+            }
+        }
+        return results;
+    }
 
 } // namespace pattern

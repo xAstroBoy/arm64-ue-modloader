@@ -3,6 +3,9 @@
 // AOB/pattern scanner for engine library mapped memory.
 // Supports any engine library (libUE4.so, libUnreal.so, etc.) via game profile.
 // Pattern format: "48 8B 05 ?? ?? ?? ?? 48 85 C0" where ?? = wildcard
+//
+// Also provides string scanning for engine version detection.
+// Scans .rodata/.data segments for known version markers.
 
 #include <string>
 #include <cstdint>
@@ -30,6 +33,14 @@ namespace pattern
 
     // Scan all matches (returns vector of all addresses that match)
     std::vector<void *> scan_all(const std::string &pattern_str);
+
+    // ═══ String scanning for version detection ═════════════════════════════
+    // Search for a null-terminated string in all readable (non-executable) regions.
+    // Returns the address of the first match, or nullptr if not found.
+    void *find_string(const char *needle);
+
+    // Search for a string and return all occurrences.
+    std::vector<void *> find_string_all(const char *needle);
 
     // Get the start and end of libUE4.so executable segment
     uintptr_t text_start();
