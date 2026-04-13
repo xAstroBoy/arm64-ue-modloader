@@ -1,4 +1,4 @@
--- mods/DualWield/main.lua v4.1
+-- mods/DualWield/main.lua v4.2
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-enhanced Dual Wield — grab any weapon in both hands.
 --
@@ -43,7 +43,7 @@ Log(TAG .. ": RegisterHook — VR4GamePlayerPawn:EquipProp (monitor)")
 -- NATIVE DOBBY HOOKS — Allow grabbing duplicates
 -- ═══════════════════════════════════════════════════════════════════════
 
-local sym_IsPresentOnBody = Resolve("IsPresentOnBody", 0x048F1A8)
+local sym_IsPresentOnBody = Resolve("IsPresentOnBody", 0x0670D6F4)
 if sym_IsPresentOnBody then
     pcall(function()
         RegisterNativeHook("IsPresentOnBody", nil,

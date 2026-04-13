@@ -1,4 +1,4 @@
--- mods/3DCutscenesFix/main.lua v12.2
+-- mods/3DCutscenesFix/main.lua v12.3
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-style 3D Cutscenes — teleports VR player to cinematic camera.
 --
@@ -107,10 +107,10 @@ Log(TAG .. ": RegisterHook — VR4GamePlayerPawn:OnCameraModeChanged")
 -- ═══════════════════════════════════════════════════════════════════════
 
 local sym_setAnchor = Resolve(
-    "_ZN14AVR4PlayerPawn17SetAnchorInternalERK10FTransform", 0x068410D0)
+    "_ZN14AVR4PlayerPawn17SetAnchorInternalERK10FTransform", 0x0679A598)
 
 local sym_updateCamera = Resolve(
-    "_ZN22AVR4CutscenePlayerPawn12UpdateCameraERK10FTransformfb", 0x06443E64)
+    "_ZN22AVR4CutscenePlayerPawn12UpdateCameraERK10FTransformfb", 0x06843E64)
 
 if sym_updateCamera and sym_setAnchor then
     pcall(function()
@@ -141,8 +141,8 @@ else
 end
 
 -- SceEvent hooks for cutscene begin/end detection
-local sym_begin = Resolve("OnSceEventBegin", 0x0641A2EC)
-local sym_end   = Resolve("OnSceEventEnd",   0x0641A340)
+local sym_begin = Resolve("OnSceEventBegin", 0x0684080C)
+local sym_end   = Resolve("OnSceEventEnd",   0x068408D4)
 
 if sym_begin then
     pcall(function()

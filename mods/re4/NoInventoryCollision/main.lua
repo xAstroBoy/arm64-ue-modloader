@@ -1,4 +1,4 @@
--- mods/NoInventoryCollision/main.lua v3.0
+-- mods/NoInventoryCollision/main.lua v3.1
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-style Unlimited Inventory — all placement checks return true.
 -- Items overlay on each other (no grid collision).
@@ -98,7 +98,7 @@ Log(TAG .. ": NotifyOnNewObject — VR4ItemPickup (item spawn tracking)")
 -- NATIVE HOOKS — Item collision bypass
 -- ═══════════════════════════════════════════════════════════════════════
 
-local sym_intersect = Resolve("ItemRegionsIntersect", 0x064AEDC4)
+local sym_intersect = Resolve("ItemRegionsIntersect", 0x06735678)
 if sym_intersect then
     pcall(function()
     RegisterNativeHookAt(sym_intersect, "ItemRegionsIntersect", nil,
@@ -110,17 +110,9 @@ if sym_intersect then
     end)
 end
 
-local sym_adj = Resolve("ItemRegionsIntersectOrAdjacent", 0x064AEFC4)
-if sym_adj then
-    pcall(function()
-    RegisterNativeHookAt(sym_adj, "ItemRegionsIntersectOrAdjacent", nil,
-        function(retval)
-            if not state.enabled then return retval end
-            return 0
-        end)
-    Log(TAG .. ": Native hook — ItemRegionsIntersectOrAdjacent → false")
-    end)
-end
+-- NOTE: ItemRegionsIntersectOrAdjacent does NOT exist in the RE4 binary
+-- (confirmed via bindump analysis — 0x064AEFC4 was actually execMakeItemRegion).
+-- ItemRegionsIntersect alone handles all inventory collision bypass.
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- COMMANDS — UE4SS inventory introspection
