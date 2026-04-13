@@ -26,49 +26,57 @@ end
 -- VR4GamePlayerGun::AmmoAvailable → force true
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:AmmoAvailable", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 1)
+    local p = CastParms(parms, "VR4GamePlayerGun:AmmoAvailable")
+    if p then p:SetReturnValue(true) end
 end)
 
 -- VR4GamePlayerBow::AmmoAvailable → force true (bow uses arrows)
 RegisterPostHook("/Script/Game.VR4GamePlayerBow:AmmoAvailable", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 1)
+    local p = CastParms(parms, "VR4GamePlayerBow:AmmoAvailable")
+    if p then p:SetReturnValue(true) end
 end)
 
 -- VR4GamePlayerGun::UsesAmmo → force true (ensure ammo system stays active)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:UsesAmmo", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 1)
+    local p = CastParms(parms, "VR4GamePlayerGun:UsesAmmo")
+    if p then p:SetReturnValue(true) end
 end)
 
 -- VR4GamePlayerGun::GetCurrentAmmo → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetCurrentAmmo", function(self, func, parms)
     if not state.enabled then return end
-    WriteS32(Offset(parms, 4), 999)
+    local p = CastParms(parms, "VR4GamePlayerGun:GetCurrentAmmo")
+    if p then p:SetReturnValue(999) end
 end)
 
 -- VR4GamePlayerGun::GetAmmoReserves → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetAmmoReserves", function(self, func, parms)
     if not state.enabled then return end
-    WriteS32(parms, 999)
+    local p = CastParms(parms, "VR4GamePlayerGun:GetAmmoReserves")
+    if p then p:SetReturnValue(999) end
 end)
 
 -- VR4GamePlayerGun::GetAmmoCapacity → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetAmmoCapacity", function(self, func, parms)
     if not state.enabled then return end
-    WriteS32(parms, 999)
+    local p = CastParms(parms, "VR4GamePlayerGun:GetAmmoCapacity")
+    if p then p:SetReturnValue(999) end
 end)
 
 -- VR4GamePlayerGun::GetTotalAvailableAmmo → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetTotalAvailableAmmo", function(self, func, parms)
     if not state.enabled then return end
-    WriteS32(parms, 999)
+    local p = CastParms(parms, "VR4GamePlayerGun:GetTotalAvailableAmmo")
+    if p then p:SetReturnValue(999) end
 end)
 
 -- VR4GamePlayerGun::GetWeaponItemAmmo → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetWeaponItemAmmo", function(self, func, parms)
     if not state.enabled then return end
-    WriteS32(parms, 999)
+    local p = CastParms(parms, "VR4GamePlayerGun:GetWeaponItemAmmo")
+    if p then p:SetReturnValue(999) end
 end)
 
 Log(TAG .. ": 8 UE4SS RegisterPostHook on VR4GamePlayerGun/Bow ammo UFunctions")

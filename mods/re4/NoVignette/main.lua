@@ -41,12 +41,14 @@ Log(TAG .. ": RegisterPreHook — VR4Vignette:SetVignetteActive → BLOCK")
 
 RegisterPostHook("/Script/Game.VR4Vignette:IsVignetteActive", function(self, func, parms)
     if not state.vignetteOff then return end
-    WriteU8(parms, 0)
+    local p = CastParms(parms, "VR4Vignette:IsVignetteActive")
+    if p then p:SetReturnValue(false) end
 end)
 
 RegisterPostHook("/Script/Game.VR4Vignette:IsAnyVignetteActive", function(self, func, parms)
     if not state.vignetteOff then return end
-    WriteU8(parms, 0)
+    local p = CastParms(parms, "VR4Vignette:IsAnyVignetteActive")
+    if p then p:SetReturnValue(false) end
 end)
 
 Log(TAG .. ": RegisterPostHook — IsVignetteActive, IsAnyVignetteActive → false")

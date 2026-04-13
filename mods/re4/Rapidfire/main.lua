@@ -45,25 +45,29 @@ end)
 -- IsFiringBlocked → always false (gun is never blocked from firing)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFiringBlocked", function(self, func, parms)
     if not state.enabled or not modReady then return end
-    WriteU8(parms, 0)  -- false = not blocked
+    local p = CastParms(parms, "VR4GamePlayerGun:IsFiringBlocked")
+    if p then p:SetReturnValue(false) end
 end)
 
 -- IsFullyAutomatic → always true (holding trigger keeps firing)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFullyAutomatic", function(self, func, parms)
     if not state.enabled or not modReady then return end
-    WriteU8(parms, 1)  -- true = full auto
+    local p = CastParms(parms, "VR4GamePlayerGun:IsFullyAutomatic")
+    if p then p:SetReturnValue(true) end
 end)
 
 -- IsReadyToFire → always true (fire timer always "done" from ProcessEvent perspective)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsReadyToFire", function(self, func, parms)
     if not state.enabled or not modReady then return end
-    WriteU8(parms, 1)  -- true = ready to fire
+    local p = CastParms(parms, "VR4GamePlayerGun:IsReadyToFire")
+    if p then p:SetReturnValue(true) end
 end)
 
 -- WasTriggerJustPressed → true when trigger held (for semi-auto guns)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:WasTriggerJustPressed", function(self, func, parms)
     if not state.enabled or not modReady then return end
-    WriteU8(parms, 1)  -- true = trigger just pressed
+    local p = CastParms(parms, "VR4GamePlayerGun:WasTriggerJustPressed")
+    if p then p:SetReturnValue(true) end
 end)
 
 Log(TAG .. ": 4 UE4SS PostHooks registered (IsFiringBlocked, IsFullyAutomatic, IsReadyToFire, WasTriggerJustPressed)")

@@ -28,28 +28,32 @@ end
 -- AttacheCase::CanPlaceItem → force true
 RegisterPostHook("/Script/Game.AttacheCase:CanPlaceItem", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 1)
+    local p = CastParms(parms, "AttacheCase:CanPlaceItem")
+    if p then p:SetReturnValue(true) end
 end)
 Log(TAG .. ": RegisterPostHook — AttacheCase:CanPlaceItem → true")
 
 -- VR4ItemReceptacle::CanPlaceItem → force true
 RegisterPostHook("/Script/Game.VR4ItemReceptacle:CanPlaceItem", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(Offset(parms, 8), 1)
+    local p = CastParms(parms, "VR4ItemReceptacle:CanPlaceItem")
+    if p then p:SetReturnValue(true) end
 end)
 Log(TAG .. ": RegisterPostHook — VR4ItemReceptacle:CanPlaceItem → true")
 
 -- VR4ItemReceptacle::CanPlaceItemId → force true
 RegisterPostHook("/Script/Game.VR4ItemReceptacle:CanPlaceItemId", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(Offset(parms, 1), 1)
+    local p = CastParms(parms, "VR4ItemReceptacle:CanPlaceItemId")
+    if p then p:SetReturnValue(true) end
 end)
 Log(TAG .. ": RegisterPostHook — VR4ItemReceptacle:CanPlaceItemId → true")
 
 -- VR4ItemReceptacleSlot::CanPlaceItem → force true
 RegisterPostHook("/Script/Game.VR4ItemReceptacleSlot:CanPlaceItem", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(Offset(parms, 1), 1)
+    local p = CastParms(parms, "VR4ItemReceptacleSlot:CanPlaceItem")
+    if p then p:SetReturnValue(true) end
 end)
 Log(TAG .. ": RegisterPostHook — VR4ItemReceptacleSlot:CanPlaceItem → true")
 

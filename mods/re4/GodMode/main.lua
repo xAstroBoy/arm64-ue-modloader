@@ -85,18 +85,13 @@ Log(TAG .. ": PreHook BLOCK — HurtPlayer + HurtPlayerWithConstDamage + HurtAsh
 -- LAYER 4: Block game-over state
 -- ═══════════════════════════════════════════════════════════════════════
 
-RegisterHook("/Script/Game.Bio4:IsGameOver", function(Context, ReturnValue)
+RegisterPostHook("/Script/Game.Bio4:IsGameOver", function(self, func, parms)
     if not state.enabled then return end
     -- Force return false — game-over never triggers
-    pcall(function()
-        local ret = ReturnValue:get()
-        if ret and ret ~= 0 then
-            ReturnValue:set(0)
-            Log(TAG .. ": BLOCKED IsGameOver → forced false")
-        end
-    end)
+    local p = CastParms(parms, "Bio4:IsGameOver")
+    if p then p:SetReturnValue(false) end
 end)
-Log(TAG .. ": RegisterHook — Bio4:IsGameOver (force false)")
+Log(TAG .. ": RegisterPostHook — Bio4:IsGameOver (force false)")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- LAYER 5: Block VR4DeathMenu from spawning / auto-exit if it does

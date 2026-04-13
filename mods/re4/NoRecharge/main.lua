@@ -26,24 +26,28 @@ end
 -- VR4GamePlayerAmmo::IsReloadInProgress → false (skip reload animation)
 RegisterPostHook("/Script/Game.VR4GamePlayerAmmo:IsReloadInProgress", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 0)
+    local p = CastParms(parms, "VR4GamePlayerAmmo:IsReloadInProgress")
+    if p then p:SetReturnValue(false) end
 end)
 
 -- VR4GamePlayerAmmo::IsReloadLingering → false
 RegisterPostHook("/Script/Game.VR4GamePlayerAmmo:IsReloadLingering", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 0)
+    local p = CastParms(parms, "VR4GamePlayerAmmo:IsReloadLingering")
+    if p then p:SetReturnValue(false) end
 end)
 
 -- VR4GamePlayerArrow (bow) overrides
 RegisterPostHook("/Script/Game.VR4GamePlayerArrow:IsReloadInProgress", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 0)
+    local p = CastParms(parms, "VR4GamePlayerArrow:IsReloadInProgress")
+    if p then p:SetReturnValue(false) end
 end)
 
 RegisterPostHook("/Script/Game.VR4GamePlayerArrow:IsReloadLingering", function(self, func, parms)
     if not state.enabled then return end
-    WriteU8(parms, 0)
+    local p = CastParms(parms, "VR4GamePlayerArrow:IsReloadLingering")
+    if p then p:SetReturnValue(false) end
 end)
 
 Log(TAG .. ": 4 UE4SS RegisterPostHook on VR4GamePlayerAmmo/Arrow reload UFunctions")
