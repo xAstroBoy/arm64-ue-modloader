@@ -4,7 +4,7 @@
 -- via NotifyOnNewObject + K2_DestroyActor.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "HeadBlocker"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }

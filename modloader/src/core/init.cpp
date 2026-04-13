@@ -249,9 +249,8 @@ namespace init
                 {
                     int gn_count = 0;
                     auto result = safe_call::execute([&]()
-                                                     {
-                    reflection::walk_all_fnames([&](int32_t index, const std::string &name)
-                                                {
+                                                     { reflection::walk_all_fnames([&](int32_t index, const std::string &name)
+                                                                                   {
                         fprintf(gnames_f, "[%d] %s\n", index, name.c_str());
                         gn_count++; }); }, "GNames dump walk_all_fnames");
                     fflush(gnames_f);

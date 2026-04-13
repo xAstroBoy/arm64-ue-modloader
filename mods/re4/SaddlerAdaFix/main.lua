@@ -9,7 +9,7 @@
 --   Native hooks on GetEtcModelClass for mesh table override
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "SaddlerAdaFix"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local EM3F_INDEX = 0x3F

@@ -1,15 +1,14 @@
--- mods/DualWield/main.lua v4.2
+-- mods/DualWield/main.lua v5.0
 -- ═══════════════════════════════════════════════════════════════════════
--- UE4SS-enhanced Dual Wield — grab any weapon in both hands.
+-- Dual Wield — grab any weapon in both hands.
 --
--- v4.0 — UE4SS enhancements:
---   FindFirstOf("VR4GamePlayerPawn") for hand state inspection
---   FindAllOf("VR4GamePlayerGun") for active gun listing
---   RegisterHook on EquipProp for equip monitoring
+-- v5.0 — Dual approach (UFunction PostHook + native Dobby fallback):
+--   PostHook on VR4GamePlayerProp:IsPresentOnBody via ProcessEvent
 --   Native Dobby hooks on IsPresentOnBody/CanGrab/IsGrabAllowed
+--   RegisterHook on EquipProp for equip monitoring
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "DualWield"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
@@ -31,8 +30,8 @@ RegisterHook("/Script/Game.VR4GamePlayerPawn:EquipProp", function(Context, Parms
     local self = Context:get()
     if self and self:IsValid() then
         pcall(function()
-            local slot = self:GetCurrentEquippedPropSlot()
-            local hand = self:GetWeaponHand()
+            local slot = self:Call("GetCurrentEquippedPropSlot")
+            local hand = self:Call("GetWeaponHand")
             if slot and hand then
                 Log(TAG .. ": EquipProp slot=" .. tostring(slot)
                     .. " hand=" .. tostring(hand))
@@ -43,7 +42,20 @@ end)
 Log(TAG .. ": RegisterHook — VR4GamePlayerPawn:EquipProp (monitor)")
 
 -- ═══════════════════════════════════════════════════════════════════════
--- NATIVE DOBBY HOOKS — Allow grabbing duplicates
+-- UFunction PostHook — Override grab checks via ProcessEvent (safe)
+-- ═══════════════════════════════════════════════════════════════════════
+
+pcall(function()
+    RegisterPostHook("/Script/Game.VR4GamePlayerProp:IsPresentOnBody", function(self, func, parms)
+        if not state.enabled then return end
+        local p = CastParms(parms, "VR4GamePlayerProp:IsPresentOnBody")
+        if p then p:SetReturnValue(true) end
+    end)
+    Log(TAG .. ": PostHook IsPresentOnBody -> true (UFunction path)")
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- NATIVE DOBBY HOOKS — Allow grabbing duplicates (fallback for C++ calls)
 -- ═══════════════════════════════════════════════════════════════════════
 
 local sym_IsPresentOnBody = Resolve("IsPresentOnBody", 0x0670D6F4)
@@ -134,8 +146,8 @@ RegisterCommand("dualwield_status", function()
         for i, gun in ipairs(guns) do
             if gun and gun:IsValid() then
                 pcall(function()
-                    local wtype = gun:GetWeaponType()
-                    local hand = gun:GetFiringHand()
+                    local wtype = gun:Call("GetWeaponType")
+                    local hand = gun:Call("GetFiringHand")
                     info = info .. " [type=" .. tostring(wtype) .. " hand=" .. tostring(hand) .. "]"
                 end)
             end
@@ -146,7 +158,7 @@ RegisterCommand("dualwield_status", function()
     V("FindFirstOf(VR4GamePlayerPawn) = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         pcall(function()
-            local locked = pawn:AreHandsGrabLocked()
+            local locked = pawn:Call("AreHandsGrabLocked")
             if locked ~= nil then info = info .. " | grabLocked=" .. tostring(locked) end
         end)
     end
@@ -159,4 +171,4 @@ if SharedAPI and SharedAPI.DebugMenu then
         function(v) state.enabled = v; ModConfig.Save("DualWield", state) end)
 end
 
-Log(TAG .. ": v4.0 loaded — UE4SS RegisterHook EquipProp + native IsPresentOnBody/CanGrab/IsGrabAllowed/IsPropGrabbable")
+Log(TAG .. ": v5.0 loaded — PostHook IsPresentOnBody + native hooks + DebugMenu")

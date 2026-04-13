@@ -4,7 +4,7 @@
 -- on Bio4Utils:HurtAshley.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "AshleyArmor"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }

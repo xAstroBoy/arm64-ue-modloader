@@ -10,7 +10,7 @@
 --   Distributes spawns in a circle around the player
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "EnemySpawner"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 -- ── HP presets (LE uint16 → {lo, hi}) ───────────────────────────────
@@ -381,8 +381,11 @@ end
 --   +0x0c  s16  posX       x 10.0 -> world X float at cEm+0xa4
 --   +0x0e  s16  posY       x 10.0 -> world Y float (height)
 --   +0x10  s16  posZ       x 10.0 -> world Z float at cEm+0xac
---   +0x12  s16  rotY       x (pi/32768) -> facing angle
---   +0x14-1b    misc rotation/scale params
+--   +0x12  s16  rotY       x (pi/16384) -> facing angle (radians)
+--   +0x14  s16  rotX       x (pi/16384) -> pitch
+--   +0x16  s16  rotZ       x (pi/16384) -> roll
+--   +0x18  s16  scale?     x 1000.0
+--   +0x1A  s16  misc
 
 local sym_EmSetEvent = nil
 local addr_pPL       = nil   -- BSS: cPlayer* pointer (player position)
@@ -453,21 +456,75 @@ local function initNative()
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- PLAYER POSITION — Read from RE4 cPlayer struct via pPL BSS pointer
+-- PLAYER POSITION — UE4 reflection (primary) + native pPL fallback
 -- ═══════════════════════════════════════════════════════════════════════
 
 local function getPlayerPosition()
-    if not addr_pPL then V("getPlayerPosition: addr_pPL is nil"); return nil end
-    local pPL = nil
-    pcall(function() pPL = ReadPtr(addr_pPL) end)
-    if not pPL or IsNull(pPL) then V("getPlayerPosition: pPL ptr is nil/null"); return nil end
-    local x, y, z
-    pcall(function() x = ReadFloat(Offset(pPL, 0xa4)) end)
-    pcall(function() y = ReadFloat(Offset(pPL, 0xa8)) end)
-    pcall(function() z = ReadFloat(Offset(pPL, 0xac)) end)
-    if not x or not z then V("getPlayerPosition: coords nil x=%s z=%s", tostring(x), tostring(z)); return nil end
-    V("getPlayerPosition: pos=(%.1f, %.1f, %.1f)", x, y or 0, z)
-    return x, y or 0, z
+    -- Method 1: UE4 reflection — reliable, works as long as pawn is spawned
+    -- Try multiple class names (VR4Bio4PlayerPawn is the actual class in RE4 VR)
+    local pawn = nil
+    for _, cls in ipairs({"VR4Bio4PlayerPawn", "VR4GamePlayerPawn", "Pawn"}) do
+        if not pawn then
+            pcall(function()
+                local p = FindFirstOf(cls)
+                if p and p:IsValid() then pawn = p end
+            end)
+        end
+    end
+
+    if pawn then
+        -- Try K2_GetActorLocation → returns FVector LuaUStruct {X, Y, Z}
+        -- RE4 VR wraps the RE4 engine inside UE4 — actor positions are stored
+        -- in RE4 native coords: X=horizontal, Y=height, Z=horizontal
+        -- The cEm position at +0xA4/+0xA8/+0xAC matches the UE4 actor location
+        local ok, loc = pcall(function() return pawn:Call("K2_GetActorLocation") end)
+        if ok and loc then
+            local x, y, z
+            pcall(function() x = loc.X end)
+            pcall(function() y = loc.Y end)
+            pcall(function() z = loc.Z end)
+            if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
+                V("getPlayerPosition: K2_GetActorLocation=(%.1f, %.1f, %.1f)", x, y or 0, z or 0)
+                -- Return RE4 native: (posX, posY_height, posZ)
+                return x, y or 0, z or 0
+            end
+        end
+
+        -- Try reading RootComponent.RelativeLocation
+        local ok2, root = pcall(function() return pawn:Get("RootComponent") end)
+        if ok2 and root and root:IsValid() then
+            local ok3, rloc = pcall(function() return root:Get("RelativeLocation") end)
+            if ok3 and rloc then
+                local x, y, z
+                pcall(function() x = rloc.X end)
+                pcall(function() y = rloc.Y end)
+                pcall(function() z = rloc.Z end)
+                if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
+                    V("getPlayerPosition: RelativeLocation=(%.1f, %.1f, %.1f)", x, y or 0, z or 0)
+                    return x, y or 0, z or 0
+                end
+            end
+        end
+    end
+
+    -- Fallback: native pPL (original method — may return 0,0,0)
+    if addr_pPL then
+        local pPL = nil
+        pcall(function() pPL = ReadPtr(addr_pPL) end)
+        if pPL and not IsNull(pPL) then
+            local x, y, z
+            pcall(function() x = ReadFloat(Offset(pPL, 0xa4)) end)
+            pcall(function() y = ReadFloat(Offset(pPL, 0xa8)) end)
+            pcall(function() z = ReadFloat(Offset(pPL, 0xac)) end)
+            if x and z and (x ~= 0 or z ~= 0) then
+                V("getPlayerPosition: native pPL pos=(%.1f, %.1f, %.1f)", x, y or 0, z)
+                return x, y or 0, z
+            end
+        end
+    end
+
+    V("getPlayerPosition: all methods returned nil/zero")
+    return nil
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -578,17 +635,23 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     local dz = -(offsetZ or 0)
     if dx ~= 0 or dz ~= 0 then
         local faceAngle = math.atan(dz, dx)  -- radians toward player
-        -- EM_LIST rotY int16: angle / (pi/32768) = angle * 32768/pi
-        local rotInt = math.floor(faceAngle * 32768.0 / math.pi)
+        -- EM_LIST rotY: EmSetEvent multiplies by pi/16384, so inverse = 16384/pi
+        local rotInt = math.floor(faceAngle * 16384.0 / math.pi)
         pcall(function() WriteU16(Offset(emListBuf, 0x12), toU16(rotInt)) end)
     end
+    -- Zero rotX and rotZ to prevent upside-down spawns
+    pcall(function() WriteU16(Offset(emListBuf, 0x14), 0) end)  -- rotX = 0 (no pitch)
+    pcall(function() WriteU16(Offset(emListBuf, 0x16), 0) end)  -- rotZ = 0 (no roll)
 
     V("spawnSingle: calling EmSetEvent emId=%d subType=%d hp=%d", b[1], b[2], hp)
     -- Call EmSetEvent(EM_LIST*) -> returns cEm* or errEm
+    -- Set flag so Randomizer's EmSetEvent hook skips our deliberate spawns
+    if SharedAPI then SharedAPI._skipRandomizer = true end
     local result = nil
     local callOk, callErr = pcall(function()
         result = CallNative(sym_EmSetEvent, "pp", emListBuf)
     end)
+    if SharedAPI then SharedAPI._skipRandomizer = false end
 
     if not callOk then
         V("spawnSingle: CallNative crashed: %s", tostring(callErr))

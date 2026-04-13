@@ -5,7 +5,7 @@
 -- No blocking — lets the game flow naturally, just auto-dismisses.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "RadioSkip"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {

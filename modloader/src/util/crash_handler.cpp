@@ -51,6 +51,19 @@ namespace lua_uobject
     extern thread_local sigjmp_buf g_call_ufunction_jmp;
 }
 
+// Mod loading crash recovery — defined in mod_loader.cpp
+// When a mod's main.lua causes a SIGSEGV during loading, we siglongjmp
+// back to load_mod() which marks the mod as FAILED and continues.
+// This is the LOWEST PRIORITY recovery — checked AFTER all inner guards
+// (safe_call, hook install, hook execution, ProcessEvent) so that
+// crashes in those subsystems are handled locally instead of killing
+// the entire mod.
+namespace mod_loader
+{
+    extern thread_local sigjmp_buf s_mod_jmpbuf;
+    extern thread_local volatile sig_atomic_t s_in_mod_loading;
+}
+
 namespace crash_handler
 {
 
@@ -250,6 +263,19 @@ namespace crash_handler
             // Never reaches here
         }
 
+        // ── MOD LOADING CRASH RECOVERY (lowest priority) ────────────────────
+        // If we're inside a mod's main.lua execution and none of the inner
+        // recovery guards above caught this crash, recover here.
+        // This is the LAST resort — it kills the current mod and skips to the
+        // next one, but it must be checked AFTER all inner guards so that e.g.
+        // a DobbyHook() crash during hook installation jumps to the hook-install
+        // guard (which just skips that hook) instead of killing the entire mod.
+        if (mod_loader::s_in_mod_loading)
+        {
+            siglongjmp(mod_loader::s_mod_jmpbuf, sig);
+            // Never reaches here
+        }
+
         // Determine if crash PC is inside libmodloader.so or game code.
         ucontext_t *uc = static_cast<ucontext_t *>(ucontext_raw);
         bool is_modloader_crash = false;
@@ -276,170 +302,170 @@ namespace crash_handler
 
         // Write full crash report ONLY for libmodloader.so crashes (safe — we control our heap)
         {
-        FILE *f = fopen(paths::crash_log().c_str(), "w");
-        if (f)
-        {
-            // Timestamp
-            struct timeval tv;
-            gettimeofday(&tv, nullptr);
-            struct tm tm_info;
-            localtime_r(&tv.tv_sec, &tm_info);
-            char date_buf[64];
-            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
-
-            fprintf(f, "=== MODLOADER CRASH REPORT ===\n");
-            fprintf(f, "Time: %s.%03ld\n", date_buf, tv.tv_usec / 1000);
-            fprintf(f, "Signal: %s (%d)\n", signal_name(sig), sig);
-            fprintf(f, "Code: %s (%d)\n", signal_code_name(sig, info->si_code), info->si_code);
-            fprintf(f, "Fault address: %p\n", info->si_addr);
-            fprintf(f, "Crash origin: %s\n", is_modloader_crash ? "libmodloader.so (OUR CODE)" : "GAME / EXTERNAL (possibly triggered by our hooks)");
-            // Resolve crashing library via dladdr
-            if (uc)
+            FILE *f = fopen(paths::crash_log().c_str(), "w");
+            if (f)
             {
-                uintptr_t crash_pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
-                Dl_info crash_dl;
-                if (dladdr(reinterpret_cast<void *>(crash_pc), &crash_dl) && crash_dl.dli_fname)
-                {
-                    fprintf(f, "Crash library: %s\n", crash_dl.dli_fname);
-                    fprintf(f, "Crash offset:  0x%lX\n",
-                            (unsigned long)(crash_pc - reinterpret_cast<uintptr_t>(crash_dl.dli_fbase)));
-                }
-            }
-            fprintf(f, "Crash log path: %s\n", paths::crash_log().c_str());
-            fprintf(f, "\n");
-            fprintf(f, "=== LIBRARY BASE ADDRESSES ===\n");
-            fprintf(f, "libmodloader.so base: 0x%lX\n", (unsigned long)s_modloader_base);
-            fprintf(f, "libmodloader.so end:  0x%lX\n", (unsigned long)s_modloader_end);
-            fprintf(f, "libmodloader.so size: 0x%lX\n",
-                    (unsigned long)(s_modloader_end - s_modloader_base));
+                // Timestamp
+                struct timeval tv;
+                gettimeofday(&tv, nullptr);
+                struct tm tm_info;
+                localtime_r(&tv.tv_sec, &tm_info);
+                char date_buf[64];
+                strftime(date_buf, sizeof(date_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
 
-            // Register dump (ARM64)
-            ucontext_t *uc_reg = static_cast<ucontext_t *>(ucontext_raw);
-            if (uc_reg)
-            {
-                uintptr_t pc = static_cast<uintptr_t>(uc_reg->uc_mcontext.pc);
-                uintptr_t pc_offset = (pc >= s_modloader_base) ? (pc - s_modloader_base) : 0;
-
-                fprintf(f, "\n=== CRASH PC ===\n");
-                fprintf(f, "PC  = 0x%016llx\n", (unsigned long long)pc);
-                if (pc_in_modloader(pc))
+                fprintf(f, "=== MODLOADER CRASH REPORT ===\n");
+                fprintf(f, "Time: %s.%03ld\n", date_buf, tv.tv_usec / 1000);
+                fprintf(f, "Signal: %s (%d)\n", signal_name(sig), sig);
+                fprintf(f, "Code: %s (%d)\n", signal_code_name(sig, info->si_code), info->si_code);
+                fprintf(f, "Fault address: %p\n", info->si_addr);
+                fprintf(f, "Crash origin: %s\n", is_modloader_crash ? "libmodloader.so (OUR CODE)" : "GAME / EXTERNAL (possibly triggered by our hooks)");
+                // Resolve crashing library via dladdr
+                if (uc)
                 {
-                    fprintf(f, "PC offset in libmodloader.so: 0x%lX\n", (unsigned long)pc_offset);
-                    fprintf(f, "\n");
-                    fprintf(f, "To symbolicate on host PC:\n");
-                    fprintf(f, "  llvm-addr2line -e build/libmodloader.so -f 0x%lX\n",
-                            (unsigned long)pc_offset);
-                    fprintf(f, "  ndk-stack -sym build/ -dump <this_file>\n");
-                }
-                else
-                {
-                    // Game crash — show which library and offset
-                    Dl_info pc_dl;
-                    if (dladdr(reinterpret_cast<void *>(pc), &pc_dl) && pc_dl.dli_fname)
+                    uintptr_t crash_pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+                    Dl_info crash_dl;
+                    if (dladdr(reinterpret_cast<void *>(crash_pc), &crash_dl) && crash_dl.dli_fname)
                     {
-                        uintptr_t lib_offset = pc - reinterpret_cast<uintptr_t>(pc_dl.dli_fbase);
-                        fprintf(f, "PC in %s + 0x%lX\n", pc_dl.dli_fname, (unsigned long)lib_offset);
-                        if (pc_dl.dli_sname)
-                            fprintf(f, "Near symbol: %s\n", pc_dl.dli_sname);
+                        fprintf(f, "Crash library: %s\n", crash_dl.dli_fname);
+                        fprintf(f, "Crash offset:  0x%lX\n",
+                                (unsigned long)(crash_pc - reinterpret_cast<uintptr_t>(crash_dl.dli_fbase)));
+                    }
+                }
+                fprintf(f, "Crash log path: %s\n", paths::crash_log().c_str());
+                fprintf(f, "\n");
+                fprintf(f, "=== LIBRARY BASE ADDRESSES ===\n");
+                fprintf(f, "libmodloader.so base: 0x%lX\n", (unsigned long)s_modloader_base);
+                fprintf(f, "libmodloader.so end:  0x%lX\n", (unsigned long)s_modloader_end);
+                fprintf(f, "libmodloader.so size: 0x%lX\n",
+                        (unsigned long)(s_modloader_end - s_modloader_base));
+
+                // Register dump (ARM64)
+                ucontext_t *uc_reg = static_cast<ucontext_t *>(ucontext_raw);
+                if (uc_reg)
+                {
+                    uintptr_t pc = static_cast<uintptr_t>(uc_reg->uc_mcontext.pc);
+                    uintptr_t pc_offset = (pc >= s_modloader_base) ? (pc - s_modloader_base) : 0;
+
+                    fprintf(f, "\n=== CRASH PC ===\n");
+                    fprintf(f, "PC  = 0x%016llx\n", (unsigned long long)pc);
+                    if (pc_in_modloader(pc))
+                    {
+                        fprintf(f, "PC offset in libmodloader.so: 0x%lX\n", (unsigned long)pc_offset);
+                        fprintf(f, "\n");
+                        fprintf(f, "To symbolicate on host PC:\n");
+                        fprintf(f, "  llvm-addr2line -e build/libmodloader.so -f 0x%lX\n",
+                                (unsigned long)pc_offset);
+                        fprintf(f, "  ndk-stack -sym build/ -dump <this_file>\n");
                     }
                     else
                     {
-                        fprintf(f, "PC not in any known library (unmapped?)\n");
-                    }
-                }
-
-                fprintf(f, "\n=== REGISTERS ===\n");
-                for (int i = 0; i < 31; i++)
-                {
-                    uintptr_t reg_val = static_cast<uintptr_t>(uc_reg->uc_mcontext.regs[i]);
-                    fprintf(f, "X%-2d = 0x%016llx", i,
-                            (unsigned long long)reg_val);
-                    // Annotate registers pointing into libmodloader.so
-                    if (pc_in_modloader(reg_val))
-                    {
-                        fprintf(f, "  (libmodloader.so+0x%lX)",
-                                (unsigned long)(reg_val - s_modloader_base));
-                    }
-                    else
-                    {
-                        Dl_info reg_dl;
-                        if (reg_val > 0x10000 && dladdr(reinterpret_cast<void *>(reg_val), &reg_dl) &&
-                            reg_dl.dli_fname)
+                        // Game crash — show which library and offset
+                        Dl_info pc_dl;
+                        if (dladdr(reinterpret_cast<void *>(pc), &pc_dl) && pc_dl.dli_fname)
                         {
-                            fprintf(f, "  (%s+0x%lX)", reg_dl.dli_fname,
-                                    (unsigned long)(reg_val - reinterpret_cast<uintptr_t>(reg_dl.dli_fbase)));
+                            uintptr_t lib_offset = pc - reinterpret_cast<uintptr_t>(pc_dl.dli_fbase);
+                            fprintf(f, "PC in %s + 0x%lX\n", pc_dl.dli_fname, (unsigned long)lib_offset);
+                            if (pc_dl.dli_sname)
+                                fprintf(f, "Near symbol: %s\n", pc_dl.dli_sname);
+                        }
+                        else
+                        {
+                            fprintf(f, "PC not in any known library (unmapped?)\n");
                         }
                     }
-                    fprintf(f, "\n");
-                }
-                fprintf(f, "SP  = 0x%016llx\n", (unsigned long long)uc_reg->uc_mcontext.sp);
-                fprintf(f, "PC  = 0x%016llx\n", (unsigned long long)uc_reg->uc_mcontext.pc);
-            }
 
-            // Backtrace with addr2line hints
-            fprintf(f, "\n=== BACKTRACE ===\n");
-            fprintf(f, "# addr2line commands for libmodloader.so frames:\n");
-            void *frames[64];
-            int depth = capture_backtrace(frames, 64);
-            for (int i = 0; i < depth; i++)
-            {
-                Dl_info dl_info;
-                if (dladdr(frames[i], &dl_info))
-                {
-                    uintptr_t offset = reinterpret_cast<uintptr_t>(frames[i]) -
-                                       reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
-                    const char *lib_short = dl_info.dli_fname;
-                    // Extract just filename from path
-                    const char *slash = strrchr(lib_short, '/');
-                    if (slash)
-                        lib_short = slash + 1;
-
-                    fprintf(f, "#%02d  %p  %s + 0x%lx (%s)\n",
-                            i, frames[i],
-                            dl_info.dli_sname ? dl_info.dli_sname : "???",
-                            (unsigned long)offset,
-                            lib_short);
-
-                    // If this frame is in libmodloader.so, print addr2line command
-                    if (dl_info.dli_fname && strstr(dl_info.dli_fname, "libmodloader.so"))
+                    fprintf(f, "\n=== REGISTERS ===\n");
+                    for (int i = 0; i < 31; i++)
                     {
-                        fprintf(f, "     -> llvm-addr2line -e build/libmodloader.so -f 0x%lX\n",
-                                (unsigned long)offset);
+                        uintptr_t reg_val = static_cast<uintptr_t>(uc_reg->uc_mcontext.regs[i]);
+                        fprintf(f, "X%-2d = 0x%016llx", i,
+                                (unsigned long long)reg_val);
+                        // Annotate registers pointing into libmodloader.so
+                        if (pc_in_modloader(reg_val))
+                        {
+                            fprintf(f, "  (libmodloader.so+0x%lX)",
+                                    (unsigned long)(reg_val - s_modloader_base));
+                        }
+                        else
+                        {
+                            Dl_info reg_dl;
+                            if (reg_val > 0x10000 && dladdr(reinterpret_cast<void *>(reg_val), &reg_dl) &&
+                                reg_dl.dli_fname)
+                            {
+                                fprintf(f, "  (%s+0x%lX)", reg_dl.dli_fname,
+                                        (unsigned long)(reg_val - reinterpret_cast<uintptr_t>(reg_dl.dli_fbase)));
+                            }
+                        }
+                        fprintf(f, "\n");
+                    }
+                    fprintf(f, "SP  = 0x%016llx\n", (unsigned long long)uc_reg->uc_mcontext.sp);
+                    fprintf(f, "PC  = 0x%016llx\n", (unsigned long long)uc_reg->uc_mcontext.pc);
+                }
+
+                // Backtrace with addr2line hints
+                fprintf(f, "\n=== BACKTRACE ===\n");
+                fprintf(f, "# addr2line commands for libmodloader.so frames:\n");
+                void *frames[64];
+                int depth = capture_backtrace(frames, 64);
+                for (int i = 0; i < depth; i++)
+                {
+                    Dl_info dl_info;
+                    if (dladdr(frames[i], &dl_info))
+                    {
+                        uintptr_t offset = reinterpret_cast<uintptr_t>(frames[i]) -
+                                           reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
+                        const char *lib_short = dl_info.dli_fname;
+                        // Extract just filename from path
+                        const char *slash = strrchr(lib_short, '/');
+                        if (slash)
+                            lib_short = slash + 1;
+
+                        fprintf(f, "#%02d  %p  %s + 0x%lx (%s)\n",
+                                i, frames[i],
+                                dl_info.dli_sname ? dl_info.dli_sname : "???",
+                                (unsigned long)offset,
+                                lib_short);
+
+                        // If this frame is in libmodloader.so, print addr2line command
+                        if (dl_info.dli_fname && strstr(dl_info.dli_fname, "libmodloader.so"))
+                        {
+                            fprintf(f, "     -> llvm-addr2line -e build/libmodloader.so -f 0x%lX\n",
+                                    (unsigned long)offset);
+                        }
+                    }
+                    else
+                    {
+                        fprintf(f, "#%02d  %p  ???\n", i, frames[i]);
                     }
                 }
-                else
+
+                // Safe-call statistics
+                fprintf(f, "\n=== SAFE-CALL STATS ===\n");
+                fprintf(f, "Total crash recoveries: %llu\n",
+                        (unsigned long long)safe_call::crash_recovery_count());
+                fprintf(f, "Exception recoveries:   %llu\n",
+                        (unsigned long long)safe_call::exception_count());
+                fprintf(f, "Signal recoveries:      %llu\n",
+                        (unsigned long long)safe_call::signal_recovery_count());
+                const std::string &last_ctx = safe_call::last_crash_context();
+                if (!last_ctx.empty())
                 {
-                    fprintf(f, "#%02d  %p  ???\n", i, frames[i]);
+                    fprintf(f, "Last crash context:     %s\n", last_ctx.c_str());
                 }
+
+                // Append last 500 lines of UEModLoader.log
+                fprintf(f, "\n=== LAST 500 LOG LINES ===\n");
+                auto tail_text = logger::get_tail(500);
+                fprintf(f, "%s", tail_text.c_str());
+
+                fprintf(f, "\n=== END CRASH REPORT ===\n");
+                fprintf(f, "Crash log location: %s\n", paths::crash_log().c_str());
+                fflush(f);
+                fclose(f);
             }
 
-            // Safe-call statistics
-            fprintf(f, "\n=== SAFE-CALL STATS ===\n");
-            fprintf(f, "Total crash recoveries: %llu\n",
-                    (unsigned long long)safe_call::crash_recovery_count());
-            fprintf(f, "Exception recoveries:   %llu\n",
-                    (unsigned long long)safe_call::exception_count());
-            fprintf(f, "Signal recoveries:      %llu\n",
-                    (unsigned long long)safe_call::signal_recovery_count());
-            const std::string &last_ctx = safe_call::last_crash_context();
-            if (!last_ctx.empty())
-            {
-                fprintf(f, "Last crash context:     %s\n", last_ctx.c_str());
-            }
-
-            // Append last 500 lines of UEModLoader.log
-            fprintf(f, "\n=== LAST 500 LOG LINES ===\n");
-            auto tail_text = logger::get_tail(500);
-            fprintf(f, "%s", tail_text.c_str());
-
-            fprintf(f, "\n=== END CRASH REPORT ===\n");
-            fprintf(f, "Crash log location: %s\n", paths::crash_log().c_str());
-            fflush(f);
-            fclose(f);
-        }
-
-        // Post crash notification (best effort — may fail in signal context)
-        notification::post_crash();
+            // Post crash notification (best effort — may fail in signal context)
+            notification::post_crash();
         } // end crash-report scope
 
     chain_to_old_handler:

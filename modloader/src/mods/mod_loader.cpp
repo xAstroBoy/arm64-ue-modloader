@@ -29,53 +29,16 @@ static std::mutex s_mods_mutex;
 // process-wide but SIGSEGV is delivered to the faulting thread.
 // Without thread_local, a game thread SIGSEGV during mod loading would
 // siglongjmp using the modloader thread's jmpbuf = undefined behavior.
-static thread_local sigjmp_buf s_mod_jmpbuf;
-static thread_local volatile sig_atomic_t s_in_mod_loading = 0;
-static struct sigaction s_prev_sigsegv;
-static struct sigaction s_prev_sigbus;
-static struct sigaction s_prev_sigabrt;
-
-static void mod_load_signal_handler(int sig, siginfo_t* info, void* ucontext) {
-    if (s_in_mod_loading) {
-        // We're inside a mod load — recover instead of dying
-        // NOTE: This is signal-handler context. Only async-signal-safe calls.
-        siglongjmp(s_mod_jmpbuf, sig);
-    }
-
-    // Not in mod loading — forward to the original crash handler
-    struct sigaction* old = nullptr;
-    switch (sig) {
-        case SIGSEGV: old = &s_prev_sigsegv; break;
-        case SIGBUS:  old = &s_prev_sigbus;  break;
-        case SIGABRT: old = &s_prev_sigabrt; break;
-    }
-    if (old && old->sa_sigaction) {
-        old->sa_sigaction(sig, info, ucontext);
-    } else if (old && old->sa_handler && old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
-        old->sa_handler(sig);
-    } else {
-        signal(sig, SIG_DFL);
-        raise(sig);
-    }
-}
-
-static void install_mod_signal_handler() {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = mod_load_signal_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-
-    sigaction(SIGSEGV, &sa, &s_prev_sigsegv);
-    sigaction(SIGBUS,  &sa, &s_prev_sigbus);
-    sigaction(SIGABRT, &sa, &s_prev_sigabrt);
-}
-
-static void restore_original_signal_handler() {
-    sigaction(SIGSEGV, &s_prev_sigsegv, nullptr);
-    sigaction(SIGBUS,  &s_prev_sigbus,  nullptr);
-    sigaction(SIGABRT, &s_prev_sigabrt, nullptr);
-}
+//
+// NOTE: These are NOT static — they are referenced by crash_handler.cpp
+// as the LOWEST PRIORITY recovery point in the unified signal handler.
+// This ensures that inner recovery guards (hook install, hook execution,
+// ProcessEvent, safe_call) fire BEFORE mod-loading recovery. Previously,
+// a separate mod_load_signal_handler would bypass those inner guards,
+// causing DobbyHook() crashes to kill entire mods instead of just
+// skipping the failed hook.
+thread_local sigjmp_buf s_mod_jmpbuf;
+thread_local volatile sig_atomic_t s_in_mod_loading = 0;
 
 static bool file_exists(const std::string& path) {
     struct stat st;
@@ -129,8 +92,10 @@ int load_all() {
     int loaded = 0;
     int failed = 0;
 
-    // Install SIGSEGV recovery handler for the entire mod loading phase
-    install_mod_signal_handler();
+    // NOTE: No separate signal handler installed here.
+    // crash_handler.cpp's unified handler checks s_in_mod_loading as
+    // the LOWEST priority recovery, ensuring inner guards (hook install,
+    // hook execution, ProcessEvent, safe_call) fire first.
 
     for (const auto& mod_name : mod_dirs) {
         if (load_mod(mod_name)) {
@@ -139,9 +104,6 @@ int load_all() {
             failed++;
         }
     }
-
-    // Restore original signal handler after all mods are loaded
-    restore_original_signal_handler();
 
     logger::log_info("MOD", "Loaded %d mods, %d failed (from %s)", loaded, failed, mods_path.c_str());
     return loaded;

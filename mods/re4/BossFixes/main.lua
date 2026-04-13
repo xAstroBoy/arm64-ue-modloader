@@ -11,7 +11,7 @@
 --   Native hooks on cEmWrap::setHp for death trigger
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "BossFixes"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 -- ── Boss type IDs ───────────────────────────────────────────────────────

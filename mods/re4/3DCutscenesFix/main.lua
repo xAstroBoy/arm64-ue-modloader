@@ -9,7 +9,7 @@
 --   Native Dobby hooks on CutsceneUpdateCamera + SceEvent Begin/End
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "3DCutscenesFix"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {

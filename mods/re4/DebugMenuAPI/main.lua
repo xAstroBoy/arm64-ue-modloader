@@ -1,6 +1,6 @@
 --[[
-    DebugMenuAPI v23 — BndEvt Hook Architecture
-    ============================================
+    DebugMenuAPI v26.0 — In-place widget updates (no ClearWidgets)
+    ===================================================
     A mod-menu system that cooperates with the stock DebugMenu_C.
     NEVER blocks or overrides Blueprint behaviour.
 
@@ -8,24 +8,30 @@
     This mod only takes over for custom byte-IDs (100 +).
 
     ─────────────────────────────────────────────────────────────────────
-    HOW IT WORKS  (v23 — BndEvt hooks)
+    HOW IT WORKS  (v25 — Deferred injection + BndEvt hooks)
     ─────────────────────────────────────────────────────────────────────
     IMPORTANT: Blueprint-internal function calls (DoAction, NewMenu,
     InputActionConfirm etc.) do NOT go through ProcessEvent so they
     CANNOT be hooked. Only delegate-dispatched BndEvt functions on
     VR4PlayerController_BP_C go through ProcessEvent.
 
-    1.  A PAK-injected DataTable row adds "Mods" (OptionType = Setting)
-        to the stock Main page.
-    2.  PostHook BndEvt Confirm (3, 8, 10) — after Blueprint finishes
-        its confirm action, detects "Mods" selection on Main page and
-        calls NewMenu(100) via Lua (goes through ProcessEvent).
-    3.  PostHook NewMenu — fires ONLY when called via ProcessEvent
+    v25 KEY FIX: The PostHook on OpenDebugMenu fires BEFORE Blueprint's
+    latent actions complete (e.g. fade-in animations, deferred NewMenu).
+    Injecting "Mods" immediately gets wiped by subsequent Blueprint
+    execution. We now use ExecuteWithDelay with multiple retry windows
+    to inject AFTER all Blueprint activity settles. BndEvt Scroll hooks
+    provide lazy injection as a failsafe.
+
+    1.  PostHook on OpenDebugMenu schedules deferred injection of "Mods"
+        at 200ms/500ms/1000ms after menu opens (retries until it sticks).
+    2.  BndEvt Scroll hooks (IDs 0,1,2,4,5,6,7,11,13) lazily inject
+        "Mods" whenever user scrolls on Main page (AM=1).
+    3.  PostHook BndEvt Confirm (3, 8, 10) — detects "Mods" selection
+        on Main page and navigates to page 100 via Lua.
+    4.  PostHook NewMenu — fires ONLY when called via ProcessEvent
         (i.e. from our Lua dm:Call). APPENDS custom option widgets.
-    4.  PostHook BndEvt Back (9) — when Blueprint navigates back to a
-        custom page, rebuilds it (since internal NewMenu call doesn't
-        trigger our PostHook).
-    5.  On custom pages, BndEvt Confirm dispatches item actions.
+    5.  PostHook BndEvt Back (9) — when Blueprint navigates back to a
+        custom page, rebuilds it.
 
     BLUEPRINT HANDLES (never touched by Lua):
         ✓  Scrolling          InputActionScrollUp / Down
@@ -52,7 +58,7 @@
 ]]
 
 local MOD_NAME = "DebugMenuAPI"
-local VERSION  = "23.0"
+local VERSION  = "26.0"
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- STATE
@@ -93,7 +99,7 @@ local function Err(msg)
 end
 
 local TAG = "[DebugMenuAPI]"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then print(TAG .. " [V] " .. string.format(...)) end end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -142,6 +148,81 @@ local function ensure_viewport(dm)
             widget_comp:Call("RequestRedraw")
         end
     end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- MODS OPTION INJECTION (programmatic — replaces old PAK DataTable row)
+-- ═══════════════════════════════════════════════════════════════════════
+
+--- Append a "Mods" option widget to the Main page (AM=1) if not present.
+--- Called after Blueprint builds the stock 24-item Main page.
+--- Returns true if "Mods" is now present, false if injection failed.
+local function ensure_mods_option(dm)
+    local ok, widgets = pcall(function() return dm:Get("ActiveOptionsWidgets") end)
+    if not ok or not widgets then V("ensure_mods: no widgets array"); return false end
+
+    local count = 0
+    pcall(function() count = #widgets end)
+
+    -- Need at least the stock items to be present before injecting
+    if count < 10 then
+        V("ensure_mods: only %d widgets, too early (waiting for stock items)", count)
+        return false
+    end
+
+    -- Scan for existing "Mods" widget
+    for i = 1, count do
+        local ok2, w = pcall(function() return widgets[i] end)
+        if ok2 and w and w:IsValid() then
+            local ok3, name = pcall(function() return w:Get("OptionName") end)
+            if ok3 and tostring(name) == "Mods" then
+                V("ensure_mods: already present at index %d", i)
+                return true
+            end
+        end
+    end
+
+    -- Not found → inject as last option
+    local ok_create = pcall(function() dm:Call("CreateActiveOption", "Mods") end)
+    if ok_create then
+        Log("Injected 'Mods' option on Main page (item #" .. (count + 1) .. ")")
+
+        -- Increase MaxVisible so user can scroll to see "Mods"
+        pcall(function()
+            local pw = dm:Get("ParentWidget")
+            if pw then
+                local vbl = pw:Get("DebugVBoxList")
+                if vbl then
+                    vbl:Set("MaxVisible", 30)
+                    vbl:Call("UpdateListView")
+                end
+            end
+        end)
+
+        -- Force render target update
+        ensure_viewport(dm)
+    else
+        Warn("Failed to inject 'Mods' option widget")
+    end
+    return ok_create
+end
+
+--- Schedule deferred injection of "Mods" on the Main page.
+--- Uses multiple retry windows to survive Blueprint latent actions
+--- that may rebuild/clear the widget list after OpenDebugMenu returns.
+local function schedule_mods_injection()
+    local delays = {200, 500, 1000, 2000}
+    for _, ms in ipairs(delays) do
+        ExecuteWithDelay(ms, function()
+            pcall(function()
+                local dm = get_dm()
+                if not dm then return end
+                local am = get_active_menu(dm)
+                if am ~= 1 then return end
+                ensure_mods_option(dm)
+            end)
+        end)
+    end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -330,7 +411,17 @@ local function dispatch_item(dm, page_byte)
         if item.setter then
             pcall(item.setter, new_state)
         end
-        refresh_page(dm, page_byte, ci)
+        -- Update widget label in-place (works for ALL page types — never ClearWidgets)
+        pcall(function()
+            local widgets = dm:Get("ActiveOptionsWidgets")
+            -- ci is 0-based (Back=0, items start at 1), TArray is 1-based
+            local w = widgets[ci + 1]
+            if w and w:IsValid() then
+                w:Set("OptionName", make_display(item))
+                pcall(function() w:Call("Setup") end)
+            end
+        end)
+        ensure_viewport(dm)
 
     -- ── Selector ────────────────────────────────────────────────
     elseif item.type == "selector" and item.options and #item.options > 0 then
@@ -339,7 +430,16 @@ local function dispatch_item(dm, page_byte)
             local val = item.options[item.sel_index + 1]
             pcall(item.callback, val, item.sel_index, item)
         end
-        refresh_page(dm, page_byte, ci)
+        -- Update widget label in-place (works for ALL page types — never ClearWidgets)
+        pcall(function()
+            local widgets = dm:Get("ActiveOptionsWidgets")
+            local w = widgets[ci + 1]
+            if w and w:IsValid() then
+                w:Set("OptionName", make_display(item))
+                pcall(function() w:Call("Setup") end)
+            end
+        end)
+        ensure_viewport(dm)
 
     -- ── SubMenu link ────────────────────────────────────────────
     elseif item.type == "submenu" then
@@ -389,8 +489,8 @@ local function setup_hooks()
     RegisterPostHook(DM_PATH .. ":NewMenu", function(self, func, parms)
         V("PostHook NewMenu fired")
         pcall(function()
-            local dm = self:get()
-            if not dm then V("PostHook NewMenu: self:get() returned nil"); return end
+            local dm = get_dm()
+            if not dm then V("PostHook NewMenu: get_dm() returned nil"); return end
 
             local am = get_active_menu(dm)
             V("PostHook NewMenu: AM=%s, is_custom=%s", tostring(am), tostring(am and pages[am] ~= nil))
@@ -404,6 +504,46 @@ local function setup_hooks()
                 .. (page.populate_fn and " [dynamic]" or ""))
         end)
     end)
+
+    -- ┌─────────────────────────────────────────────────────────────────┐
+    -- │ PostHook : OpenDebugMenu                                       │
+    -- │ Fires when menu is opened via interface message from            │
+    -- │ VR4PlayerController_BP_C:DebugMenuButtonPressed.               │
+    -- │ Blueprint has latent actions that build widgets AFTER this      │
+    -- │ function returns, so direct injection gets wiped.              │
+    -- │ We schedule DEFERRED injection at multiple delay windows.      │
+    -- └─────────────────────────────────────────────────────────────────┘
+    pcall(function()
+        RegisterPostHook(DM_PATH .. ":OpenDebugMenu", function(self, func, parms)
+            Log("PostHook OpenDebugMenu FIRED — scheduling deferred injection")
+            V("PostHook OpenDebugMenu fired — scheduling deferred injection")
+            schedule_mods_injection()
+        end)
+        Log("PostHook: OpenDebugMenu → deferred 'Mods' injection (200/500/1000/2000ms)")
+    end)
+
+    -- ┌─────────────────────────────────────────────────────────────────┐
+    -- │ PostHook : BndEvt Scroll (IDs 0,1,2,4,5,6,7,11,13)            │
+    -- │ Lazy injection: whenever user scrolls on Main page (AM=1),    │
+    -- │ check if "Mods" exists and inject if missing. This is a       │
+    -- │ failsafe for the deferred injection above.                    │
+    -- └─────────────────────────────────────────────────────────────────┘
+    local SCROLL_IDS = {0, 1, 2, 4, 5, 6, 7, 11, 13}
+
+    local function on_scroll_post(self, func, parms)
+        pcall(function()
+            local dm = get_dm()
+            if not dm then return end
+            local am = get_active_menu(dm)
+            if am ~= 1 then return end
+            ensure_mods_option(dm)
+        end)
+    end
+
+    for _, id in ipairs(SCROLL_IDS) do
+        pcall(function() RegisterPostHook(bndevt(id), on_scroll_post) end)
+    end
+    Log("PostHook: BndEvt Scroll (" .. #SCROLL_IDS .. " IDs) → lazy 'Mods' injection on page 1")
 
     -- ┌─────────────────────────────────────────────────────────────────┐
     -- │ PostHook : BndEvt Confirm (IDs 3, 8, 10)                       │
@@ -435,6 +575,8 @@ local function setup_hooks()
 
             -- Job 1: Main page → navigate to Mods root
             if am == 1 then
+                -- Lazy injection fallback (in case deferred injection missed)
+                ensure_mods_option(dm)
                 local opt = get_selected_option_name(dm)
                 V("BndEvt Confirm: Main page, selected=%s", tostring(opt))
                 if opt == "Mods" then
@@ -489,16 +631,22 @@ local function setup_hooks()
 
             local am = get_active_menu(dm)
             V("BndEvt Back: AM=%s, is_custom=%s", tostring(am), tostring(am and pages[am] ~= nil))
-            if not am or not pages[am] then return end
+            if not am then return end
 
-            -- We're on a custom page after pressing Back.
-            -- Blueprint ran PreviousMenu → NewMenu(am) internally.
-            -- Rebuild with proper content.
-            rebuild_custom_page(dm, am)
+            -- Returned to Main page → schedule "Mods" injection
+            if am == 1 then
+                schedule_mods_injection()
+                return
+            end
+
+            -- Custom page → rebuild
+            if pages[am] then
+                rebuild_custom_page(dm, am)
+            end
         end)
     end)
 
-    Log("Hooks installed (PostHook NewMenu + BndEvt Confirm×3 + BndEvt Back)")
+    Log("Hooks installed (PostHook NewMenu + OpenDebugMenu(deferred) + BndEvt Scroll×9 + Confirm×3 + Back)")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -632,15 +780,62 @@ local function setup_shared_api()
         })
     end
 
-    --- Force-refresh the current custom page (re-renders labels).
-    --- For dynamic pages this re-invokes populate().
+    --- Force-refresh the current custom page (re-renders labels in-place).
+    --- For dynamic pages this re-invokes populate() then updates each
+    --- widget's OptionName without ClearWidgets (preserves input state).
     function api.Refresh()
         V("api.Refresh called")
+        if _refreshing then V("api.Refresh: re-entrant, skipping"); return end
+        _refreshing = true
+
         local dm = get_dm()
-        if not dm then V("api.Refresh: dm=nil"); return end
+        if not dm then V("api.Refresh: dm=nil"); _refreshing = false; return end
         local am = get_active_menu(dm)
-        if not am or not pages[am] then V("api.Refresh: AM=%s not custom", tostring(am)); return end
-        refresh_page(dm, am, get_current_index(dm) or 0)
+        if not am or not pages[am] then
+            V("api.Refresh: AM=%s not custom", tostring(am))
+            _refreshing = false; return
+        end
+
+        local page = pages[am]
+        local cursor = get_current_index(dm) or 0
+
+        -- For dynamic pages, re-run populate_fn to get updated items/labels
+        if page.populate_fn then
+            page.items = {}
+            _build_page = page
+            pcall(page.populate_fn)
+            _build_page = nil
+        end
+
+        -- In-place update: walk widgets and update each label
+        -- Widget layout: [1]=Back, [2]=items[1], [3]=items[2], ...
+        pcall(function()
+            local widgets = dm:Get("ActiveOptionsWidgets")
+            local wcount = #widgets
+            local expected = #page.items + 1  -- +1 for Back
+            if wcount ~= expected then
+                V("api.Refresh: widget count mismatch (got %d, expected %d) — falling back", wcount, expected)
+                -- Fallback: full rebuild (rare — only if item count changed)
+                _refreshing = false
+                refresh_page(dm, am, cursor)
+                return
+            end
+            for i, item in ipairs(page.items) do
+                local wi = i + 1  -- +1 for Back at widget index 1
+                local w = widgets[wi]
+                if w and w:IsValid() then
+                    w:Set("OptionName", make_display(item))
+                    pcall(function() w:Call("Setup") end)
+                end
+            end
+        end)
+
+        -- Restore cursor position and highlight
+        pcall(function() dm:Set("CurrentIndex", cursor) end)
+        pcall(function() dm:Call("UpdateOptionHighlight") end)
+        ensure_viewport(dm)
+
+        _refreshing = false
     end
 
     --- Create a named static sub-page and add a navigation link on
@@ -821,14 +1016,17 @@ local function init()
     if initialised then return end
     initialised = true
 
-    Log("v" .. VERSION .. " — BndEvt hook architecture")
+    Log("v" .. VERSION .. " — Deferred injection + BndEvt hook architecture")
     V("VERBOSE logging enabled")
     Log("  BndEvt hooks on VR4PlayerController_BP_C (ProcessEvent path)")
-    Log("  Stock menu is 100%% unmodified for built-in pages")
+    Log("  'Mods' injection: deferred 200/500/1000/2000ms + lazy on scroll")
 
     setup_shared_api()
     setup_hooks()
     setup_bridge()
+
+    -- Schedule a startup injection attempt (in case menu is already open)
+    schedule_mods_injection()
 
     Log("Ready — mods register via SharedAPI.DebugMenu")
 end

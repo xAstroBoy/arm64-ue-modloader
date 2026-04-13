@@ -14,7 +14,7 @@
 -- Ashley protection is now handled by the separate AshleyArmor mod.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "GodMode"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }

@@ -1,7 +1,11 @@
--- mods/Rapidfire/main.lua v12.0
+-- mods/Rapidfire/main.lua v12.2
 -- ═══════════════════════════════════════════════════════════════════════
 -- Rapidfire — Forces fully automatic rapid fire on all weapons.
 --
+-- v12.2 — Fixed: WasTriggerJustPressed is NOT a UFunction — removed
+--   invalid PostHook. 3 valid PostHooks remain. IsFullyAutomatic→true
+--   effectively handles semi-auto guns by making them full-auto.
+-- v12.1 — pcall-wrapped PostHooks for safety.
 -- v12.0 — Simplified. No trigger state machine, no BLOCK, no crash risk.
 --   1. PostHook IsFiringBlocked → false (gun can always fire)
 --   2. PostHook IsFullyAutomatic → true (holding trigger keeps firing)
@@ -13,7 +17,7 @@
 -- Fire rate controlled by state.cooldown — lower = faster.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Rapidfire"
-local VERBOSE = true
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
@@ -44,39 +48,48 @@ end)
 -- No BLOCK needed. Original always runs safely.
 -- ═══════════════════════════════════════════════════════════════════════
 
+local hookCount = 0
+
 -- IsFiringBlocked → always false (gun is never blocked from firing)
-RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFiringBlocked", function(self, func, parms)
-    if not state.enabled or not modReady then return end
-    V("PostHook IsFiringBlocked → false")
-    local p = CastParms(parms, "VR4GamePlayerGun:IsFiringBlocked")
-    if p then p:SetReturnValue(false) end
+pcall(function()
+    RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFiringBlocked", function(self, func, parms)
+        if not state.enabled or not modReady then return end
+        V("PostHook IsFiringBlocked → false")
+        local p = CastParms(parms, "VR4GamePlayerGun:IsFiringBlocked")
+        if p then p:SetReturnValue(false) end
+    end)
+    hookCount = hookCount + 1
 end)
 
 -- IsFullyAutomatic → always true (holding trigger keeps firing)
-RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFullyAutomatic", function(self, func, parms)
-    if not state.enabled or not modReady then return end
-    V("PostHook IsFullyAutomatic → true")
-    local p = CastParms(parms, "VR4GamePlayerGun:IsFullyAutomatic")
-    if p then p:SetReturnValue(true) end
+pcall(function()
+    RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFullyAutomatic", function(self, func, parms)
+        if not state.enabled or not modReady then return end
+        V("PostHook IsFullyAutomatic → true")
+        local p = CastParms(parms, "VR4GamePlayerGun:IsFullyAutomatic")
+        if p then p:SetReturnValue(true) end
+    end)
+    hookCount = hookCount + 1
 end)
 
 -- IsReadyToFire → always true (fire timer always "done" from ProcessEvent perspective)
-RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsReadyToFire", function(self, func, parms)
-    if not state.enabled or not modReady then return end
-    V("PostHook IsReadyToFire → true")
-    local p = CastParms(parms, "VR4GamePlayerGun:IsReadyToFire")
-    if p then p:SetReturnValue(true) end
+pcall(function()
+    RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsReadyToFire", function(self, func, parms)
+        if not state.enabled or not modReady then return end
+        V("PostHook IsReadyToFire → true")
+        local p = CastParms(parms, "VR4GamePlayerGun:IsReadyToFire")
+        if p then p:SetReturnValue(true) end
+    end)
+    hookCount = hookCount + 1
 end)
 
--- WasTriggerJustPressed → true when trigger held (for semi-auto guns)
-RegisterPostHook("/Script/Game.VR4GamePlayerGun:WasTriggerJustPressed", function(self, func, parms)
-    if not state.enabled or not modReady then return end
-    V("PostHook WasTriggerJustPressed → true")
-    local p = CastParms(parms, "VR4GamePlayerGun:WasTriggerJustPressed")
-    if p then p:SetReturnValue(true) end
-end)
+-- WasTriggerJustPressed → NOT a UFunction (native C++ only, no exec thunk).
+-- Cannot be hooked via PostHook. Skipping.
+-- For semi-auto guns, IsFullyAutomatic→true handles this case by making
+-- the gun behave as full-auto, so trigger-press detection is bypassed.
+Log(TAG .. ": Note: WasTriggerJustPressed is native-only (no UFunction), skipped PostHook")
 
-Log(TAG .. ": 4 UE4SS PostHooks registered (IsFiringBlocked, IsFullyAutomatic, IsReadyToFire, WasTriggerJustPressed)")
+Log(TAG .. ": " .. hookCount .. "/3 PostHooks registered (IsFiringBlocked, IsFullyAutomatic, IsReadyToFire)")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- NATIVE HOOKS — Fire timer acceleration + enemy reaction bypass
@@ -173,4 +186,4 @@ if SharedAPI and SharedAPI.DebugMenu then
         end)
 end
 
-Log(TAG .. ": v12.0 loaded — cooldown=" .. state.cooldown .. "s | No state machine, pure PostHook + timer acceleration")
+Log(TAG .. ": v12.2 loaded — cooldown=" .. state.cooldown .. "s | 3 PostHooks + native timer acceleration")

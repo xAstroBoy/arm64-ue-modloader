@@ -174,8 +174,70 @@ Return `"BLOCK"` from a pre-hook callback to prevent the original UFunction from
 Post-hooks STILL fire even when blocked.
 
 ### 10. TEST VIA BRIDGE BEFORE DEPLOYING
-Always test new API calls via the ADB bridge `exec_lua` command before putting them in mod code.  
-Use `python tools\deploy.py console` → `exec_lua <code>` to validate.
+**MANDATORY: Always test new API calls, hooks, and game state queries via the ADB bridge BEFORE deploying mod code.**
+
+#### Bridge Connection
+```python
+import socket, json
+
+def bridge_exec(code):
+    """Execute Lua on the running game via bridge and return result."""
+    s = socket.socket()
+    s.settimeout(5)
+    s.connect(('127.0.0.1', 19420))
+    s.sendall(json.dumps({'cmd': 'exec_lua', 'code': code}).encode() + b'\n')
+    data = s.recv(65536).decode()
+    s.close()
+    return json.loads(data)
+```
+
+#### What to Test
+1. **Before writing any hook**: Verify the UFunction exists
+   ```python
+   bridge_exec('local obj = FindFirstOf("ClassName"); return obj ~= nil')
+   ```
+2. **Before using Get/Set**: Verify the property exists and returns expected type
+   ```python
+   bridge_exec('local o = FindFirstOf("DebugMenu_C"); return tostring(o:Get("ActiveMenu"))')
+   ```
+3. **Before using Call**: Verify the UFunction is callable
+   ```python
+   bridge_exec('local dm = FindFirstOf("DebugMenu_C"); dm:Call("CreateActiveOption", "Test"); return "ok"')
+   ```
+4. **After deploying**: Verify hooks fired and state is correct
+   ```python
+   bridge_exec('return SharedAPI and SharedAPI.DebugMenu and SharedAPI.DebugMenu.VERSION or "nil"')
+   ```
+
+#### Bridge Commands (built into modloader)
+```bash
+python tools\deploy.py console
+> ping                          # Check bridge is alive
+> exec_lua <lua code>           # Execute arbitrary Lua
+> list_mods                     # List loaded mods
+> debugmenu_status              # DebugMenuAPI status
+> debugmenu_pages               # Dump all registered pages + items
+> debugmenu_open                # Open Mods page directly
+> debugmenu_toggle {"mod":"X"}  # Toggle a specific mod
+```
+
+#### Quick Python Test Script Pattern
+Save as `_test.py` in project root, run with `python _test.py`:
+```python
+import socket, json
+
+def send(code):
+    s = socket.socket(); s.settimeout(5)
+    s.connect(('127.0.0.1', 19420))
+    s.sendall(json.dumps({'cmd': 'exec_lua', 'code': code}).encode() + b'\n')
+    r = json.loads(s.recv(65536).decode()); s.close()
+    return r
+
+# Test whatever you need:
+print(send('local dm = FindFirstOf("DebugMenu_C"); return tostring(dm:Get("ActiveMenu"))'))
+```
+
+⚠️ **NEVER deploy untested hooks or API calls.** If you can't test via bridge first (e.g., game not running), wrap ALL new code in pcall blocks.
 
 ### 11. ANALYZE BEFORE CODING
 Before writing or modifying any debug menu code, read and understand:
