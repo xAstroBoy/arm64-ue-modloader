@@ -1,5 +1,5 @@
 --[[
-    DebugMenuAPI v21 — Clean Cooperative Design
+    DebugMenuAPI v22 — Clean Cooperative Design
     ============================================
     A mod-menu system that cooperates with the stock DebugMenu_C.
     NEVER blocks or overrides Blueprint behaviour.
@@ -44,7 +44,7 @@
 ]]
 
 local MOD_NAME = "DebugMenuAPI"
-local VERSION  = "21.0"
+local VERSION  = "22.0"
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- STATE
@@ -110,6 +110,23 @@ end
 local function get_current_index(dm)
     local ok, v = pcall(function() return dm:Get("CurrentIndex") end)
     return (ok and type(v) == "number") and v or nil
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- VIEWPORT HELPERS
+-- ═══════════════════════════════════════════════════════════════════════
+
+--- Ensure the WidgetComponent's render target is large enough.
+--- The PAK mod increases SizeBox_90 HeightOverride from 1200 to 2000,
+--- and bDrawAtDesiredSize causes the render target to auto-adjust.
+--- This function forces a redraw after dynamic content changes.
+local function ensure_viewport(dm)
+    pcall(function()
+        local widget_comp = dm:Get("Widget")
+        if widget_comp and widget_comp:IsValid() then
+            widget_comp:Call("RequestRedraw")
+        end
+    end)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -184,6 +201,9 @@ local function build_page(dm, page)
             end
         end
     end)
+
+    -- Force render target update after dynamic content change
+    ensure_viewport(dm)
 end
 
 --- Soft-refresh: clear and re-render the current custom page without
@@ -207,6 +227,9 @@ local function refresh_page(dm, page_byte, cursor)
     -- Restore cursor
     pcall(function() dm:Set("CurrentIndex", cursor or 0) end)
     pcall(function() dm:Call("UpdateOptionHighlight") end)
+
+    -- Force render target update
+    ensure_viewport(dm)
 
     _refreshing = false
 end

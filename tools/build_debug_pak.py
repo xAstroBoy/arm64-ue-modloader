@@ -69,7 +69,7 @@ ALL_ASSETS = [
 ]
 
 # Assets we modify — everything else is copied verbatim
-MODIFIED_ASSETS = {"DebugMenuOptions", "DebugVBoxList"}
+MODIFIED_ASSETS = {"DebugMenuOptions", "DebugVBoxList", "DebugMenuWidget"}
 
 # ═══════════════════════════════════════════════════════════════════════
 # DataTable Property FNames (from DebugMenuOption struct reflection)
@@ -96,6 +96,9 @@ OPT_COMMAND    = "DebugOptionType::NewEnumerator7"  # Console command type
 
 # DebugVBoxList CDO modifications
 VBOXLIST_MAX_VISIBLE = 20  # Stock: 5 — too few for VR. NewMenu overrides per-page anyway.
+
+# DebugMenuWidget SizeBox modifications
+SIZEBOX_HEIGHT = 2000.0    # Stock: 1200 — clips items when many are visible (1200/50px ≈ 24 max)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -329,6 +332,55 @@ def patch_vboxlist_maxvisible(vbl_json, new_max=VBOXLIST_MAX_VISIBLE):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Modification 3: DebugMenuWidget — Extend SizeBox viewport height
+# ═══════════════════════════════════════════════════════════════════════
+
+def patch_widget_sizebox(widget_json, new_height=SIZEBOX_HEIGHT):
+    """Increase SizeBox_90 HeightOverride in DebugMenuWidget_C.
+
+    The DebugMenuWidget_C uses a SizeBox (named SizeBox_90) as the root
+    container for all debug menu content.  Stock values:
+        WidthOverride  = 1920.0
+        HeightOverride = 1200.0
+
+    With 1200px height and ~50px per option widget, only ~22 items fit
+    before content is clipped below the SizeBox boundary.  When the Lua
+    mod sets MaxVisible=50 and adds many items, they overflow and are
+    cut out of sight.
+
+    The WidgetComponent (on DebugMenu_C) has bDrawAtDesiredSize=true,
+    so the render target automatically resizes to match the widget's
+    desired size.  Increasing the SizeBox height makes the 3D panel
+    proportionally taller in VR — acceptable for a debug menu.
+
+    Both SizeBox_90 instances (runtime + editor-only) are patched.
+    """
+    exports = widget_json.get("Exports", [])
+    patched = 0
+
+    for export in exports:
+        obj_name = export.get("ObjectName", "")
+        if obj_name != "SizeBox_90":
+            continue
+
+        data = export.get("Data", [])
+        for prop in data:
+            if prop.get("Name") == "HeightOverride":
+                old_val = prop.get("Value", "?")
+                prop["Value"] = new_height
+                print(f"  ✅ {obj_name} (outer={export.get('OuterIndex','?')}): "
+                      f"HeightOverride {old_val} → {new_height}")
+                patched += 1
+
+    if patched == 0:
+        print(f"  ⚠️  Could not find SizeBox_90 HeightOverride in DebugMenuWidget")
+    else:
+        print(f"     Patched {patched} SizeBox_90 instance(s)")
+
+    return patched > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # JSON ↔ Asset Conversion
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -518,7 +570,8 @@ def build(dry_run=False, do_deploy=False):
     print("  Modifications:")
     print("    1. DataTable: Inject 'Mods' Action on Main page")
     print(f"    2. VBoxList:  MaxVisible 5 → {VBOXLIST_MAX_VISIBLE}")
-    print("    3. All other assets: copied verbatim from stock")
+    print(f"    3. Widget:    SizeBox HeightOverride 1200 → {SIZEBOX_HEIGHT:.0f}")
+    print("    4. All other assets: copied verbatim from stock")
     print()
 
     # ── Verify tools ──
@@ -545,12 +598,21 @@ def build(dry_run=False, do_deploy=False):
         print("  ⚠️  Continuing without MaxVisible patch")
     print()
 
+    # ── Step 3: Modify DebugMenuWidget SizeBox ──
+    print("── Step 3: DebugMenuWidget SizeBox ──")
+    dmw_data = load_json("DebugMenuWidget")
+    if not dmw_data:
+        return False
+    if not patch_widget_sizebox(dmw_data, SIZEBOX_HEIGHT):
+        print("  ⚠️  Continuing without SizeBox patch")
+    print()
+
     if dry_run:
         print("  [DRY RUN] No files written.")
         return True
 
-    # ── Step 3: Build assets ──
-    print("── Step 3: Build Assets ──")
+    # ── Step 4: Build assets ──
+    print("── Step 4: Build Assets ──")
     if BUILD_DIR.exists():
         shutil.rmtree(BUILD_DIR)
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
@@ -574,10 +636,19 @@ def build(dry_run=False, do_deploy=False):
             src = EXTRACTED_DIR / f"DebugVBoxList{ext}"
             if src.exists():
                 shutil.copy2(src, output_dir / f"DebugVBoxList{ext}")
+
+    # Build modified DebugMenuWidget
+    print(f"\n  Building DebugMenuWidget (SizeBox height={SIZEBOX_HEIGHT:.0f})...")
+    if not save_json_to_uasset("DebugMenuWidget", dmw_data, output_dir):
+        print("  ⚠️  DebugMenuWidget build failed — falling back to stock copy")
+        for ext in [".uasset", ".uexp"]:
+            src = EXTRACTED_DIR / f"DebugMenuWidget{ext}"
+            if src.exists():
+                shutil.copy2(src, output_dir / f"DebugMenuWidget{ext}")
     print()
 
-    # ── Step 4: Verify file counts ──
-    print("── Step 4: Verify Build ──")
+    # ── Step 5: Verify file counts ──
+    print("── Step 5: Verify Build ──")
     built_files = list(output_dir.glob("*"))
     uasset_count = sum(1 for f in built_files if f.suffix == ".uasset")
     uexp_count = sum(1 for f in built_files if f.suffix == ".uexp")
@@ -605,14 +676,14 @@ def build(dry_run=False, do_deploy=False):
                 print(f"     {name}{ext}: {stock.stat().st_size:,}B → {built.stat().st_size:,}B ({sign}{delta:,}B)")
     print()
 
-    # ── Step 5: Pack .pak ──
-    print("── Step 5: Pack .pak ──")
+    # ── Step 6: Pack .pak ──
+    print("── Step 6: Pack .pak ──")
     if not pack_to_pak():
         return False
 
-    # ── Step 6: Deploy (optional) ──
+    # ── Step 7: Deploy (optional) ──
     if do_deploy:
-        print("\n── Step 6: Deploy ──")
+        print("\n── Step 7: Deploy ──")
         deploy_pak()
 
     print(f"\n🎉 Build complete!")
