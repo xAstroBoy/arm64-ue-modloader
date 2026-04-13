@@ -15,6 +15,8 @@
 -- v3.0: Full UE4SS API with native hooks
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoVignette"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     vignetteOff = true,
@@ -31,6 +33,7 @@ end
 
 RegisterPreHook("/Script/Game.VR4Vignette:SetVignetteActive", function(self, func, parms)
     if not state.vignetteOff then return end
+    V("PreHook BLOCK SetVignetteActive")
     return "BLOCK"
 end)
 Log(TAG .. ": RegisterPreHook — VR4Vignette:SetVignetteActive → BLOCK")
@@ -41,12 +44,14 @@ Log(TAG .. ": RegisterPreHook — VR4Vignette:SetVignetteActive → BLOCK")
 
 RegisterPostHook("/Script/Game.VR4Vignette:IsVignetteActive", function(self, func, parms)
     if not state.vignetteOff then return end
+    V("PostHook IsVignetteActive -> false")
     local p = CastParms(parms, "VR4Vignette:IsVignetteActive")
     if p then p:SetReturnValue(false) end
 end)
 
 RegisterPostHook("/Script/Game.VR4Vignette:IsAnyVignetteActive", function(self, func, parms)
     if not state.vignetteOff then return end
+    V("PostHook IsAnyVignetteActive -> false")
     local p = CastParms(parms, "VR4Vignette:IsAnyVignetteActive")
     if p then p:SetReturnValue(false) end
 end)
@@ -60,6 +65,7 @@ Log(TAG .. ": RegisterPostHook — IsVignetteActive, IsAnyVignetteActive → fal
 local vignetteCount = 0
 
 NotifyOnNewObject("VR4Vignette", function(obj)
+    V("NotifyOnNewObject VR4Vignette fired, obj=%s", tostring(obj))
     if not state.vignetteOff then return end
     if not obj or not obj:IsValid() then return end
     vignetteCount = vignetteCount + 1
@@ -87,7 +93,10 @@ local nativeHookCount = 0
 
 -- SetVignetteActive C++ impl — block entirely
 local ok = RegisterNativeHook("SetVignetteActive", function(self, active)
-    if state.vignetteOff then return "BLOCK" end
+    if state.vignetteOff then
+        V("Native BLOCK SetVignetteActive")
+        return "BLOCK"
+    end
 end, nil, "pp")
 if ok then
     nativeHookCount = nativeHookCount + 1
@@ -98,7 +107,10 @@ end
 
 -- IsVignetteActive C++ impl — force return false
 ok = RegisterNativeHook("IsVignetteActive", function(self)
-    if state.vignetteOff then return 0 end
+    if state.vignetteOff then
+        V("Native IsVignetteActive -> 0")
+        return 0
+    end
 end, nil, "p")
 if ok then
     nativeHookCount = nativeHookCount + 1
@@ -109,7 +121,10 @@ end
 
 -- IsAnyVignetteActive C++ impl — force return false
 ok = RegisterNativeHook("IsAnyVignetteActive", function(self)
-    if state.vignetteOff then return 0 end
+    if state.vignetteOff then
+        V("Native IsAnyVignetteActive -> 0")
+        return 0
+    end
 end, nil, "p")
 if ok then
     nativeHookCount = nativeHookCount + 1
@@ -120,7 +135,10 @@ end
 
 -- ActivateVignette — block activation
 ok = RegisterNativeHook("ActivateVignette", function(self)
-    if state.vignetteOff then return "BLOCK" end
+    if state.vignetteOff then
+        V("Native BLOCK ActivateVignette")
+        return "BLOCK"
+    end
 end, nil, "p")
 if ok then
     nativeHookCount = nativeHookCount + 1
@@ -131,7 +149,10 @@ end
 
 -- UpdateVignette — block vignette tick updates
 ok = RegisterNativeHook("UpdateVignette", function(self, dt)
-    if state.vignetteOff then return "BLOCK" end
+    if state.vignetteOff then
+        V("Native BLOCK UpdateVignette")
+        return "BLOCK"
+    end
 end, nil, "pf")
 if ok then
     nativeHookCount = nativeHookCount + 1
@@ -142,7 +163,10 @@ end
 
 -- ApplyVignetteEffect — block vignette rendering
 ok = RegisterNativeHook("ApplyVignetteEffect", function(self)
-    if state.vignetteOff then return "BLOCK" end
+    if state.vignetteOff then
+        V("Native BLOCK ApplyVignetteEffect")
+        return "BLOCK"
+    end
 end, nil, "p")
 if ok then
     nativeHookCount = nativeHookCount + 1
@@ -159,6 +183,7 @@ Log(TAG .. ": " .. nativeHookCount .. "/6 native hooks installed (UE4SS hooks al
 
 RegisterCommand("vignette", function()
     state.vignetteOff = not state.vignetteOff
+    V("toggle: vignetteOff=%s", tostring(state.vignetteOff))
     ModConfig.Save("NoVignette", state)
     Log(TAG .. ": Vignette " .. (state.vignetteOff and "DISABLED" or "ENABLED"))
     Notify(TAG, "Vignette " .. (state.vignetteOff and "OFF" or "ON"))

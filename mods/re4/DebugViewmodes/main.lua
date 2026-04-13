@@ -4,6 +4,8 @@
 -- GameInstance config moved to Patches mod.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "DebugViewmodes"
+local VERBOSE = false  -- NOTE: keep OFF — AllowDebugViewmodes fires every frame (~90fps)
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
 
@@ -19,6 +21,7 @@ end
 pcall(function()
     RegisterNativeHook("AllowDebugViewmodes1", nil,
         function(retval)
+            V("Native post AllowDebugViewmodes1, enabled=%s retval=%s", tostring(state.enabled), tostring(retval))
             if not state.enabled then return retval end
             return 1
         end)
@@ -27,6 +30,7 @@ end)
 pcall(function()
     RegisterNativeHook("_Z19AllowDebugViewmodesv", nil,
         function(retval)
+            V("Native post AllowDebugViewmodesv, enabled=%s retval=%s", tostring(state.enabled), tostring(retval))
             if not state.enabled then return retval end
             return 1
         end)
@@ -40,6 +44,7 @@ Log(TAG .. ": Native hooks — AllowDebugViewmodes")
 
 pcall(function()
     local cvar_addr = Offset(GetLibBase(), 0x0ABD6F18)
+    V("pcall: CVar debug flags write at %s", ToHex(cvar_addr))
     WriteU32(cvar_addr, 1)
     WriteU32(Offset(cvar_addr, 4), 1)
     Log(TAG .. ": CVar debug flags enabled")

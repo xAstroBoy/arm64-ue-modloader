@@ -14,6 +14,8 @@
 -- Ashley protection is now handled by the separate AshleyArmor mod.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "GodMode"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
 
@@ -33,6 +35,7 @@ local pawnProtected = false
 
 local function protectPawn(pawn)
     if not pawn or not pawn:IsValid() then return end
+    V("protectPawn called, pawn=%s", tostring(pawn))
     cachedPawn = pawn
     pcall(function()
         pawn.bCanBeDamaged = false
@@ -43,6 +46,7 @@ end
 
 local function refreshProtection()
     if not state.enabled then return end
+    V("refreshProtection called")
     local pawn = FindFirstOf("VR4Bio4PlayerPawn")
     if pawn and pawn:IsValid() then
         protectPawn(pawn)
@@ -51,6 +55,7 @@ end
 
 -- Auto-protect on pawn spawn
 NotifyOnNewObject("VR4Bio4PlayerPawn", function(obj)
+    V("NotifyOnNewObject VR4Bio4PlayerPawn fired, obj=%s", tostring(obj))
     if obj and obj:IsValid() then
         cachedPawn = obj
         if state.enabled then
@@ -66,16 +71,19 @@ end)
 
 RegisterPreHook("/Script/Game.Bio4Utils:HurtPlayerWithConstDamage", function(self, func, parms)
     if not state.enabled then return end
+    V("BLOCK HurtPlayerWithConstDamage")
     return "BLOCK"
 end)
 
 RegisterPreHook("/Script/Game.Bio4Utils:HurtPlayer", function(self, func, parms)
     if not state.enabled then return end
+    V("BLOCK HurtPlayer")
     return "BLOCK"
 end)
 
 RegisterPreHook("/Script/Game.Bio4Utils:HurtAshley", function(self, func, parms)
     if not state.enabled then return end
+    V("BLOCK HurtAshley")
     return "BLOCK"
 end)
 
@@ -87,6 +95,7 @@ Log(TAG .. ": PreHook BLOCK — HurtPlayer + HurtPlayerWithConstDamage + HurtAsh
 
 RegisterPostHook("/Script/Game.Bio4:IsGameOver", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook IsGameOver — forcing false")
     -- Force return false — game-over never triggers
     local p = CastParms(parms, "Bio4:IsGameOver")
     if p then p:SetReturnValue(false) end
@@ -100,6 +109,7 @@ Log(TAG .. ": RegisterPostHook — Bio4:IsGameOver (force false)")
 NotifyOnNewObject("VR4DeathMenu", function(obj)
     if not state.enabled then return end
     if not obj or not obj:IsValid() then return end
+    V("NotifyOnNewObject VR4DeathMenu fired, obj=%s", tostring(obj))
     Log(TAG .. ": VR4DeathMenu spawned — hiding + scheduling destroy + force heal")
     
     -- Hide immediately to prevent rendering
@@ -115,6 +125,7 @@ NotifyOnNewObject("VR4DeathMenu", function(obj)
     
     -- Defer destroy by 100ms to avoid tick crash
     ExecuteWithDelay(100, function()
+        V("VR4DeathMenu deferred destroy executing")
         if obj and obj:IsValid() then
             pcall(function() obj:K2_DestroyActor() end)
             Log(TAG .. ": VR4DeathMenu destroyed (deferred)")
@@ -135,6 +146,7 @@ end)
 -- Monitor stun changes — block death stuns (e.g., neck snap, chain kill)
 RegisterPreHook("/Script/Game.VR4Bio4PlayerPawn:OnStunnedChanged", function(self, func, parms)
     if not state.enabled then return end
+    V("BLOCK OnStunnedChanged")
     -- Block all stun state changes that could lead to death animations
     return "BLOCK"
 end)
@@ -159,6 +171,7 @@ local function waitForPlayerThenDestroyKillZ(obj)
     
     -- Player exists — safe to destroy after one frame
     ExecuteWithDelay(100, function()
+        V("KillZVolume deferred destroy executing")
         if obj and obj:IsValid() then
             pcall(function() obj:K2_DestroyActor() end)
             Log(TAG .. ": KillZVolume destroyed (deferred)")
@@ -169,6 +182,7 @@ end
 NotifyOnNewObject("KillZVolume", function(obj)
     if not state.enabled then return end
     if not obj or not obj:IsValid() then return end
+    V("NotifyOnNewObject KillZVolume fired, obj=%s", tostring(obj))
     Log(TAG .. ": KillZVolume spawned — scheduling deferred destroy")
     
     -- Disable collision immediately to prevent kills
@@ -182,6 +196,7 @@ Log(TAG .. ": NotifyOnNewObject — KillZVolume (auto-destroy, deferred)")
 -- ═══════════════════════════════════════════════════════════════════════
 
 local function onToggle(newState)
+    V("onToggle: enabled %s -> %s", tostring(state.enabled), tostring(newState))
     state.enabled = newState
     ModConfig.Save("GodMode", state)
     if cachedPawn and cachedPawn:IsValid() then

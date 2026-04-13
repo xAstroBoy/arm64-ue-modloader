@@ -5,6 +5,8 @@
 -- No blocking — lets the game flow naturally, just auto-dismisses.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "RadioSkip"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled = true,
@@ -22,6 +24,7 @@ end
 local base = GetLibBase()
 local sym_SkipFlags = nil
 if base then
+    V("Attempting skip flags write at base+0x0A5AA430")
     pcall(function()
         sym_SkipFlags = Offset(base, 0x0A5AA430)
         for i = 0, 7 do WriteU8(Offset(sym_SkipFlags, i), 1) end
@@ -39,6 +42,7 @@ end
 local commCount = 0
 
 NotifyOnNewObject("VR4Communicator", function(obj)
+    V("NotifyOnNewObject VR4Communicator fired, obj=%s", tostring(obj))
     if not state.enabled then return end
     if not obj or not obj:IsValid() then return end
     commCount = commCount + 1
@@ -46,6 +50,7 @@ NotifyOnNewObject("VR4Communicator", function(obj)
 
     -- Let it initialize, then Open → Abort to close it naturally
     ExecuteWithDelay(50, function()
+        V("ExecuteWithDelay callback for Communicator #%d", commCount)
         if not obj:IsValid() then return end
         pcall(function() obj:Open() end)
         pcall(function() obj:Abort() end)
@@ -61,6 +66,7 @@ Log(TAG .. ": NotifyOnNewObject — VR4Communicator (auto Open→Abort)")
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterHook("/Script/Game.VR4Communicator:Open", function(Context, Parms)
+    V("VR4Communicator:Open hook fired")
     if not state.enabled then return end
     local self = Context:get()
     if not self or not self:IsValid() then return end
@@ -80,6 +86,7 @@ local sym_Cleanup = Resolve("VR4Communicator_Cleanup", 0x0627DEE4)
 pcall(function()
     RegisterNativeHook("VR4Communicator_Open", nil,
         function(retval, self_ptr)
+            V("Native post-Open callback self_ptr=%s", tostring(self_ptr))
             if not state.enabled then return retval end
             if not self_ptr or self_ptr == 0 then return retval end
             -- After Open finishes, immediately Abort + Cleanup

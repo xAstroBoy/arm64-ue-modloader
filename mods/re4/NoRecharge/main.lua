@@ -9,6 +9,8 @@
 --   Native hooks on BeginReload → InstantReload redirect
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoRecharge"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled = true,
@@ -26,6 +28,7 @@ end
 -- VR4GamePlayerAmmo::IsReloadInProgress → false (skip reload animation)
 RegisterPostHook("/Script/Game.VR4GamePlayerAmmo:IsReloadInProgress", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook VR4GamePlayerAmmo:IsReloadInProgress -> false")
     local p = CastParms(parms, "VR4GamePlayerAmmo:IsReloadInProgress")
     if p then p:SetReturnValue(false) end
 end)
@@ -33,6 +36,7 @@ end)
 -- VR4GamePlayerAmmo::IsReloadLingering → false
 RegisterPostHook("/Script/Game.VR4GamePlayerAmmo:IsReloadLingering", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook VR4GamePlayerAmmo:IsReloadLingering -> false")
     local p = CastParms(parms, "VR4GamePlayerAmmo:IsReloadLingering")
     if p then p:SetReturnValue(false) end
 end)
@@ -40,12 +44,14 @@ end)
 -- VR4GamePlayerArrow (bow) overrides
 RegisterPostHook("/Script/Game.VR4GamePlayerArrow:IsReloadInProgress", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook VR4GamePlayerArrow:IsReloadInProgress -> false")
     local p = CastParms(parms, "VR4GamePlayerArrow:IsReloadInProgress")
     if p then p:SetReturnValue(false) end
 end)
 
 RegisterPostHook("/Script/Game.VR4GamePlayerArrow:IsReloadLingering", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook VR4GamePlayerArrow:IsReloadLingering -> false")
     local p = CastParms(parms, "VR4GamePlayerArrow:IsReloadLingering")
     if p then p:SetReturnValue(false) end
 end)
@@ -62,6 +68,7 @@ pcall(function()
     RegisterNativeHook("cObjWep_reloadable", nil,
         function(retval)
             if not state.enabled then return retval end
+            V("Native cObjWep_reloadable -> 1")
             return 1
         end)
     Log(TAG .. ": Native hook — cObjWep_reloadable → true")
@@ -72,6 +79,7 @@ if sym_InstantReload then
         RegisterNativeHook("BeginReload",
             function(self_ptr)
                 if not state.enabled then return self_ptr end
+                V("Native BeginReload -> InstantReload redirect, self=%s", tostring(self_ptr))
                 CallNative(sym_InstantReload, "vp", self_ptr)
                 return self_ptr
             end, nil)
@@ -85,6 +93,7 @@ end
 
 RegisterCommand("norecharge", function()
     state.enabled = not state.enabled
+    V("toggle: enabled=%s", tostring(state.enabled))
     ModConfig.Save("NoRecharge", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
     Notify(TAG, state.enabled and "ON" or "OFF")

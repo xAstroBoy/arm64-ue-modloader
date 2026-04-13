@@ -13,6 +13,8 @@
 --   by the modloader's C++ crash guard — no Lua patches needed.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Patches"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
 
@@ -26,6 +28,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterHook("/Script/Game.GameInstance:ReceiveInit", function(Context)
+    V("ReceiveInit hook fired")
     if not state.enabled then return end
     local obj = Context:get()
     if not obj or not obj:IsValid() then return end
@@ -34,12 +37,15 @@ RegisterHook("/Script/Game.GameInstance:ReceiveInit", function(Context)
     local sym_SetQuickStart = Resolve("SetQuickStart", 0x067DF654)
 
     if sym_SetDebugMode then
+        V("Calling SetDebugMode on GameInstance")
         pcall(function() CallNative(sym_SetDebugMode, "vpi", obj, 1) end)
     end
     if sym_SetQuickStart then
+        V("Calling SetQuickStart on GameInstance")
         pcall(function() CallNative(sym_SetQuickStart, "vpi", obj, 1) end)
     end
 
+    V("Setting NewWeaponWheel=true, ShouldLoadTheatreBox=false")
     pcall(function() obj:Set("NewWeaponWheel", true) end)
     pcall(function() obj:Set("ShouldLoadTheatreBox", false) end)
 
@@ -52,6 +58,7 @@ Log(TAG .. ": RegisterHook — GameInstance:ReceiveInit")
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("patches", function()
+    V("patches command — toggling enabled from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     ModConfig.Save("Patches", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))

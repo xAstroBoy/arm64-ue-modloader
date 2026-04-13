@@ -4,6 +4,8 @@
 -- on Bio4Utils:HurtAshley.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "AshleyArmor"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
 
@@ -17,7 +19,9 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterPreHook("/Script/Game.Bio4Utils:HurtAshley", function(self, func, parms)
+    V("PreHook HurtAshley fired, enabled=%s", tostring(state.enabled))
     if not state.enabled then return end
+    V("BLOCKING Ashley damage")
     return "BLOCK"
 end)
 

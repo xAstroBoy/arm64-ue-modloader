@@ -1,12 +1,11 @@
--- mods/Randomizer/main.lua v7.0
+-- mods/Randomizer/main.lua v7.1
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-enhanced Enemy Randomizer — re-randomizes on EVERY level load
 --
--- v7.0 — Crash-safe + verbose debug:
---   Full pcall wrapper on native hook — ALWAYS returns retPtr.
---   Settle period after level change — skip N calls to let ESL stabilize.
---   Error counting with auto-disable safety.
---   VERBOSE logging on every hook call for crash diagnosis.
+-- v7.1 — Fix lightuserdata handling:
+--   Native hooks pass pointer/integer args as lightuserdata (void*).
+--   Use PtrToInt() for comparisons/formatting, keep raw ptr for ReadU8/WriteU8/Offset.
+-- v7.0 — Crash-safe + verbose debug, pcall wrapper, settle period.
 -- v6.0 — Per-level-load randomization, emId mismatch detection.
 -- v5.0 — Once-per-slot randomization, debug menu submenu
 -- v3.0 — RegisterNativeHookAt on readEmList, per-enemy toggle commands
@@ -16,6 +15,25 @@ local VERBOSE = true  -- VERBOSE LOGGING — log every hook call for crash diagn
 
 local function V(msg)
     if VERBOSE then Log(TAG .. ": [V] " .. msg) end
+end
+
+-- ── Pointer helpers ─────────────────────────────────────────────────
+-- Native hooks and CallNative with 'p' return pass lightuserdata (void*).
+-- PtrToInt (C++) converts to Lua integer for arithmetic/formatting.
+-- These helpers provide safe conversion with fallbacks.
+local function ptrval(p)
+    if p == nil then return 0 end
+    if type(p) == "number" then return p end
+    if PtrToInt then return PtrToInt(p) end
+    -- Fallback: parse tostring output ("userdata: 0xABCD")
+    local s = tostring(p)
+    local hex = s:match(": 0x(%x+)")
+    if hex then return tonumber(hex, 16) end
+    return 0
+end
+
+local function ptrfmt(p)
+    return string.format("0x%X", ptrval(p))
 end
 
 -- ── HP presets ──────────────────────────────────────────────────────
@@ -150,7 +168,7 @@ end
 -- STATE
 -- ═══════════════════════════════════════════════════════════════════════
 local state = {
-    enabled = false,
+    enabled = true,     -- v7.2: default ON (was false, causing no-scramble confusion)
     hpMode  = "MATCH",  -- MATCH, EASY, NORMAL, HARD, RANDOM
     enabledEnemies = {},
     swapCount = 0,
@@ -182,6 +200,7 @@ local function saveConfig()
         if on then names[#names + 1] = name end
     end
     ModConfig.Save("Randomizer", {
+        configVersion = 2,
         enabled = state.enabled,
         hpMode = state.hpMode,
         enabledNames = names,
@@ -191,8 +210,18 @@ end
 
 local function loadConfig()
     local cfg = ModConfig.Load("Randomizer")
-    if not cfg then return end
-    if cfg.enabled ~= nil then state.enabled = cfg.enabled end
+    if not cfg then
+        Log(TAG .. ": No saved config — using defaults (enabled=true)")
+        return
+    end
+    -- v7.2: Config migration — old configs had enabled=false by default
+    if cfg.configVersion and cfg.configVersion >= 2 then
+        if cfg.enabled ~= nil then state.enabled = cfg.enabled end
+    else
+        -- Old config without version: ignore saved 'enabled' (was incorrectly false)
+        state.enabled = true
+        Log(TAG .. ": CONFIG MIGRATION — old config had enabled=false, forcing ON")
+    end
     if cfg.hpMode then state.hpMode = cfg.hpMode end
     if cfg.enabledNames then
         for name, _ in pairs(state.enabledEnemies) do state.enabledEnemies[name] = false end
@@ -263,12 +292,13 @@ local MAX_HOOK_ERRORS = 20  -- Auto-disable writes after this many consecutive e
 
 -- Hook readEmList — pre-hook captures index, post-hook detects level change + applies randomization
 if sym_readEmList then
-    RegisterNativeHookAt(sym_readEmList, "pi",
+    RegisterNativeHookAt(sym_readEmList, "readEmList",
         function(index)
             -- Pre-hook: capture the slot index argument (pcall for safety)
+            -- Native hooks pass X-register values as lightuserdata — convert to number
             pcall(function()
-                lastReadIndex = index or -1
-                V("PRE readEmList idx=" .. tostring(index))
+                lastReadIndex = ptrval(index)
+                V("PRE readEmList idx=" .. tostring(lastReadIndex))
             end)
         end,
         function(retPtr)
@@ -277,14 +307,14 @@ if sym_readEmList then
             -- ║  prevent us from returning retPtr to the game engine.    ║
             -- ╚═══════════════════════════════════════════════════════════╝
             local ok, err = pcall(function()
-                V("POST retPtr=" .. string.format("0x%X", retPtr or 0)
+                V("POST retPtr=" .. ptrfmt(retPtr)
                     .. " enabled=" .. tostring(state.enabled)
                     .. " idx=" .. tostring(lastReadIndex)
                     .. " settle=" .. settleCounter
                     .. " errors=" .. hookErrors)
 
                 if not state.enabled then V("SKIP: disabled"); return end
-                if not retPtr or retPtr == 0 then V("SKIP: retPtr null/0"); return end
+                if retPtr == nil or ptrval(retPtr) == 0 then V("SKIP: retPtr null/0"); return end
                 if lastReadIndex < 0 then V("SKIP: lastReadIndex<0"); return end
                 if hookErrors >= MAX_HOOK_ERRORS then V("SKIP: too many errors (" .. hookErrors .. ")"); return end
 
@@ -419,7 +449,7 @@ if sym_readEmList then
                 hookErrors = hookErrors + 1
             end
 
-            V("RETURN retPtr=" .. string.format("0x%X", retPtr or 0))
+            V("RETURN retPtr=" .. ptrfmt(retPtr))
             -- ALWAYS return retPtr — game MUST get a valid pointer back
             return retPtr
         end)
@@ -446,8 +476,8 @@ local function scrambleNow()
     local swapped = 0
     for i = 0, n - 1 do
         local ptr = CallNative(sym_readEmList, "pi", i)
-        V("SCRAMBLE: slot " .. i .. " ptr=" .. string.format("0x%X", ptr or 0))
-        if ptr ~= 0 then
+        V("SCRAMBLE: slot " .. i .. " ptr=" .. ptrfmt(ptr))
+        if ptrval(ptr) ~= 0 then
             local pick = pickRandom()
             if pick then
                 local hp = getRandomHP(pick)
@@ -676,7 +706,7 @@ if SharedAPI and SharedAPI.DebugMenu then
     end)
 end
 
-Log(TAG .. ": v7.0 loaded — " .. #ENEMIES .. " enemies, "
+Log(TAG .. ": v7.1 loaded — " .. #ENEMIES .. " enemies, "
     .. #GROUPS .. " groups, "
     .. (state.enabled and "ON" or "OFF")
     .. " hpMode=" .. state.hpMode

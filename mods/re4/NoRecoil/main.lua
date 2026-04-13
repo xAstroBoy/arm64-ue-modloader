@@ -10,6 +10,8 @@
 -- v1.0: Original with native hooks
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoRecoil"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
 
@@ -31,7 +33,10 @@ local hookCount = 0
 -- UpdateRecoil(self, dt) — block the recoil update entirely
 -- sig: "pf" = self(ptr/X0), dt(float/D0)
 local ok = RegisterNativeHook("UpdateRecoil", function(self, dt)
-    if state.enabled then return "BLOCK" end
+    if state.enabled then
+        V("Native UpdateRecoil BLOCK, self=%s", tostring(self))
+        return "BLOCK"
+    end
 end, nil, "pf")
 if ok then
     hookCount = hookCount + 1
@@ -42,7 +47,10 @@ end
 
 -- IsRecoiling(self) — return false (0)
 ok = RegisterNativeHook("IsRecoiling", function(self)
-    if state.enabled then return 0 end  -- false
+    if state.enabled then
+        V("Native IsRecoiling -> 0")
+        return 0  -- false
+    end
 end, nil, "p")
 if ok then
     hookCount = hookCount + 1
@@ -54,7 +62,10 @@ end
 -- GetShotSpreadMM(self) — return 0.0 spread via post-hook
 -- sig: "fp" = float return, self(ptr/X0)
 ok = RegisterNativeHook("GetShotSpreadMM", nil, function(ret_d0, self)
-    if state.enabled then return 0.0 end
+    if state.enabled then
+        V("Native GetShotSpreadMM -> 0.0")
+        return 0.0
+    end
 end, "fp")
 if ok then
     hookCount = hookCount + 1
@@ -66,7 +77,10 @@ end
 -- Filter00SetAddSpread(self, spread) — block spread addition
 -- sig: "pf" = self(ptr/X0), spread(float/D0)
 ok = RegisterNativeHook("Filter00SetAddSpread", function(self, spread)
-    if state.enabled then return "BLOCK" end
+    if state.enabled then
+        V("Native Filter00SetAddSpread BLOCK")
+        return "BLOCK"
+    end
 end, nil, "pf")
 if ok then
     hookCount = hookCount + 1
@@ -83,6 +97,7 @@ Log(TAG .. ": " .. hookCount .. "/4 native hooks installed")
 
 RegisterCommand("norecoil", function()
     state.enabled = not state.enabled
+    V("toggle: enabled=%s", tostring(state.enabled))
     ModConfig.Save("NoRecoil", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
     Notify(TAG, state.enabled and "ON" or "OFF")

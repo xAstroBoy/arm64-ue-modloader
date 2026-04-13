@@ -9,6 +9,8 @@
 --   Native Dobby hooks on IsPresentOnBody/CanGrab/IsGrabAllowed
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "DualWield"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled = true,
@@ -24,6 +26,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterHook("/Script/Game.VR4GamePlayerPawn:EquipProp", function(Context, Parms)
+    V("PostHook EquipProp fired, enabled=%s", tostring(state.enabled))
     if not state.enabled then return end
     local self = Context:get()
     if self and self:IsValid() then
@@ -48,6 +51,7 @@ if sym_IsPresentOnBody then
     pcall(function()
         RegisterNativeHook("IsPresentOnBody", nil,
             function(retval)
+                V("Native post IsPresentOnBody, enabled=%s retval=%s", tostring(state.enabled), tostring(retval))
                 if not state.enabled then return retval end
                 return 1
             end)
@@ -68,6 +72,7 @@ else
             pcall(function()
                 RegisterNativeHook(sym_name, nil,
                     function(retval)
+                        V("Native post %s, enabled=%s retval=%s", sym_name, tostring(state.enabled), tostring(retval))
                         if not state.enabled then return retval end
                         return 1
                     end)
@@ -84,7 +89,7 @@ local sym_CanGrab = Resolve("VR4GamePlayerProp_CanGrab")
 if sym_CanGrab then
     pcall(function()
         RegisterNativeHook("VR4GamePlayerProp_CanGrab", nil,
-            function(retval) if not state.enabled then return retval end; return 1 end)
+            function(retval) V("Native post CanGrab, enabled=%s", tostring(state.enabled)); if not state.enabled then return retval end; return 1 end)
         Log(TAG .. ": Native hook — CanGrab → true")
     end)
 end
@@ -93,7 +98,7 @@ local sym_IsGrabAllowed = Resolve("VR4GamePlayerProp_IsGrabAllowed")
 if sym_IsGrabAllowed then
     pcall(function()
         RegisterNativeHook("VR4GamePlayerProp_IsGrabAllowed", nil,
-            function(retval) if not state.enabled then return retval end; return 1 end)
+            function(retval) V("Native post IsGrabAllowed, enabled=%s", tostring(state.enabled)); if not state.enabled then return retval end; return 1 end)
         Log(TAG .. ": Native hook — IsGrabAllowed → true")
     end)
 end
@@ -102,7 +107,7 @@ local sym_IsPropGrabbable = Resolve("VR4GamePlayerPropHolster_IsPropGrabbable")
 if sym_IsPropGrabbable then
     pcall(function()
         RegisterNativeHook("VR4GamePlayerPropHolster_IsPropGrabbable", nil,
-            function(retval) if not state.enabled then return retval end; return 1 end)
+            function(retval) V("Native post IsPropGrabbable, enabled=%s", tostring(state.enabled)); if not state.enabled then return retval end; return 1 end)
         Log(TAG .. ": Native hook — IsPropGrabbable → true")
     end)
 end
@@ -113,6 +118,7 @@ end
 
 RegisterCommand("dualwield", function()
     state.enabled = not state.enabled
+    V("State change: enabled=%s", tostring(state.enabled))
     ModConfig.Save("DualWield", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
     Notify(TAG, state.enabled and "ON" or "OFF")
@@ -122,6 +128,7 @@ RegisterCommand("dualwield_status", function()
     local info = TAG .. ": enabled=" .. tostring(state.enabled)
     -- List all active gun instances via UE4SS
     local guns = FindAllOf("VR4GamePlayerGun")
+    V("FindAllOf(VR4GamePlayerGun) = %s", tostring(guns and #guns or "nil"))
     if guns then
         info = info .. " | Active guns: " .. #guns
         for i, gun in ipairs(guns) do
@@ -136,6 +143,7 @@ RegisterCommand("dualwield_status", function()
     end
     -- Check pawn hand state
     local pawn = FindFirstOf("VR4GamePlayerPawn")
+    V("FindFirstOf(VR4GamePlayerPawn) = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         pcall(function()
             local locked = pawn:AreHandsGrabLocked()

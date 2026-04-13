@@ -11,6 +11,8 @@
 --   Native hooks on cEmWrap::setHp for death trigger
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "BossFixes"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 -- ── Boss type IDs ───────────────────────────────────────────────────────
 local BOSS_IDS = {
@@ -43,6 +45,7 @@ local bossKills = {}
 pcall(function()
 RegisterNativeHook("cEmWrap_setHp",
     function(self_ptr, new_hp)
+        V("Native pre cEmWrap_setHp, self=%s hp=%s", ToHex(self_ptr), tostring(new_hp))
         if new_hp > 0 then return self_ptr, new_hp end
 
         local valid = ReadU8(Offset(self_ptr, OFF_WRAP_VALID))
@@ -65,9 +68,11 @@ RegisterNativeHook("cEmWrap_setHp",
             .. " (kill #" .. bossKills[boss_name] .. ")")
 
         if sym_EmSetDie then
+            V("pcall: EmSetDie cem=%s", ToHex(cem))
             pcall(function() CallNative(sym_EmSetDie, "vpi", cem, 0) end)
         end
         if sym_EmSetDieCnt then
+            V("pcall: EmSetDieCnt cem=%s", ToHex(cem))
             pcall(function() CallNative(sym_EmSetDieCnt, "vpi", cem, 0) end)
         end
 
@@ -80,6 +85,7 @@ end)
 pcall(function()
     RegisterNativeHook("EmListSetAlive",
         function(idx, alive)
+            V("Native pre EmListSetAlive idx=%s alive=%s", tostring(idx), tostring(alive))
             if alive == 0 then
                 Log(TAG .. ": EmListSetAlive idx=" .. idx .. " → DEAD")
             end
@@ -103,6 +109,7 @@ RegisterCommand("bossfixes_status", function()
 
     -- Check player health via UE4SS
     local pawn = FindFirstOf("VR4Bio4PlayerPawn")
+    V("FindFirstOf(VR4Bio4PlayerPawn) = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         pcall(function()
             local hp = pawn:GetPlayerCurrentHealth()

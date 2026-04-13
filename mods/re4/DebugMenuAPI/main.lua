@@ -92,6 +92,10 @@ local function Err(msg)
     print("[" .. MOD_NAME .. "] ERROR: " .. tostring(msg))
 end
 
+local TAG = "[DebugMenuAPI]"
+local VERBOSE = true
+local function V(...) if VERBOSE then print(TAG .. " [V] " .. string.format(...)) end end
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- DEBUGMENU_C ACCESS
 -- ═══════════════════════════════════════════════════════════════════════
@@ -99,11 +103,14 @@ end
 --- Return the live DebugMenu_C singleton (cached).
 local function get_dm()
     if dm_cache and dm_cache:IsValid() then return dm_cache end
+    V("get_dm: cache miss, calling FindFirstOf('DebugMenu_C')")
     local ok, r = pcall(FindFirstOf, "DebugMenu_C")
     if ok and r and r:IsValid() then
         dm_cache = r
+        V("get_dm: found %s", tostring(r:GetName()))
         return r
     end
+    V("get_dm: NOT FOUND (ok=%s, r=%s)", tostring(ok), tostring(r))
     dm_cache = nil
     return nil
 end
@@ -173,6 +180,7 @@ end
 --- Create option widgets for every item in the page and set the title.
 --- Called inside PostHook NewMenu after Blueprint has finished its work.
 local function build_page(dm, page)
+    V("build_page: name=%s, items_before=%d, dynamic=%s", page.name or "?", #page.items, tostring(page.populate_fn ~= nil))
     -- Dynamic pages: re-create item list via populate_fn each time
     if page.populate_fn then
         page.items = {}
@@ -183,8 +191,10 @@ local function build_page(dm, page)
 
     -- Create one widget per item
     if #page.items == 0 then
+        V("build_page: no items, creating placeholder")
         pcall(function() dm:Call("CreateActiveOption", "(No mods registered)") end)
     else
+        V("build_page: creating %d option widgets", #page.items)
         for _, item in ipairs(page.items) do
             pcall(function() dm:Call("CreateActiveOption", make_display(item)) end)
         end
@@ -193,6 +203,7 @@ local function build_page(dm, page)
     -- Cosmetics: title + VBoxList settings
     pcall(function()
         local pw = dm:Get("ParentWidget")
+        V("build_page: ParentWidget=%s", tostring(pw))
         if pw then
             local tt = pw:Get("TitleText")
             if tt then tt:Set("Text", page.name or "Mods") end
@@ -202,6 +213,7 @@ local function build_page(dm, page)
         local pw = dm:Get("ParentWidget")
         if pw then
             local vbl = pw:Get("DebugVBoxList")
+            V("build_page: DebugVBoxList=%s", tostring(vbl))
             if vbl then
                 vbl:Set("MaxVisible", 50)
                 vbl:Set("FirstVisible", 0)
@@ -219,11 +231,13 @@ end
 local function refresh_page(dm, page_byte, cursor)
     if _refreshing then return end
     _refreshing = true
+    V("refresh_page: byte=%d, cursor=%s", page_byte, tostring(cursor))
 
     local page = pages[page_byte]
     if not page then _refreshing = false; return end
 
     -- Wipe widgets (including the auto-added "Back")
+    V("refresh_page: ClearWidgets")
     pcall(function() dm:Call("ClearWidgets") end)
 
     -- Re-add "Back" at index 0 (Blueprint recognises it by name)
@@ -246,10 +260,12 @@ end
 --- Used when Blueprint's internal NewMenu call didn't trigger our PostHook
 --- (e.g. PreviousMenu back-navigation to a custom page).
 local function rebuild_custom_page(dm, page_byte)
+    V("rebuild_custom_page: byte=%d", page_byte)
     local page = pages[page_byte]
-    if not page then return end
+    if not page then V("rebuild_custom_page: no page for byte %d", page_byte); return end
 
     -- Wipe whatever Blueprint left (might be empty or just "Back")
+    V("rebuild_custom_page: ClearWidgets")
     pcall(function() dm:Call("ClearWidgets") end)
 
     -- Re-add "Back" at index 0 (Blueprint recognises it by name)
@@ -299,6 +315,7 @@ local function dispatch_item(dm, page_byte)
     -- ci = 0 is "Back" (handled by Blueprint as a Link, not DoAction).
     if ci < 1 or ci > #page.items then return end
     local item = page.items[ci]
+    V("dispatch_item: page=%d, ci=%d, item=%s, type=%s", page_byte, ci, item.name or "?", item.type or "?")
 
     -- ── Toggle ──────────────────────────────────────────────────
     if item.type == "toggle" then
@@ -370,11 +387,13 @@ local function setup_hooks()
     -- │ We APPEND our items after Blueprint has finished its work.      │
     -- └─────────────────────────────────────────────────────────────────┘
     RegisterPostHook(DM_PATH .. ":NewMenu", function(self, func, parms)
+        V("PostHook NewMenu fired")
         pcall(function()
             local dm = self:get()
-            if not dm then return end
+            if not dm then V("PostHook NewMenu: self:get() returned nil"); return end
 
             local am = get_active_menu(dm)
+            V("PostHook NewMenu: AM=%s, is_custom=%s", tostring(am), tostring(am and pages[am] ~= nil))
             if not am or not pages[am] then return end
 
             local page = pages[am]
@@ -403,18 +422,21 @@ local function setup_hooks()
 
     local function on_confirm_post(self, func, parms)
         local pressed = ReadU8(parms)
+        V("BndEvt Confirm: pressed=%d", pressed)
         if pressed == 0 then return end   -- release event, skip
 
         pcall(function()
             local dm = get_dm()
-            if not dm then return end
+            if not dm then V("BndEvt Confirm: dm=nil, aborting"); return end
 
             local am = get_active_menu(dm)
+            V("BndEvt Confirm: AM=%s, ci=%s", tostring(am), tostring(get_current_index(dm)))
             if not am then return end
 
             -- Job 1: Main page → navigate to Mods root
             if am == 1 then
                 local opt = get_selected_option_name(dm)
+                V("BndEvt Confirm: Main page, selected=%s", tostring(opt))
                 if opt == "Mods" then
                     Log("'Mods' selected on Main → page " .. MODS_ROOT_BYTE)
                     ExecuteAsync(function()
@@ -427,10 +449,12 @@ local function setup_hooks()
             -- Job 2: Custom page
             if pages[am] then
                 local ci = get_current_index(dm)
+                V("BndEvt Confirm: custom page %d, ci=%s", am, tostring(ci))
                 if ci and ci >= 1 then
                     -- Normal item confirm → dispatch action
                     dispatch_item(dm, am)
                 else
+                    V("BndEvt Confirm: ci=0 on custom page, rebuilding")
                     -- ci=0: user confirmed "Back" and Blueprint navigated
                     -- us to this custom page via PreviousMenu → NewMenu.
                     -- Since NewMenu was called internally (no ProcessEvent),
@@ -456,13 +480,15 @@ local function setup_hooks()
     -- └─────────────────────────────────────────────────────────────────┘
     RegisterPostHook(bndevt(9), function(self, func, parms)
         local pressed = ReadU8(parms)
+        V("BndEvt Back: pressed=%d", pressed)
         if pressed == 0 then return end
 
         pcall(function()
             local dm = get_dm()
-            if not dm then return end
+            if not dm then V("BndEvt Back: dm=nil, aborting"); return end
 
             local am = get_active_menu(dm)
+            V("BndEvt Back: AM=%s, is_custom=%s", tostring(am), tostring(am and pages[am] ~= nil))
             if not am or not pages[am] then return end
 
             -- We're on a custom page after pressing Back.
@@ -570,6 +596,7 @@ local function setup_shared_api()
         opts = opts or {}
         local byte = next_page_byte
         next_page_byte = next_page_byte + 1
+        V("NavigateTo: byte=%d, name=%s", byte, tostring(opts.name or _submenu_name or "?"))
         if byte > 254 then
             Warn("Page byte overflow (> 254)")
             return
@@ -608,10 +635,11 @@ local function setup_shared_api()
     --- Force-refresh the current custom page (re-renders labels).
     --- For dynamic pages this re-invokes populate().
     function api.Refresh()
+        V("api.Refresh called")
         local dm = get_dm()
-        if not dm then return end
+        if not dm then V("api.Refresh: dm=nil"); return end
         local am = get_active_menu(dm)
-        if not am or not pages[am] then return end
+        if not am or not pages[am] then V("api.Refresh: AM=%s not custom", tostring(am)); return end
         refresh_page(dm, am, get_current_index(dm) or 0)
     end
 
@@ -794,6 +822,7 @@ local function init()
     initialised = true
 
     Log("v" .. VERSION .. " — BndEvt hook architecture")
+    V("VERBOSE logging enabled")
     Log("  BndEvt hooks on VR4PlayerController_BP_C (ProcessEvent path)")
     Log("  Stock menu is 100%% unmodified for built-in pages")
 

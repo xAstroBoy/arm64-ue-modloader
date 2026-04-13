@@ -9,6 +9,8 @@
 --   Native hooks as backup for stripped C++ ammo checks
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "UnlimitedAmmo"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled = true,
@@ -26,6 +28,7 @@ end
 -- VR4GamePlayerGun::AmmoAvailable → force true
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:AmmoAvailable", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook Gun:AmmoAvailable → true")
     local p = CastParms(parms, "VR4GamePlayerGun:AmmoAvailable")
     if p then p:SetReturnValue(true) end
 end)
@@ -33,6 +36,7 @@ end)
 -- VR4GamePlayerBow::AmmoAvailable → force true (bow uses arrows)
 RegisterPostHook("/Script/Game.VR4GamePlayerBow:AmmoAvailable", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook Bow:AmmoAvailable → true")
     local p = CastParms(parms, "VR4GamePlayerBow:AmmoAvailable")
     if p then p:SetReturnValue(true) end
 end)
@@ -40,6 +44,7 @@ end)
 -- VR4GamePlayerGun::UsesAmmo → force true (ensure ammo system stays active)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:UsesAmmo", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook UsesAmmo → true")
     local p = CastParms(parms, "VR4GamePlayerGun:UsesAmmo")
     if p then p:SetReturnValue(true) end
 end)
@@ -47,6 +52,7 @@ end)
 -- VR4GamePlayerGun::GetCurrentAmmo → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetCurrentAmmo", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook GetCurrentAmmo → 999")
     local p = CastParms(parms, "VR4GamePlayerGun:GetCurrentAmmo")
     if p then p:SetReturnValue(999) end
 end)
@@ -54,6 +60,7 @@ end)
 -- VR4GamePlayerGun::GetAmmoReserves → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetAmmoReserves", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook GetAmmoReserves → 999")
     local p = CastParms(parms, "VR4GamePlayerGun:GetAmmoReserves")
     if p then p:SetReturnValue(999) end
 end)
@@ -61,6 +68,7 @@ end)
 -- VR4GamePlayerGun::GetAmmoCapacity → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetAmmoCapacity", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook GetAmmoCapacity → 999")
     local p = CastParms(parms, "VR4GamePlayerGun:GetAmmoCapacity")
     if p then p:SetReturnValue(999) end
 end)
@@ -68,6 +76,7 @@ end)
 -- VR4GamePlayerGun::GetTotalAvailableAmmo → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetTotalAvailableAmmo", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook GetTotalAvailableAmmo → 999")
     local p = CastParms(parms, "VR4GamePlayerGun:GetTotalAvailableAmmo")
     if p then p:SetReturnValue(999) end
 end)
@@ -75,6 +84,7 @@ end)
 -- VR4GamePlayerGun::GetWeaponItemAmmo → 999
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:GetWeaponItemAmmo", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook GetWeaponItemAmmo → 999")
     local p = CastParms(parms, "VR4GamePlayerGun:GetWeaponItemAmmo")
     if p then p:SetReturnValue(999) end
 end)
@@ -87,13 +97,13 @@ Log(TAG .. ": 8 UE4SS RegisterPostHook on VR4GamePlayerGun/Bow ammo UFunctions")
 
 pcall(function()
     RegisterNativeHook("CheckForOutOfAmmo",
-        function(self_ptr) if not state.enabled then return self_ptr end; return self_ptr end,
+        function(self_ptr) V("CheckForOutOfAmmo pre-hook"); if not state.enabled then return self_ptr end; return self_ptr end,
         nil)
 end)
 
 pcall(function()
     RegisterNativeHook("IsAmmoAvailable", nil,
-        function(retval) if not state.enabled then return retval end; return 1 end)
+        function(retval) V("IsAmmoAvailable post-hook → 1"); if not state.enabled then return retval end; return 1 end)
 end)
 
 local bulletFuncs = {
@@ -104,7 +114,7 @@ local bulletFuncs = {
 for _, fn in ipairs(bulletFuncs) do
     pcall(function()
         RegisterNativeHook(fn, nil,
-            function(retval) if not state.enabled then return retval end; return 999 end)
+            function(retval) V("%s post-hook → 999", fn); if not state.enabled then return retval end; return 999 end)
     end)
 end
 
@@ -115,6 +125,7 @@ Log(TAG .. ": Native hooks on bulletNum/IsAmmoAvailable (backup)")
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("unlimitedammo", function()
+    V("unlimitedammo command — toggling from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     ModConfig.Save("UnlimitedAmmo", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
@@ -125,6 +136,7 @@ RegisterCommand("ammo_status", function()
     local info = TAG .. ": enabled=" .. tostring(state.enabled)
     -- Use FindAllOf to count active guns
     local guns = FindAllOf("VR4GamePlayerGun")
+    V("FindAllOf VR4GamePlayerGun → %d", guns and #guns or 0)
     if guns then
         info = info .. " | Active guns: " .. #guns
         for i, gun in ipairs(guns) do

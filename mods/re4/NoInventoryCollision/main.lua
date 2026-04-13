@@ -11,6 +11,8 @@
 --   Native hooks for collision bypass
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoInventoryCollision"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled = true,
@@ -28,6 +30,7 @@ end
 -- AttacheCase::CanPlaceItem → force true
 RegisterPostHook("/Script/Game.AttacheCase:CanPlaceItem", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook AttacheCase:CanPlaceItem -> true")
     local p = CastParms(parms, "AttacheCase:CanPlaceItem")
     if p then p:SetReturnValue(true) end
 end)
@@ -36,6 +39,7 @@ Log(TAG .. ": RegisterPostHook — AttacheCase:CanPlaceItem → true")
 -- VR4ItemReceptacle::CanPlaceItem → force true
 RegisterPostHook("/Script/Game.VR4ItemReceptacle:CanPlaceItem", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook VR4ItemReceptacle:CanPlaceItem -> true")
     local p = CastParms(parms, "VR4ItemReceptacle:CanPlaceItem")
     if p then p:SetReturnValue(true) end
 end)
@@ -44,6 +48,7 @@ Log(TAG .. ": RegisterPostHook — VR4ItemReceptacle:CanPlaceItem → true")
 -- VR4ItemReceptacle::CanPlaceItemId → force true
 RegisterPostHook("/Script/Game.VR4ItemReceptacle:CanPlaceItemId", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook VR4ItemReceptacle:CanPlaceItemId -> true")
     local p = CastParms(parms, "VR4ItemReceptacle:CanPlaceItemId")
     if p then p:SetReturnValue(true) end
 end)
@@ -52,6 +57,7 @@ Log(TAG .. ": RegisterPostHook — VR4ItemReceptacle:CanPlaceItemId → true")
 -- VR4ItemReceptacleSlot::CanPlaceItem → force true
 RegisterPostHook("/Script/Game.VR4ItemReceptacleSlot:CanPlaceItem", function(self, func, parms)
     if not state.enabled then return end
+    V("PostHook VR4ItemReceptacleSlot:CanPlaceItem -> true")
     local p = CastParms(parms, "VR4ItemReceptacleSlot:CanPlaceItem")
     if p then p:SetReturnValue(true) end
 end)
@@ -104,6 +110,7 @@ if sym_intersect then
     RegisterNativeHookAt(sym_intersect, "ItemRegionsIntersect", nil,
         function(retval)
             if not state.enabled then return retval end
+            V("Native ItemRegionsIntersect -> 0 (allow overlay)")
             return 0
         end)
     Log(TAG .. ": Native hook — ItemRegionsIntersect → false (allow overlay)")
@@ -120,6 +127,7 @@ end
 
 RegisterCommand("NoInventoryCollision", function()
     state.enabled = not state.enabled
+    V("toggle: enabled=%s", tostring(state.enabled))
     ModConfig.Save("NoInventoryCollision", state)
     Log(TAG .. ": " .. (state.enabled and "ENABLED" or "DISABLED"))
     Notify(TAG, state.enabled and "ON" or "OFF")
@@ -128,6 +136,7 @@ end)
 RegisterCommand("inventory_info", function()
     local info = TAG .. ": enabled=" .. tostring(state.enabled)
     local case = FindFirstOf("AttacheCase")
+    V("FindFirstOf AttacheCase -> %s", tostring(case))
     if case and case:IsValid() then
         pcall(function()
             local w = case.Width

@@ -9,6 +9,8 @@
 --   Native hooks on GetEtcModelClass for mesh table override
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "SaddlerAdaFix"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local EM3F_INDEX = 0x3F
 
@@ -29,6 +31,7 @@ local cachedClass = nil
 
 -- Pre-search using UE4SS StaticFindObject
 for _, path in ipairs(MESH_TABLE_PATHS) do
+    V("Trying StaticFindObject: %s", path)
     local found = StaticFindObject(path)
     if found and found:IsValid() then
         cachedClass = found:GetAddress()
@@ -40,6 +43,7 @@ end
 if not cachedClass then
     -- Try StaticLoadClass as fallback
     for _, path in ipairs(MESH_TABLE_PATHS) do
+        V("Trying StaticLoadClass: %s", path)
         local loaded = StaticLoadClass("Actor", path)
         if loaded then
             cachedClass = loaded:GetAddress()
@@ -65,8 +69,9 @@ local sym_StaticLoadCls = Resolve("StaticLoadClass")
 
 pcall(function()
 RegisterNativeHook("GetEtcModelClass",
-    function(self_ptr, index) return self_ptr, index end,
+    function(self_ptr, index) V("GetEtcModelClass pre-hook index=0x%X", index); return self_ptr, index end,
     function(retval, self_ptr, index)
+        V("GetEtcModelClass post-hook index=0x%X retval=%s", index, tostring(retval))
         if index ~= EM3F_INDEX then return retval end
         if retval ~= 0 then
             if not cachedClass then cachedClass = retval end
@@ -76,6 +81,7 @@ RegisterNativeHook("GetEtcModelClass",
         if cachedClass then return cachedClass end
 
         -- Last resort: manual C++ lookup
+        V("em3f cache miss, attempting manual C++ lookup")
         local baseClass = nil
         if sym_AVR4Model_SC then
             baseClass = CallNative(sym_AVR4Model_SC, "p")
@@ -99,12 +105,13 @@ end)
 -- Monitor em3f container init
 pcall(function()
     RegisterNativeHook("Et3f_init",
-        function(self_ptr) Log(TAG .. ": em3f container init"); return self_ptr end, nil)
+        function(self_ptr) V("Et3f_init pre-hook self=%s", tostring(self_ptr)); Log(TAG .. ": em3f container init"); return self_ptr end, nil)
 end)
 
 pcall(function()
     RegisterNativeHook("VR4ModelInit",
         function(self_ptr, uclass)
+            V("VR4ModelInit pre-hook self=%s uclass=%s", tostring(self_ptr), tostring(uclass))
             if uclass == 0 then LogWarn(TAG .. ": VR4ModelInit null UClass") end
             return self_ptr, uclass
         end, nil)

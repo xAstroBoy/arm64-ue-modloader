@@ -17,6 +17,8 @@
 --   +0x4  uint16_t  maxCapacity ← WE OVERRIDE THIS
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "StackableItems"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled = true,
@@ -41,6 +43,7 @@ local sym_itemInfo = Resolve("itemInfo", 0x0635F714)
 pcall(function()
     RegisterNativeHook("itemInfo",
         function(itemId, outInfoPtr)
+            V("itemInfo pre-hook itemId=0x%X outInfoPtr=%s", itemId, tostring(outInfoPtr))
             -- BLOCK if outInfo is null — prevent write to NULL
             if IsNull(outInfoPtr) then
                 return "BLOCK"
@@ -48,6 +51,7 @@ pcall(function()
             return itemId, outInfoPtr
         end,
         function(retval, itemId, outInfoPtr)
+            V("itemInfo post-hook itemId=0x%X", itemId)
             if not state.enabled then return retval end
             if IsNull(outInfoPtr) then return retval end
 
@@ -66,6 +70,7 @@ pcall(function()
 
                 -- Override max capacity
                 WriteU16(Offset(outInfoPtr, 4), state.maxStack)
+                V("Patched itemId=0x%X type=%d oldMax=%d → %d", itemId & 0xFFFF, itemType, maxCap, state.maxStack)
 
                 -- Track unique items overridden
                 local id = itemId & 0xFFFF
@@ -90,6 +95,7 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("stackable", function()
+    V("stackable command — toggling enabled from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     ModConfig.Save("StackableItems", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
@@ -97,6 +103,7 @@ RegisterCommand("stackable", function()
 end)
 
 RegisterCommand("stackable_max", function(args)
+    V("stackable_max command args=%s", tostring(args))
     local n = tonumber(args)
     if n and n >= 1 and n <= 99999 then
         state.maxStack = n

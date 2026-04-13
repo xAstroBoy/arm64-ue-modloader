@@ -10,6 +10,8 @@
 --   Distributes spawns in a circle around the player
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "EnemySpawner"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 -- ── HP presets (LE uint16 → {lo, hi}) ───────────────────────────────
 local HP_PRESETS = {
@@ -389,14 +391,17 @@ local emListBuf      = nil   -- Reusable 32-byte EM_LIST (AllocateMemory)
 local nativeReady    = false
 
 local function initNative()
-    if nativeReady then return true end
+    if nativeReady then V("initNative: already initialized"); return true end
 
+    V("initNative: resolving native symbols...")
     local base = nil
     pcall(function() base = GetLibBase() end)
     if not base or IsNull(base) then
+        V("initNative: GetLibBase() returned nil/null")
         LogWarn(TAG .. ": GetLibBase() failed")
         return false
     end
+    V("initNative: base=%s", tostring(base))
 
     -- Resolve EmSetEvent — try mangled C++ name, then plain, then raw offset
     pcall(function()
@@ -412,22 +417,28 @@ local function initNative()
             sym_EmSetEvent = Offset(base, 0x062E9E8C)
         end)
     end
+    V("initNative: EmSetEvent resolved=%s", tostring(sym_EmSetEvent ~= nil))
 
     -- pPL: BSS variable holding cPlayer* (player position source)
     -- pPL+0xa4 = posX (float), pPL+0xa8 = posY (float), pPL+0xac = posZ (float)
     pcall(function() addr_pPL = Offset(base, 0x0A94AB40) end)
+    V("initNative: pPL=%s", tostring(addr_pPL))
 
     -- errEm: BSS variable holding cEm* sentinel returned on spawn failure
     pcall(function() addr_errEm = Offset(base, 0x0A954FF0) end)
+    V("initNative: errEm=%s", tostring(addr_errEm))
 
     -- Allocate reusable 32-byte EM_LIST buffer (calloc -> zero-initialized)
     pcall(function() emListBuf = AllocateMemory(32) end)
+    V("initNative: emListBuf=%s", tostring(emListBuf))
 
     if not sym_EmSetEvent or IsNull(sym_EmSetEvent) then
+        V("initNative: FAILED - EmSetEvent not resolved")
         LogWarn(TAG .. ": EmSetEvent resolve FAILED")
         return false
     end
     if not emListBuf or IsNull(emListBuf) then
+        V("initNative: FAILED - AllocateMemory returned nil/null")
         LogWarn(TAG .. ": AllocateMemory(32) FAILED")
         return false
     end
@@ -446,15 +457,16 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 local function getPlayerPosition()
-    if not addr_pPL then return nil end
+    if not addr_pPL then V("getPlayerPosition: addr_pPL is nil"); return nil end
     local pPL = nil
     pcall(function() pPL = ReadPtr(addr_pPL) end)
-    if not pPL or IsNull(pPL) then return nil end
+    if not pPL or IsNull(pPL) then V("getPlayerPosition: pPL ptr is nil/null"); return nil end
     local x, y, z
     pcall(function() x = ReadFloat(Offset(pPL, 0xa4)) end)
     pcall(function() y = ReadFloat(Offset(pPL, 0xa8)) end)
     pcall(function() z = ReadFloat(Offset(pPL, 0xac)) end)
-    if not x or not z then return nil end
+    if not x or not z then V("getPlayerPosition: coords nil x=%s z=%s", tostring(x), tostring(z)); return nil end
+    V("getPlayerPosition: pos=(%.1f, %.1f, %.1f)", x, y or 0, z)
     return x, y or 0, z
 end
 
@@ -472,6 +484,7 @@ local state = {
 }
 
 local saved = ModConfig.Load("EnemySpawner")
+V("Config: loaded=%s", tostring(saved ~= nil))
 if saved then
     if saved.difficulty and HP_PRESETS[saved.difficulty] then
         state.difficulty = saved.difficulty
@@ -519,14 +532,17 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 local function spawnSingle(enemy, offsetX, offsetZ)
-    if not initNative() then return false, "Native init failed" end
+    V("spawnSingle: enemy=%s offX=%s offZ=%s", enemy.name, tostring(offsetX), tostring(offsetZ))
+    if not initNative() then V("spawnSingle: native init failed"); return false, "Native init failed" end
 
     -- Get player position in RE4 world coords
     local px, py, pz = getPlayerPosition()
-    if not px then return false, "No player position — load a level first" end
+    if not px then V("spawnSingle: no player position"); return false, "No player position — load a level first" end
+    V("spawnSingle: playerPos=(%.1f,%.1f,%.1f)", px, py, pz)
 
     -- Compute HP from preset tables
     local hp = getHP(enemy)
+    V("spawnSingle: hp=%d emId=%d subType=%d", hp, enemy.bytes[1], enemy.bytes[2])
     local b = enemy.bytes
     -- bytes: {emId, subType, param1, param2, p5, p6, p7, hpLo, hpHi}
 
@@ -567,6 +583,7 @@ local function spawnSingle(enemy, offsetX, offsetZ)
         pcall(function() WriteU16(Offset(emListBuf, 0x12), toU16(rotInt)) end)
     end
 
+    V("spawnSingle: calling EmSetEvent emId=%d subType=%d hp=%d", b[1], b[2], hp)
     -- Call EmSetEvent(EM_LIST*) -> returns cEm* or errEm
     local result = nil
     local callOk, callErr = pcall(function()
@@ -574,9 +591,12 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     end)
 
     if not callOk then
+        V("spawnSingle: CallNative crashed: %s", tostring(callErr))
         return false, "CallNative crash: " .. tostring(callErr)
     end
+    V("spawnSingle: CallNative returned result=%s", tostring(result))
     if not result or IsNull(result) then
+        V("spawnSingle: result is NULL")
         return false, "EmSetEvent returned NULL"
     end
 
@@ -584,21 +604,25 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     local errEm = nil
     pcall(function() errEm = ReadPtr(addr_errEm) end)
     if errEm and not IsNull(errEm) and result == errEm then
+        V("spawnSingle: result matches errEm sentinel - pool full/invalid emId")
         return false, "Pool full or invalid emId (errEm)"
     end
 
     -- Check status byte — EmSetEvent sets EM_LIST[0] = 7 on success
     local statusByte = 0
     pcall(function() statusByte = ReadU8(emListBuf) end)
+    V("spawnSingle: statusByte=%d (7=success)", statusByte)
     if statusByte ~= 7 then
         Log(TAG .. ":   Warning: EM_LIST status=" .. statusByte .. " (expected 7)")
     end
 
+    V("spawnSingle: SUCCESS enemy=%s cEm=%s", enemy.name, tostring(result))
     return true, result
 end
 
 local function spawnEnemy(enemy, count)
     count = count or state.spawnCount
+    V("spawnEnemy: name=%s count=%d diff=%s dist=%d", enemy.name, count, state.difficulty, state.spawnDistance)
 
     Log(TAG .. ": Spawning " .. enemy.name .. " x" .. count
         .. " | HP=" .. getHP(enemy)
@@ -617,6 +641,7 @@ local function spawnEnemy(enemy, count)
         local dist = state.spawnDistance
         local ox = math.cos(angle) * dist
         local oz = math.sin(angle) * dist
+        V("spawnEnemy: #%d/%d angle=%.2f ox=%.1f oz=%.1f", i, count, angle, ox, oz)
 
         local ok, result = spawnSingle(enemy, ox, oz)
         if ok then
@@ -642,8 +667,10 @@ local function spawnEnemy(enemy, count)
 end
 
 local function spawnByName(name, count)
+    V("spawnByName: name='%s' count=%s", name, tostring(count))
     local em = ENEMY_BY_NAME[name]
     if not em then
+        V("spawnByName: exact match failed, trying fuzzy search")
         -- Fuzzy search
         local lower = name:lower()
         for _, e in ipairs(ALL_ENEMIES) do
@@ -654,9 +681,11 @@ local function spawnByName(name, count)
         end
     end
     if not em then
+        V("spawnByName: no match found for '%s'", name)
         LogWarn(TAG .. ": Enemy not found: " .. name)
         return 0
     end
+    V("spawnByName: resolved '%s' -> %s", name, em.name)
     return spawnEnemy(em, count)
 end
 
@@ -665,6 +694,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("spawn", function(args)
+    V("cmd:spawn args='%s'", tostring(args))
     if not args or args == "" then
         Log(TAG .. ": Usage: spawn <name|index> [count]")
         return
@@ -690,6 +720,7 @@ RegisterCommand("spawn", function(args)
 end)
 
 RegisterCommand("spawn_difficulty", function(args)
+    V("cmd:spawn_difficulty args='%s'", tostring(args))
     local d = (args or "NORMAL"):upper()
     if HP_PRESETS[d] then
         state.difficulty = d
@@ -702,6 +733,7 @@ RegisterCommand("spawn_difficulty", function(args)
 end)
 
 RegisterCommand("spawn_count", function(args)
+    V("cmd:spawn_count args='%s'", tostring(args))
     local n = tonumber(args) or 1
     state.spawnCount = math.max(1, math.min(10, n))
     ModConfig.Save("EnemySpawner", state)
@@ -709,6 +741,7 @@ RegisterCommand("spawn_count", function(args)
 end)
 
 RegisterCommand("spawn_distance", function(args)
+    V("cmd:spawn_distance args='%s'", tostring(args))
     local n = tonumber(args) or 500
     state.spawnDistance = math.max(100, math.min(5000, n))
     ModConfig.Save("EnemySpawner", state)
@@ -716,6 +749,7 @@ RegisterCommand("spawn_distance", function(args)
 end)
 
 RegisterCommand("spawn_list", function()
+    V("cmd:spawn_list")
     Log(TAG .. ": " .. #ALL_ENEMIES .. " enemies in " .. #CATEGORIES .. " categories:")
     for _, cat in ipairs(CATEGORIES) do
         Log("  " .. cat.name .. " (" .. #cat.enemies .. ")")
@@ -723,6 +757,7 @@ RegisterCommand("spawn_list", function()
 end)
 
 RegisterCommand("spawner_status", function()
+    V("cmd:spawner_status")
     local info = TAG .. ": v8.0"
         .. " | diff=" .. state.difficulty
         .. " | count=" .. state.spawnCount
@@ -745,7 +780,9 @@ end)
 -- SHARED API — Expose spawner to other mods
 -- ═══════════════════════════════════════════════════════════════════════
 
+V("SharedAPI available=%s", tostring(SharedAPI ~= nil))
 if SharedAPI then
+    V("Registering SharedAPI.Spawner")
     SharedAPI.Spawner = {
         ALL_ENEMIES    = ALL_ENEMIES,
         CATEGORIES     = CATEGORIES,
@@ -767,13 +804,17 @@ end
 -- DEBUG MENU INTEGRATION
 -- ═══════════════════════════════════════════════════════════════════════
 
+V("DebugMenu available=%s", tostring(SharedAPI and SharedAPI.DebugMenu ~= nil))
 if SharedAPI and SharedAPI.DebugMenu then
     local api = SharedAPI.DebugMenu
+    V("Registering DebugMenu sub-menu 'EnemySpawner'")
 
     api.RegisterSubMenu("EnemySpawner", "Enemy Spawner", function()
+        V("DebugMenu: EnemySpawner sub-menu activated")
         api.NavigateTo({ populate = function()
             -- Settings
             api.AddItem("Difficulty: " .. state.difficulty, function()
+                V("DebugMenu: cycling difficulty from %s", state.difficulty)
                 local modes = {"EASY", "NORMAL", "HARD"}
                 local idx = 1
                 for i, m in ipairs(modes) do
@@ -784,11 +825,13 @@ if SharedAPI and SharedAPI.DebugMenu then
                 api.Refresh()
             end)
             api.AddItem("Count: " .. state.spawnCount, function()
+                V("DebugMenu: cycling count from %d", state.spawnCount)
                 state.spawnCount = (state.spawnCount % 10) + 1
                 ModConfig.Save("EnemySpawner", state)
                 api.Refresh()
             end)
             api.AddItem("Distance: " .. state.spawnDistance, function()
+                V("DebugMenu: cycling distance from %d", state.spawnDistance)
                 local dists = {200, 500, 1000, 2000, 3000, 5000}
                 local cur = 1
                 for i, d in ipairs(dists) do
@@ -802,6 +845,7 @@ if SharedAPI and SharedAPI.DebugMenu then
             api.AddItem("--- QUICK ACTIONS ---", nil)
             api.AddItem(">> Spawn Random <<", function()
                 local pick = ALL_ENEMIES[math.random(#ALL_ENEMIES)]
+                V("DebugMenu: spawn random picked='%s'", pick.name)
                 spawnEnemy(pick, state.spawnCount)
             end)
 
@@ -810,11 +854,13 @@ if SharedAPI and SharedAPI.DebugMenu then
             for ci, cat in ipairs(CATEGORIES) do
                 local catRef = cat
                 api.AddItem(catRef.name .. " (" .. #catRef.enemies .. ") >>", function()
+                    V("DebugMenu: entering category '%s'", catRef.name)
                     api.NavigateTo({ populate = function()
                         -- Spawn random from this category
                         api.AddItem(">> Spawn Random " .. catRef.name .. " <<", function()
                             local raw = catRef.enemies[math.random(#catRef.enemies)]
                             local entry = ENEMY_BY_NAME[raw[1]]
+                            V("DebugMenu: cat random picked='%s' found=%s", raw[1], tostring(entry ~= nil))
                             if entry then
                                 spawnEnemy(entry, state.spawnCount)
                             end
@@ -824,6 +870,7 @@ if SharedAPI and SharedAPI.DebugMenu then
                         for ei, em in ipairs(catRef.enemies) do
                             local emName = em[1]
                             api.AddItem(emName, function()
+                                V("DebugMenu: spawn individual '%s'", emName)
                                 local entry = ENEMY_BY_NAME[emName]
                                 if entry then
                                     spawnEnemy(entry, state.spawnCount)
@@ -842,7 +889,9 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 -- Try to init native engine on load (non-fatal — will retry on first spawn)
+V("Init: calling initNative (non-fatal)")
 pcall(initNative)
+V("Init: nativeReady=%s", tostring(nativeReady))
 
 Log(TAG .. ": v8.0 loaded — " .. #ALL_ENEMIES .. " enemies, "
     .. #CATEGORIES .. " categories"

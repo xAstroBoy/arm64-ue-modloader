@@ -4,6 +4,8 @@
 -- via NotifyOnNewObject + K2_DestroyActor.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "HeadBlocker"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
 
@@ -20,11 +22,13 @@ local destroyed = 0
 
 -- Wait for player pawn to exist before destroying anything
 local function waitForPlayerThenDestroy(obj)
+    V("waitForPlayerThenDestroy called, obj=%s", tostring(obj))
     -- Check if player pawn exists (game is fully initialized)
     local pawn = FindFirstOf("VR4GamePlayerPawn")
     if not pawn or not pawn:IsValid() then
         -- Player not ready yet — retry in 200ms
         ExecuteWithDelay(200, function()
+            V("waitForPlayerThenDestroy retry (pawn not ready)")
             if obj and obj:IsValid() then
                 waitForPlayerThenDestroy(obj)
             end
@@ -34,6 +38,7 @@ local function waitForPlayerThenDestroy(obj)
     
     -- Player exists — safe to destroy after one more frame
     ExecuteWithDelay(100, function()
+        V("VR4HeadBlocker deferred destroy executing")
         if not obj or not obj:IsValid() then return end
         local ok, err = pcall(function() obj:K2_DestroyActor() end)
         if ok then
@@ -48,6 +53,7 @@ local function waitForPlayerThenDestroy(obj)
 end
 
 NotifyOnNewObject("VR4HeadBlocker", function(obj)
+    V("NotifyOnNewObject VR4HeadBlocker fired, obj=%s", tostring(obj))
     if not state.enabled then return end
     if not obj:IsValid() then return end
     

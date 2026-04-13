@@ -13,6 +13,8 @@
 -- Fire rate controlled by state.cooldown — lower = faster.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Rapidfire"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled = true,
@@ -45,6 +47,7 @@ end)
 -- IsFiringBlocked → always false (gun is never blocked from firing)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFiringBlocked", function(self, func, parms)
     if not state.enabled or not modReady then return end
+    V("PostHook IsFiringBlocked → false")
     local p = CastParms(parms, "VR4GamePlayerGun:IsFiringBlocked")
     if p then p:SetReturnValue(false) end
 end)
@@ -52,6 +55,7 @@ end)
 -- IsFullyAutomatic → always true (holding trigger keeps firing)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFullyAutomatic", function(self, func, parms)
     if not state.enabled or not modReady then return end
+    V("PostHook IsFullyAutomatic → true")
     local p = CastParms(parms, "VR4GamePlayerGun:IsFullyAutomatic")
     if p then p:SetReturnValue(true) end
 end)
@@ -59,6 +63,7 @@ end)
 -- IsReadyToFire → always true (fire timer always "done" from ProcessEvent perspective)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsReadyToFire", function(self, func, parms)
     if not state.enabled or not modReady then return end
+    V("PostHook IsReadyToFire → true")
     local p = CastParms(parms, "VR4GamePlayerGun:IsReadyToFire")
     if p then p:SetReturnValue(true) end
 end)
@@ -66,6 +71,7 @@ end)
 -- WasTriggerJustPressed → true when trigger held (for semi-auto guns)
 RegisterPostHook("/Script/Game.VR4GamePlayerGun:WasTriggerJustPressed", function(self, func, parms)
     if not state.enabled or not modReady then return end
+    V("PostHook WasTriggerJustPressed → true")
     local p = CastParms(parms, "VR4GamePlayerGun:WasTriggerJustPressed")
     if p then p:SetReturnValue(true) end
 end)
@@ -83,6 +89,7 @@ pcall(function()
     RegisterNativeHook("UpdateFireTimer",
         function(self_ptr, dt)
             if not state.enabled or not modReady then return self_ptr, dt end
+            V("UpdateFireTimer pre-hook dt=%.3f", dt)
             local now = os.clock()
             if (now - lastFireTime) >= state.cooldown then
                 lastFireTime = now
@@ -98,6 +105,7 @@ pcall(function()
     RegisterNativeHook("IsFireTimerDone", nil,
         function(retval)
             if not state.enabled or not modReady then return retval end
+            V("IsFireTimerDone post-hook → 1")
             return 1  -- timer done
         end)
     Log(TAG .. ": IsFireTimerDone hooked")
@@ -108,6 +116,7 @@ pcall(function()
     RegisterNativeHook("GetEnemyReactionCooldown", nil,
         function(retval)
             if not state.enabled or not modReady then return retval end
+            V("GetEnemyReactionCooldown post-hook → 0.0")
             return 0.0  -- instant reaction
         end, ">f")
     Log(TAG .. ": GetEnemyReactionCooldown hooked")
@@ -131,6 +140,7 @@ end)
 --   echo '{"cmd":"rapidfire","args":"0.05"}' | nc ...          → set 0.05s
 -- ═══════════════════════════════════════════════════════════════════════
 RegisterCommand("rapidfire", function(args)
+    V("rapidfire command args=%s", tostring(args))
     if args and args ~= "" then
         local val = tonumber(args)
         if val and val > 0 then
@@ -156,6 +166,7 @@ if SharedAPI and SharedAPI.DebugMenu then
     SharedAPI.DebugMenu.RegisterToggle("Rapidfire", "Rapidfire",
         function() return state.enabled end,
         function(v)
+            V("DebugMenu toggle → %s", tostring(v))
             state.enabled = v
             lastFireTime = 0
             ModConfig.Save("Rapidfire", state)

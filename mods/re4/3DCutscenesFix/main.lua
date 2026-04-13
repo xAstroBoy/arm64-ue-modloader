@@ -9,6 +9,8 @@
 --   Native Dobby hooks on CutsceneUpdateCamera + SceEvent Begin/End
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "3DCutscenesFix"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
     enabled    = true,
@@ -29,6 +31,7 @@ local gamePawnReady = false  -- gate: don't touch camera until real game pawn ex
 
 local function refreshPawn()
     local pawn = FindFirstOf("VR4GamePlayerPawn")
+    V("refreshPawn: FindFirstOf(VR4GamePlayerPawn) = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         cachedPawn = pawn:GetAddress()
         gamePawnReady = true
@@ -41,6 +44,7 @@ end
 -- The crash (SIGSEGV in UpdateViewTargetInternal) happens when SetAnchorInternal
 -- is called before the pawn's camera subsystem is ready.
 NotifyOnNewObject("VR4GamePlayerPawn", function(obj)
+    V("NewObject VR4GamePlayerPawn: %s valid=%s", tostring(obj), tostring(obj and obj:IsValid()))
     if obj and obj:IsValid() then
         cachedPawn = obj:GetAddress()
         Log(TAG .. ": VR4GamePlayerPawn spawned — cached @ " .. ToHex(cachedPawn) .. " (delaying ready 3s)")
@@ -86,6 +90,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterHook("/Script/Game.VR4GamePlayerPawn:OnCameraModeChanged", function(Context, Parms)
+    V("PostHook OnCameraModeChanged fired")
     local self = Context:get()
     if self and self:IsValid() then
         local addr = self:GetAddress()
@@ -95,6 +100,7 @@ RegisterHook("/Script/Game.VR4GamePlayerPawn:OnCameraModeChanged", function(Cont
         end
         -- Read camera mode via UE4SS reflection
         pcall(function()
+            V("pcall: reading CameraMode from pawn")
             local mode = self.CameraMode
             if mode then Log(TAG .. ": CameraMode → " .. tostring(mode)) end
         end)
@@ -116,6 +122,7 @@ if sym_updateCamera and sym_setAnchor then
     pcall(function()
     RegisterNativeHookAt(sym_updateCamera, "CutsceneUpdateCamera", nil,
         function(retval, self_ptr, transform_ptr, fovY, screenOn)
+            V("Native post CutsceneUpdateCamera, enabled=%s gamePawnReady=%s cachedPawn=%s", tostring(state.enabled), tostring(gamePawnReady), tostring(cachedPawn ~= nil))
             if not state.enabled then return retval end
             if not transform_ptr then return retval end
             -- CRITICAL: Don't engage until the real VR game pawn exists.
@@ -124,6 +131,7 @@ if sym_updateCamera and sym_setAnchor then
             if not gamePawnReady or not cachedPawn then return retval end
             -- Validate the cached pawn is still alive before touching its camera
             local pawn = FindFirstOf("VR4GamePlayerPawn")
+            V("FindFirstOf(VR4GamePlayerPawn) in UpdateCamera = %s", tostring(pawn))
             if not pawn or not pawn:IsValid() then return retval end
             cachedPawn = pawn:GetAddress() -- refresh in case it moved
             state.inCutscene = true
@@ -148,6 +156,7 @@ if sym_begin then
     pcall(function()
     RegisterNativeHookAt(sym_begin, "OnSceEventBegin", nil,
         function(retval, self_ptr)
+            V("Native post OnSceEventBegin, enabled=%s", tostring(state.enabled))
             if not state.enabled then return retval end
             state.inCutscene = true
             Log(TAG .. ": Cutscene BEGIN")
@@ -160,6 +169,7 @@ if sym_end then
     pcall(function()
     RegisterNativeHookAt(sym_end, "OnSceEventEnd", nil,
         function(retval, self_ptr)
+            V("Native post OnSceEventEnd")
             state.inCutscene = false
             Log(TAG .. ": Cutscene END")
             return retval
@@ -185,6 +195,7 @@ RegisterCommand("cutscene_status", function()
         .. " pawn=" .. tostring(cachedPawn ~= nil)
     -- Read player state via UE4SS
     local pawn = FindFirstOf("VR4GamePlayerPawn")
+    V("FindFirstOf(VR4GamePlayerPawn) for status = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         pcall(function()
             local active = pawn:IsActivePlayerPawn()
