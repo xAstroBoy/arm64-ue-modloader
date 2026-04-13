@@ -18,19 +18,42 @@ end
 
 local destroyed = 0
 
+-- Wait for player pawn to exist before destroying anything
+local function waitForPlayerThenDestroy(obj)
+    -- Check if player pawn exists (game is fully initialized)
+    local pawn = FindFirstOf("VR4GamePlayerPawn")
+    if not pawn or not pawn:IsValid() then
+        -- Player not ready yet — retry in 200ms
+        ExecuteWithDelay(200, function()
+            if obj and obj:IsValid() then
+                waitForPlayerThenDestroy(obj)
+            end
+        end)
+        return
+    end
+    
+    -- Player exists — safe to destroy after one more frame
+    ExecuteWithDelay(100, function()
+        if not obj or not obj:IsValid() then return end
+        local ok, err = pcall(function() obj:K2_DestroyActor() end)
+        if ok then
+            destroyed = destroyed + 1
+            Log(TAG .. ": VR4HeadBlocker destroyed (total: " .. destroyed .. ")")
+        else
+            LogWarn(TAG .. ": K2_DestroyActor failed: " .. tostring(err))
+            pcall(function() obj:SetActorHiddenInGame(true) end)
+            Log(TAG .. ": HeadBlocker hidden as fallback")
+        end
+    end)
+end
+
 NotifyOnNewObject("VR4HeadBlocker", function(obj)
     if not state.enabled then return end
     if not obj:IsValid() then return end
-
-    local ok, err = pcall(function() obj:K2_DestroyActor() end)
-    if ok then
-        destroyed = destroyed + 1
-        Log(TAG .. ": VR4HeadBlocker destroyed (total: " .. destroyed .. ")")
-    else
-        LogWarn(TAG .. ": K2_DestroyActor failed: " .. tostring(err))
-        pcall(function() obj:SetActorHiddenInGame(true) end)
-        Log(TAG .. ": HeadBlocker hidden as fallback")
-    end
+    
+    -- Hide immediately to prevent visual glitch, then defer destroy
+    pcall(function() obj:SetActorHiddenInGame(true) end)
+    waitForPlayerThenDestroy(obj)
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════

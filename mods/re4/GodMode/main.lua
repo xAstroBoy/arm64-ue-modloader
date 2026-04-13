@@ -100,18 +100,28 @@ Log(TAG .. ": RegisterPostHook — Bio4:IsGameOver (force false)")
 NotifyOnNewObject("VR4DeathMenu", function(obj)
     if not state.enabled then return end
     if not obj or not obj:IsValid() then return end
-    Log(TAG .. ": VR4DeathMenu spawned — destroying + force heal")
-    -- Destroy death menu before it renders
-    pcall(function() obj:K2_DestroyActor() end)
-    -- Emergency heal
+    Log(TAG .. ": VR4DeathMenu spawned — hiding + scheduling destroy + force heal")
+    
+    -- Hide immediately to prevent rendering
+    pcall(function() obj:SetActorHiddenInGame(true) end)
+    
+    -- Emergency heal immediately
     pcall(function()
         local utils = StaticFindObject("/Script/Game.Default__Bio4Utils")
         if utils and utils:IsValid() then
             utils:HealPlayer()
         end
     end)
+    
+    -- Defer destroy by 100ms to avoid tick crash
+    ExecuteWithDelay(100, function()
+        if obj and obj:IsValid() then
+            pcall(function() obj:K2_DestroyActor() end)
+            Log(TAG .. ": VR4DeathMenu destroyed (deferred)")
+        end
+    end)
 end)
-Log(TAG .. ": NotifyOnNewObject — VR4DeathMenu (auto-destroy)")
+Log(TAG .. ": NotifyOnNewObject — VR4DeathMenu (auto-destroy, deferred)")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- LAYER 6: Health clamp — periodic check + post-damage heal
@@ -134,13 +144,38 @@ Log(TAG .. ": PreHook BLOCK — OnStunnedChanged (anti-insta-kill stun)")
 -- LAYER 7: Block KillZ volume kills + actor destruction of pawn
 -- ═══════════════════════════════════════════════════════════════════════
 
+-- Wait for player pawn before destroying KillZ volumes
+local function waitForPlayerThenDestroyKillZ(obj)
+    local pawn = FindFirstOf("VR4GamePlayerPawn")
+    if not pawn or not pawn:IsValid() then
+        -- Player not ready — retry in 200ms
+        ExecuteWithDelay(200, function()
+            if obj and obj:IsValid() then
+                waitForPlayerThenDestroyKillZ(obj)
+            end
+        end)
+        return
+    end
+    
+    -- Player exists — safe to destroy after one frame
+    ExecuteWithDelay(100, function()
+        if obj and obj:IsValid() then
+            pcall(function() obj:K2_DestroyActor() end)
+            Log(TAG .. ": KillZVolume destroyed (deferred)")
+        end
+    end)
+end
+
 NotifyOnNewObject("KillZVolume", function(obj)
     if not state.enabled then return end
     if not obj or not obj:IsValid() then return end
-    Log(TAG .. ": KillZVolume spawned — destroying to prevent fall death")
-    pcall(function() obj:K2_DestroyActor() end)
+    Log(TAG .. ": KillZVolume spawned — scheduling deferred destroy")
+    
+    -- Disable collision immediately to prevent kills
+    pcall(function() obj:SetActorEnableCollision(false) end)
+    waitForPlayerThenDestroyKillZ(obj)
 end)
-Log(TAG .. ": NotifyOnNewObject — KillZVolume (auto-destroy)")
+Log(TAG .. ": NotifyOnNewObject — KillZVolume (auto-destroy, deferred)")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- TOGGLE — When toggled, update bCanBeDamaged on the live pawn

@@ -251,8 +251,6 @@ namespace crash_handler
         }
 
         // Determine if crash PC is inside libmodloader.so or game code.
-        // We write a crash report for ALL crashes — our hooks can trigger
-        // crashes in game code (libUE4.so), and we need to capture those too.
         ucontext_t *uc = static_cast<ucontext_t *>(ucontext_raw);
         bool is_modloader_crash = false;
         if (uc)
@@ -261,7 +259,23 @@ namespace crash_handler
             is_modloader_crash = pc_in_modloader(pc);
         }
 
-        // Write full crash report for ALL crashes (modloader + game)
+        // For game/external crashes: DON'T write a crash report.
+        // fprintf/fopen use malloc internally, which is NOT async-signal-safe.
+        // If the game's heap is corrupted (common for SIGSEGV in renderer/allocator),
+        // calling malloc from the signal handler will deadlock or double-corrupt,
+        // killing the process instead of letting the game's own handler deal with it.
+        // We only write full reports for crashes inside libmodloader.so where we
+        // control the heap state.
+        if (!is_modloader_crash)
+        {
+            // Game-side crash — skip crash report entirely (fprintf uses malloc,
+            // which is NOT async-signal-safe and will corrupt/deadlock the heap).
+            // Chain directly to the original handler.
+            goto chain_to_old_handler;
+        }
+
+        // Write full crash report ONLY for libmodloader.so crashes (safe — we control our heap)
+        {
         FILE *f = fopen(paths::crash_log().c_str(), "w");
         if (f)
         {
@@ -426,7 +440,9 @@ namespace crash_handler
 
         // Post crash notification (best effort — may fail in signal context)
         notification::post_crash();
+        } // end crash-report scope
 
+    chain_to_old_handler:
         // Re-raise with original handler
         struct sigaction *old_action = nullptr;
         switch (sig)

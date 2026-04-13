@@ -249,7 +249,12 @@ namespace reflection
                 // Compute the FName ComparisonIndex for this entry
                 int32_t fname_index = (blk << ue::FNAME_BLOCK_BITS) | (byte_pos / ue::FNAME_STRIDE);
 
-                // Read the string
+                // Read the string — check full range is readable first
+                int char_size = is_wide ? 2 : 1;
+                int raw_size = ue::FNAMENTRY_HEADER_SIZE + length * char_size;
+                if (!is_readable_ptr(reinterpret_cast<const void *>(entry_addr + raw_size - 1)))
+                    break; // End of readable memory in this block
+
                 const char *chars = reinterpret_cast<const char *>(entry_addr + ue::FNAMENTRY_HEADER_SIZE);
                 std::string name;
 
@@ -273,8 +278,6 @@ namespace reflection
                 }
 
                 // Compute entry size: header + string data, aligned up to stride
-                int char_size = is_wide ? 2 : 1;
-                int raw_size = ue::FNAMENTRY_HEADER_SIZE + length * char_size;
                 // Align up to FNAME_STRIDE
                 int entry_size = ((raw_size + ue::FNAME_STRIDE - 1) / ue::FNAME_STRIDE) * ue::FNAME_STRIDE;
                 if (entry_size < static_cast<int>(ue::FNAME_STRIDE))

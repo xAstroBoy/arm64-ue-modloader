@@ -1,19 +1,22 @@
--- mods/Randomizer/main.lua v6.0
+-- mods/Randomizer/main.lua v7.0
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-enhanced Enemy Randomizer — re-randomizes on EVERY level load
 --
--- v6.0 — Per-level-load randomization:
---   Detects level changes via emId mismatch in readEmList post-hook.
---   When the game loads new ESL data (new level), the emId at each slot
---   changes from our cached replacement to the level's original value.
---   We detect this mismatch and clear ALL slot caches, forcing fresh
---   random picks for every enemy in the new level.
---   Cached enabled pool for efficiency (rebuilt only on config change).
---   Better statistics: per-level swap count, generation tracking.
+-- v7.0 — Crash-safe + verbose debug:
+--   Full pcall wrapper on native hook — ALWAYS returns retPtr.
+--   Settle period after level change — skip N calls to let ESL stabilize.
+--   Error counting with auto-disable safety.
+--   VERBOSE logging on every hook call for crash diagnosis.
+-- v6.0 — Per-level-load randomization, emId mismatch detection.
 -- v5.0 — Once-per-slot randomization, debug menu submenu
 -- v3.0 — RegisterNativeHookAt on readEmList, per-enemy toggle commands
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Randomizer"
+local VERBOSE = true  -- VERBOSE LOGGING — log every hook call for crash diagnosis
+
+local function V(msg)
+    if VERBOSE then Log(TAG .. ": [V] " .. msg) end
+end
 
 -- ── HP presets ──────────────────────────────────────────────────────
 local HP = {
@@ -252,130 +255,205 @@ local sym_EmListSetAlive = Resolve("EmListSetAlive",0x062EA224)
 local slotMap = {}          -- [slotIndex] = {bytes, hp, name, removeInvincible, replEmId}
 local lastReadIndex = -1    -- Captured by pre-hook for the post-hook to use
 
+-- Safety: settle period after level change — let ESL memory stabilize before writing
+local SETTLE_CALLS = 10     -- Skip this many readEmList calls after level change
+local settleCounter = 0     -- Counts down after level change detected (0 = ready)
+local hookErrors = 0        -- Consecutive hook/write errors (reset on success)
+local MAX_HOOK_ERRORS = 20  -- Auto-disable writes after this many consecutive errors
+
 -- Hook readEmList — pre-hook captures index, post-hook detects level change + applies randomization
 if sym_readEmList then
-    pcall(function()
     RegisterNativeHookAt(sym_readEmList, "pi",
         function(index)
-            -- Pre-hook: capture the slot index argument
-            lastReadIndex = index or -1
+            -- Pre-hook: capture the slot index argument (pcall for safety)
+            pcall(function()
+                lastReadIndex = index or -1
+                V("PRE readEmList idx=" .. tostring(index))
+            end)
         end,
         function(retPtr)
-            if not state.enabled then return retPtr end
-            if retPtr == 0 then return retPtr end
-            if lastReadIndex < 0 then return retPtr end
+            -- ╔═══════════════════════════════════════════════════════════╗
+            -- ║  CRITICAL: Entire body in pcall so a Lua error can NEVER ║
+            -- ║  prevent us from returning retPtr to the game engine.    ║
+            -- ╚═══════════════════════════════════════════════════════════╝
+            local ok, err = pcall(function()
+                V("POST retPtr=" .. string.format("0x%X", retPtr or 0)
+                    .. " enabled=" .. tostring(state.enabled)
+                    .. " idx=" .. tostring(lastReadIndex)
+                    .. " settle=" .. settleCounter
+                    .. " errors=" .. hookErrors)
 
-            local idx = lastReadIndex
-            local cached = slotMap[idx]
+                if not state.enabled then V("SKIP: disabled"); return end
+                if not retPtr or retPtr == 0 then V("SKIP: retPtr null/0"); return end
+                if lastReadIndex < 0 then V("SKIP: lastReadIndex<0"); return end
+                if hookErrors >= MAX_HOOK_ERRORS then V("SKIP: too many errors (" .. hookErrors .. ")"); return end
 
-            -- ── Level-change detection ──
-            -- If we have a cached entry, check if the game overwrote our data.
-            -- On level change, the game reloads ESL from disk, so the emId
-            -- at retPtr will be the new level's original value, not ours.
-            if cached then
-                local ok, currentEmId = pcall(ReadU8, retPtr)
-                if not ok then
-                    -- retPtr is invalid (freed memory during level transition).
-                    -- Do NOT write to it — would cause SIGSEGV on ARM64.
-                    -- Clear caches so next valid call re-randomizes.
-                    slotMap = {}
-                    levelSwaps = 0
-                    cached = nil
-                    return retPtr
+                local idx = lastReadIndex
+
+                -- ── Settling period after level change ──
+                if settleCounter > 0 then
+                    V("SETTLE: skipping slot " .. idx .. " (" .. settleCounter .. " remaining)")
+                    settleCounter = settleCounter - 1
+                    return
                 end
-                if currentEmId == cached.replEmId then
-                    -- Fast path: our data is still in memory, nothing to do.
-                    -- (We already wrote it; the game hasn't touched it.)
-                    return retPtr
-                end
-                -- Mismatch! Game loaded new data → level changed.
-                -- Clear ALL slot caches to force re-randomization.
-                local now = os.clock()
-                if now - lastDetectTime > 2.0 then
+
+                local cached = slotMap[idx]
+
+                -- ── Read original bytes at retPtr for diagnostics ──
+                local origBytes = ""
+                pcall(function()
+                    local parts = {}
+                    for j = 0, 8 do
+                        parts[j+1] = string.format("%02X", ReadU8(Offset(retPtr, j)))
+                    end
+                    origBytes = table.concat(parts, " ")
+                end)
+                V("SLOT " .. idx .. " orig=[" .. origBytes .. "] cached=" .. tostring(cached ~= nil))
+
+                -- ── Level-change detection ──
+                if cached then
+                    local readOk, currentEmId = pcall(ReadU8, retPtr)
+                    if not readOk then
+                        V("LEVEL-DETECT: retPtr INVALID — clearing all caches")
+                        slotMap = {}
+                        levelSwaps = 0
+                        settleCounter = SETTLE_CALLS
+                        return
+                    end
+                    V("LEVEL-CHECK: slot " .. idx .. " currentEmId=" .. tostring(currentEmId) .. " cachedEmId=" .. cached.replEmId)
+                    if currentEmId == cached.replEmId then
+                        hookErrors = 0
+                        V("CACHE-HIT: slot " .. idx .. " → " .. cached.name .. " (no write needed)")
+                        return
+                    end
+                    -- Mismatch! Game loaded new data → level changed.
+                    local now = os.clock()
                     currentGen = currentGen + 1
                     Log(TAG .. ": === LEVEL CHANGE #" .. currentGen
                         .. " === (slot " .. idx
                         .. " emId " .. tostring(currentEmId or "?") .. "≠" .. cached.replEmId
-                        .. ") — re-randomizing ALL enemies")
+                        .. ") — settling " .. SETTLE_CALLS .. " calls before re-randomizing")
                     lastDetectTime = now
+                    slotMap = {}
+                    levelSwaps = 0
+                    settleCounter = SETTLE_CALLS
+                    return  -- Don't write this call — let ESL stabilize first
                 end
-                slotMap = {}
-                levelSwaps = 0
-                cached = nil
-            end
 
-            -- ── Randomize new slot ──
-            if not cached then
+                -- ── Randomize new slot ──
                 local pick = pickRandom()
-                if not pick then return retPtr end
+                if not pick then V("SKIP: empty pool"); return end
                 local hp = getRandomHP(pick)
-                slotMap[idx] = {
-                    bytes = pick.bytes,
-                    hp = hp,
-                    name = pick.name,
-                    removeInvincible = pick.removeInvincible,
-                    replEmId = pick.bytes[1],  -- Cache emId we'll write (for mismatch detection)
-                }
-                cached = slotMap[idx]
-                levelSwaps = levelSwaps + 1
-                state.swapCount = state.swapCount + 1
-                if levelSwaps <= 5 or levelSwaps % 25 == 0 then
+
+                -- Format bytes for logging
+                local pickBytesStr = ""
+                for j = 1, #pick.bytes do
+                    pickBytesStr = pickBytesStr .. string.format("%02X ", pick.bytes[j])
+                end
+                V("PICK: slot " .. idx .. " → " .. pick.name
+                    .. " bytes=[" .. pickBytesStr .. "]"
+                    .. " HP={" .. hp[1] .. "," .. hp[2] .. "}=" .. makeHP(hp[1], hp[2])
+                    .. " rmInvinc=" .. tostring(pick.removeInvincible))
+
+                -- Validate retPtr is still readable before committing writes
+                local valOk = pcall(ReadU8, retPtr)
+                if not valOk then
+                    V("WRITE-ABORT: retPtr unreadable before write at slot " .. idx)
+                    hookErrors = hookErrors + 1
+                    return
+                end
+
+                -- Write randomization bytes to ESL entry
+                local writeOk = pcall(function()
+                    for j = 0, 6 do
+                        WriteU8(Offset(retPtr, j), pick.bytes[j + 1])
+                    end
+                    WriteU8(Offset(retPtr, 7), hp[1])
+                    WriteU8(Offset(retPtr, 8), hp[2])
+                    if pick.removeInvincible then
+                        local flags = ReadU8(Offset(retPtr, 2))
+                        local newFlags = flags & ~0x40
+                        V("INVINC: slot " .. idx .. " flags 0x" .. string.format("%02X", flags) .. " → 0x" .. string.format("%02X", newFlags))
+                        WriteU8(Offset(retPtr, 2), newFlags)
+                    end
+                end)
+
+                if writeOk then
+                    -- Verify what we actually wrote
+                    local verifyBytes = ""
+                    pcall(function()
+                        local parts = {}
+                        for j = 0, 8 do
+                            parts[j+1] = string.format("%02X", ReadU8(Offset(retPtr, j)))
+                        end
+                        verifyBytes = table.concat(parts, " ")
+                    end)
+                    V("WROTE: slot " .. idx .. " → " .. pick.name .. " verify=[" .. verifyBytes .. "]")
+
+                    slotMap[idx] = {
+                        bytes = pick.bytes,
+                        hp = hp,
+                        name = pick.name,
+                        removeInvincible = pick.removeInvincible,
+                        replEmId = pick.bytes[1],
+                    }
+                    levelSwaps = levelSwaps + 1
+                    state.swapCount = state.swapCount + 1
+                    hookErrors = 0
                     Log(TAG .. ": [gen" .. currentGen .. "] Swap #" .. levelSwaps
                         .. " slot " .. idx
                         .. " → " .. pick.name
-                        .. " HP=" .. makeHP(hp[1], hp[2]))
-                end
-            end
-
-            -- ── Apply randomization bytes to ESL entry ──
-            if cached then
-                local writeOk = pcall(function()
-                    -- Validate retPtr is still readable before writing
-                    ReadU8(retPtr)
-                    for j = 0, 6 do
-                        WriteU8(Offset(retPtr, j), cached.bytes[j + 1])
-                    end
-                    WriteU8(Offset(retPtr, 7), cached.hp[1])
-                    WriteU8(Offset(retPtr, 8), cached.hp[2])
-                    if cached.removeInvincible then
-                        local flags = ReadU8(Offset(retPtr, 2))
-                        WriteU8(Offset(retPtr, 2), flags & ~0x40)
-                    end
-                end)
-                if not writeOk then
-                    -- Write failed — retPtr went invalid between read and write.
-                    -- Evict this slot so we retry on next call.
+                        .. " HP=" .. makeHP(hp[1], hp[2])
+                        .. " bytes=[" .. pickBytesStr .. "]")
+                else
+                    V("WRITE-FAIL: slot " .. idx .. " → " .. pick.name .. " — write pcall failed")
                     slotMap[idx] = nil
+                    hookErrors = hookErrors + 1
+                    Log(TAG .. ": Write error #" .. hookErrors .. " at slot " .. idx .. " for " .. pick.name)
                 end
+            end)
+
+            if not ok then
+                -- Log but NEVER let errors escape to native hook layer
+                pcall(Log, TAG .. ": HOOK PCALL ERROR: " .. tostring(err))
+                hookErrors = hookErrors + 1
             end
 
+            V("RETURN retPtr=" .. string.format("0x%X", retPtr or 0))
+            -- ALWAYS return retPtr — game MUST get a valid pointer back
             return retPtr
         end)
-    Log(TAG .. ": Hooked readEmList — per-level-load re-randomization (emId mismatch detection)")
-    end) -- pcall
+    Log(TAG .. ": Hooked readEmList — per-level-load re-randomization (settle=" .. SETTLE_CALLS .. ", maxErrors=" .. MAX_HOOK_ERRORS .. ")")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- SCRAMBLE — Immediate randomization of all current enemies
 -- ═══════════════════════════════════════════════════════════════════════
 local function scrambleNow()
-    if not sym_getEmListNum or not sym_readEmList or not sym_EmListSetAlive then
+    if not sym_getEmListNum or not sym_readEmList then
         LogWarn(TAG .. ": Missing native bindings")
         return 0
     end
 
-    -- Clear slot map to force re-randomization
+    -- Clear slot map and reset settle counter
     slotMap = {}
     levelSwaps = 0
+    settleCounter = 0
+    hookErrors = 0
 
     local n = CallNative(sym_getEmListNum, "i")
+    V("SCRAMBLE: emListNum=" .. tostring(n))
     local swapped = 0
     for i = 0, n - 1 do
         local ptr = CallNative(sym_readEmList, "pi", i)
+        V("SCRAMBLE: slot " .. i .. " ptr=" .. string.format("0x%X", ptr or 0))
         if ptr ~= 0 then
             local pick = pickRandom()
             if pick then
                 local hp = getRandomHP(pick)
+                local pickBytes = ""
+                for j = 1, #pick.bytes do pickBytes = pickBytes .. string.format("%02X ", pick.bytes[j]) end
+                V("SCRAMBLE-WRITE: slot " .. i .. " → " .. pick.name .. " bytes=[" .. pickBytes .. "] HP={" .. hp[1] .. "," .. hp[2] .. "}")
                 pcall(function()
                     for j = 0, 6 do
                         WriteU8(Offset(ptr, j), pick.bytes[j + 1])
@@ -386,7 +464,9 @@ local function scrambleNow()
                         local flags = ReadU8(Offset(ptr, 2))
                         WriteU8(Offset(ptr, 2), flags & ~0x40)
                     end
-                    CallNative(sym_EmListSetAlive, "vii", i, 1)
+                    if sym_EmListSetAlive then
+                        CallNative(sym_EmListSetAlive, "vii", i, 1)
+                    end
                 end)
                 swapped = swapped + 1
             end
@@ -406,7 +486,10 @@ RegisterCommand("randomizer", function()
     state.enabled = not state.enabled
     slotMap = {}
     levelSwaps = 0
+    settleCounter = 0
+    hookErrors = 0
     saveConfig()
+    V("TOGGLE: enabled=" .. tostring(state.enabled) .. " slotMap cleared")
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))
     Notify(TAG, state.enabled and "ON" or "OFF")
 end)
@@ -469,6 +552,12 @@ RegisterCommand("rnd_groups", function()
     end
 end)
 
+RegisterCommand("rnd_verbose", function()
+    VERBOSE = not VERBOSE
+    Log(TAG .. ": Verbose logging " .. (VERBOSE and "ON" or "OFF"))
+    Notify(TAG, "Verbose: " .. (VERBOSE and "ON" or "OFF"))
+end)
+
 RegisterCommand("rnd_status", function()
     local pool = getEnabledPool()
     Log(TAG .. ": enabled=" .. tostring(state.enabled)
@@ -477,6 +566,8 @@ RegisterCommand("rnd_status", function()
         .. " totalSwaps=" .. state.swapCount
         .. " levelGen=" .. currentGen
         .. " levelSwaps=" .. levelSwaps
+        .. " settle=" .. settleCounter
+        .. " errors=" .. hookErrors
         .. " groups=" .. #GROUPS)
 end)
 
@@ -487,7 +578,7 @@ end)
 if SharedAPI then
     SharedAPI.Randomizer = {
         isEnabled  = function() return state.enabled end,
-        setEnabled = function(v) state.enabled = v; slotMap = {}; levelSwaps = 0; saveConfig() end,
+        setEnabled = function(v) state.enabled = v; slotMap = {}; levelSwaps = 0; settleCounter = 0; hookErrors = 0; saveConfig() end,
         getHPMode  = function() return state.hpMode end,
         setHPMode  = function(m) state.hpMode = m; saveConfig() end,
         scramble   = scrambleNow,
@@ -508,6 +599,8 @@ if SharedAPI and SharedAPI.DebugMenu then
                 state.enabled = not state.enabled
                 slotMap = {}
                 levelSwaps = 0
+                settleCounter = 0
+                hookErrors = 0
                 saveConfig()
                 api.Refresh()
             end)
@@ -535,6 +628,8 @@ if SharedAPI and SharedAPI.DebugMenu then
             api.AddItem(">> Force Re-randomize <<", function()
                 slotMap = {}
                 levelSwaps = 0
+                settleCounter = 0
+                hookErrors = 0
                 Log(TAG .. ": Forced re-randomization — all slots will re-roll")
                 Notify(TAG, "Re-randomizing on next enemy read!")
                 api.Refresh()
@@ -581,8 +676,8 @@ if SharedAPI and SharedAPI.DebugMenu then
     end)
 end
 
-Log(TAG .. ": v6.0 loaded — " .. #ENEMIES .. " enemies, "
+Log(TAG .. ": v7.0 loaded — " .. #ENEMIES .. " enemies, "
     .. #GROUPS .. " groups, "
     .. (state.enabled and "ON" or "OFF")
     .. " hpMode=" .. state.hpMode
-    .. " | Per-level-load re-randomization, emId mismatch detection")
+    .. " | Crash-safe native hook (pcall + settle=" .. SETTLE_CALLS .. ")")

@@ -241,19 +241,30 @@ namespace init
             sdk_gen::generate();
             logger::log_info("DEFER", "SDK written to %s", paths::sdk_dir().c_str());
 
-            // ── GNames dump ─────────────────────────────────────────────────
+            // ── GNames dump (best-effort — FName pool walking can fault) ────
             {
                 std::string gnames_path = paths::data_dir() + "/gnames_dump.txt";
-                std::ofstream gnames_ofs(gnames_path);
-                if (gnames_ofs.is_open())
+                FILE *gnames_f = fopen(gnames_path.c_str(), "w");
+                if (gnames_f)
                 {
                     int gn_count = 0;
+                    auto result = safe_call::execute([&]()
+                                                     {
                     reflection::walk_all_fnames([&](int32_t index, const std::string &name)
                                                 {
-                        gnames_ofs << "[" << index << "] " << name << "\n";
-                        gn_count++; });
-                    gnames_ofs.close();
-                    logger::log_info("DEFER", "GNames dump: %d names → %s", gn_count, gnames_path.c_str());
+                        fprintf(gnames_f, "[%d] %s\n", index, name.c_str());
+                        gn_count++; }); }, "GNames dump walk_all_fnames");
+                    fflush(gnames_f);
+                    fclose(gnames_f);
+                    if (result.ok)
+                    {
+                        logger::log_info("DEFER", "GNames dump: %d names → %s", gn_count, gnames_path.c_str());
+                    }
+                    else
+                    {
+                        logger::log_warn("DEFER", "GNames dump: partial (%d names before fault) — %s",
+                                         gn_count, result.error_msg.c_str());
+                    }
                 }
                 else
                 {
