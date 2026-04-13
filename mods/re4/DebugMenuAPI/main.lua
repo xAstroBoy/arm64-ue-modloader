@@ -1,5 +1,5 @@
 --[[
-    DebugMenuAPI v22 — Clean Cooperative Design
+    DebugMenuAPI v23 — BndEvt Hook Architecture
     ============================================
     A mod-menu system that cooperates with the stock DebugMenu_C.
     NEVER blocks or overrides Blueprint behaviour.
@@ -8,16 +8,24 @@
     This mod only takes over for custom byte-IDs (100 +).
 
     ─────────────────────────────────────────────────────────────────────
-    HOW IT WORKS
+    HOW IT WORKS  (v23 — BndEvt hooks)
     ─────────────────────────────────────────────────────────────────────
-    1.  A PAK-injected DataTable row adds "Mods" (OptionType = Action)
+    IMPORTANT: Blueprint-internal function calls (DoAction, NewMenu,
+    InputActionConfirm etc.) do NOT go through ProcessEvent so they
+    CANNOT be hooked. Only delegate-dispatched BndEvt functions on
+    VR4PlayerController_BP_C go through ProcessEvent.
+
+    1.  A PAK-injected DataTable row adds "Mods" (OptionType = Setting)
         to the stock Main page.
-    2.  PostHook DoAction  — detects when the player confirms "Mods"
-        on the Main page and navigates to byte 100.
-    3.  PostHook NewMenu   — after Blueprint clears & auto-adds "Back",
-        Lua APPENDS our custom option widgets.
-    4.  On custom pages Lua reads the selected widget name, resolves
-        the item, and invokes its getter / setter / callback.
+    2.  PostHook BndEvt Confirm (3, 8, 10) — after Blueprint finishes
+        its confirm action, detects "Mods" selection on Main page and
+        calls NewMenu(100) via Lua (goes through ProcessEvent).
+    3.  PostHook NewMenu — fires ONLY when called via ProcessEvent
+        (i.e. from our Lua dm:Call). APPENDS custom option widgets.
+    4.  PostHook BndEvt Back (9) — when Blueprint navigates back to a
+        custom page, rebuilds it (since internal NewMenu call doesn't
+        trigger our PostHook).
+    5.  On custom pages, BndEvt Confirm dispatches item actions.
 
     BLUEPRINT HANDLES (never touched by Lua):
         ✓  Scrolling          InputActionScrollUp / Down
@@ -44,7 +52,7 @@
 ]]
 
 local MOD_NAME = "DebugMenuAPI"
-local VERSION  = "22.0"
+local VERSION  = "23.0"
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- STATE
@@ -234,6 +242,27 @@ local function refresh_page(dm, page_byte, cursor)
     _refreshing = false
 end
 
+--- Full rebuild of a custom page from scratch.
+--- Used when Blueprint's internal NewMenu call didn't trigger our PostHook
+--- (e.g. PreviousMenu back-navigation to a custom page).
+local function rebuild_custom_page(dm, page_byte)
+    local page = pages[page_byte]
+    if not page then return end
+
+    -- Wipe whatever Blueprint left (might be empty or just "Back")
+    pcall(function() dm:Call("ClearWidgets") end)
+
+    -- Re-add "Back" at index 0 (Blueprint recognises it by name)
+    pcall(function() dm:Call("CreateActiveOption", "Back") end)
+
+    -- Build items + cosmetics
+    build_page(dm, page)
+
+    -- Reset cursor to "Back" and update highlight
+    pcall(function() dm:Set("CurrentIndex", 0) end)
+    pcall(function() dm:Call("UpdateOptionHighlight") end)
+end
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- SELECTED WIDGET NAME
 -- ═══════════════════════════════════════════════════════════════════════
@@ -320,11 +349,25 @@ end
 local function setup_hooks()
     local DM_PATH = "/Game/Blueprints/Debug/DebugMenu/DebugMenu.DebugMenu_C"
 
+    -- BndEvt function name template on VR4PlayerController_BP_C.
+    -- These are the ONLY functions called through ProcessEvent for
+    -- debug menu input (delegate-dispatched from the input system).
+    -- Blueprint-internal calls (DoAction, NewMenu, InputActionConfirm)
+    -- do NOT go through ProcessEvent and CANNOT be hooked.
+    local function bndevt(n)
+        return "VR4PlayerController_BP_C:"
+            .. "BndEvt__DebugInput_K2Node_ComponentBoundEvent_"
+            .. n
+            .. "_DebugKeyMulticastDelegate__DelegateSignature"
+    end
+
     -- ┌─────────────────────────────────────────────────────────────────┐
     -- │ PostHook : NewMenu                                             │
-    -- │ Blueprint already: ClearWidgets → push PreviousMenus →         │
-    -- │ set ActiveMenu → populate from DataTable → auto-add "Back"     │
-    -- │ We APPEND our items after Blueprint is done.                    │
+    -- │ Fires ONLY when NewMenu is called via ProcessEvent — i.e.      │
+    -- │ from our Lua dm:Call("NewMenu", byte).                         │
+    -- │ Blueprint-internal NewMenu calls (from DoAction, PreviousMenu) │
+    -- │ do NOT trigger this hook.                                      │
+    -- │ We APPEND our items after Blueprint has finished its work.      │
     -- └─────────────────────────────────────────────────────────────────┘
     RegisterPostHook(DM_PATH .. ":NewMenu", function(self, func, parms)
         pcall(function()
@@ -344,15 +387,26 @@ local function setup_hooks()
     end)
 
     -- ┌─────────────────────────────────────────────────────────────────┐
-    -- │ PostHook : DoAction                                            │
-    -- │ Fires ONLY for OptionType = Action confirmations.              │
+    -- │ PostHook : BndEvt Confirm (IDs 3, 8, 10)                       │
+    -- │ L Trigger, A button, R Trigger — all fire InputActionConfirm   │
+    -- │ inside the Blueprint, which calls DoAction internally.         │
+    -- │                                                                │
+    -- │ Our PostHook fires AFTER the entire BndEvt handler completes   │
+    -- │ (including DoAction, ProcessNewSetting, etc.).                  │
+    -- │                                                                │
     -- │ Two jobs:                                                      │
-    -- │   1. Main page (AM = 1): detect "Mods" → NewMenu(100)         │
-    -- │   2. Custom page (AM ≥ 100): dispatch item action              │
+    -- │   1. Main page (AM=1): detect "Mods" → navigate to page 100   │
+    -- │   2. Custom page (AM≥100): dispatch item action, or rebuild    │
+    -- │      if we just landed here via "Back" confirm navigation.     │
     -- └─────────────────────────────────────────────────────────────────┘
-    RegisterPostHook(DM_PATH .. ":DoAction", function(self, func, parms)
+    local CONFIRM_IDS = {3, 8, 10}
+
+    local function on_confirm_post(self, func, parms)
+        local pressed = ReadU8(parms)
+        if pressed == 0 then return end   -- release event, skip
+
         pcall(function()
-            local dm = self:get()
+            local dm = get_dm()
             if not dm then return end
 
             local am = get_active_menu(dm)
@@ -362,7 +416,7 @@ local function setup_hooks()
             if am == 1 then
                 local opt = get_selected_option_name(dm)
                 if opt == "Mods" then
-                    Log("'Mods' selected → page " .. MODS_ROOT_BYTE)
+                    Log("'Mods' selected on Main → page " .. MODS_ROOT_BYTE)
                     ExecuteAsync(function()
                         pcall(function() dm:Call("NewMenu", MODS_ROOT_BYTE) end)
                     end)
@@ -370,14 +424,55 @@ local function setup_hooks()
                 return
             end
 
-            -- Job 2: Custom page → item action
+            -- Job 2: Custom page
             if pages[am] then
-                dispatch_item(dm, am)
+                local ci = get_current_index(dm)
+                if ci and ci >= 1 then
+                    -- Normal item confirm → dispatch action
+                    dispatch_item(dm, am)
+                else
+                    -- ci=0: user confirmed "Back" and Blueprint navigated
+                    -- us to this custom page via PreviousMenu → NewMenu.
+                    -- Since NewMenu was called internally (no ProcessEvent),
+                    -- our PostHook didn't fire. Rebuild the page now.
+                    rebuild_custom_page(dm, am)
+                end
             end
+        end)
+    end
+
+    for _, id in ipairs(CONFIRM_IDS) do
+        RegisterPostHook(bndevt(id), on_confirm_post)
+    end
+
+    -- ┌─────────────────────────────────────────────────────────────────┐
+    -- │ PostHook : BndEvt Back (ID 9)                                  │
+    -- │ B button — fires InputActionBack inside the Blueprint, which   │
+    -- │ calls PreviousMenu → NewMenu(previous_page) internally.        │
+    -- │                                                                │
+    -- │ If we land on a custom page after going back, we need to       │
+    -- │ rebuild it because the internal NewMenu call didn't trigger     │
+    -- │ our PostHook.                                                  │
+    -- └─────────────────────────────────────────────────────────────────┘
+    RegisterPostHook(bndevt(9), function(self, func, parms)
+        local pressed = ReadU8(parms)
+        if pressed == 0 then return end
+
+        pcall(function()
+            local dm = get_dm()
+            if not dm then return end
+
+            local am = get_active_menu(dm)
+            if not am or not pages[am] then return end
+
+            -- We're on a custom page after pressing Back.
+            -- Blueprint ran PreviousMenu → NewMenu(am) internally.
+            -- Rebuild with proper content.
+            rebuild_custom_page(dm, am)
         end)
     end)
 
-    Log("Hooks installed (PostHook NewMenu + PostHook DoAction)")
+    Log("Hooks installed (PostHook NewMenu + BndEvt Confirm×3 + BndEvt Back)")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -698,8 +793,8 @@ local function init()
     if initialised then return end
     initialised = true
 
-    Log("v" .. VERSION .. " — Clean cooperative design")
-    Log("  PostHook only — Blueprint handles all native input")
+    Log("v" .. VERSION .. " — BndEvt hook architecture")
+    Log("  BndEvt hooks on VR4PlayerController_BP_C (ProcessEvent path)")
     Log("  Stock menu is 100%% unmodified for built-in pages")
 
     setup_shared_api()

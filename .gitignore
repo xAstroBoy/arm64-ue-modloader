@@ -22,6 +22,10 @@ build.ninja
 PAKS/
 PAKS_extracted/
 
+# ── Custom PAKs we built (these are OUR assets, OK to commit) ────────
+# paks/ (lowercase) is tracked — contains our custom-built .pak files
+# PAKS/ (uppercase) is ignored — contains copyrighted game assets
+
 # ── SDK dump (auto-generated from device, 5400+ files) ───────────────
 Current Modloader SDK/
 
