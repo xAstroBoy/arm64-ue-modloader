@@ -11,7 +11,10 @@ env:
   NDK_VERSION: '23.1.7779620'
 
 jobs:
-  build:
+  # ════════════════════════════════════════════════════════════════════
+  #  Job 1: Build libmodloader.so (ARM64 Android)
+  # ════════════════════════════════════════════════════════════════════
+  build-modloader:
     name: Build libmodloader.so
     runs-on: ubuntu-latest
 
@@ -61,9 +64,71 @@ jobs:
           path: modloader/build/libmodloader.so
           retention-days: 30
 
+  # ════════════════════════════════════════════════════════════════════
+  #  Job 2: Build Installer (Windows GUI + CLI)
+  # ════════════════════════════════════════════════════════════════════
+  build-installer:
+    name: Build Installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ue-modloader-installer.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: ue-modloader-installer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            installer/target
+          key: ${{ matrix.os }}-cargo-installer-${{ hashFiles('installer/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-cargo-installer-
+
+      # Linux: install egui/eframe deps (X11, OpenGL)
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libgtk-3-dev \
+            libglib2.0-dev libatk1.0-dev libcairo2-dev libpango1.0-dev \
+            libgdk-pixbuf2.0-dev
+
+      - name: Build installer (Release)
+        working-directory: installer
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.target }}
+          path: installer/target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════
+  #  Job 3: Package Release (on tag push only)
+  # ════════════════════════════════════════════════════════════════════
   package:
     name: Package Release
-    needs: build
+    needs: [build-modloader, build-installer]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
@@ -71,15 +136,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download artifact
+      - name: Download libmodloader.so
         uses: actions/download-artifact@v4
         with:
           name: libmodloader-arm64
           path: release/
 
-      - name: Package mods
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-x86_64-pc-windows-msvc
+          path: release/
+
+      - name: Download Linux installer
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-x86_64-unknown-linux-gnu
+          path: release/linux/
+
+      - name: Package mods & tools
         run: |
-          # Copy game-specific mods (re4, pfx, etc.)
+          # ── Game mods ──
           for game_dir in mods/*/; do
             game=$(basename "$game_dir")
             for mod in "$game_dir"*/; do
@@ -90,25 +167,51 @@ jobs:
               cp "$mod"*.pak "release/mods/$game/$mod_name/" 2>/dev/null || true
             done
           done
-          # Copy tools
+
+          # ── Tools ──
           mkdir -p release/tools
           cp tools/deploy.py release/tools/
-          # Copy examples
+          cp tools/uncook.py release/tools/
+          cp tools/extract_paks.py release/tools/
+          cp tools/dump_uasset.py release/tools/
+          cp tools/kismet_decompiler.py release/tools/
+
+          # ── Examples ──
           cp -r examples/ release/examples/ 2>/dev/null || true
-          # Copy docs
+
+          # ── Docs ──
           cp README.md release/
           cp LICENSE release/
-          cp docs/LUA_API.md release/
+          cp CHANGELOG.md release/ 2>/dev/null || true
+          cp docs/LUA_API.md release/ 2>/dev/null || true
 
-      - name: Create archive
+          # ── Linux installer is separate ──
+          chmod +x release/linux/ue-modloader-installer 2>/dev/null || true
+
+      - name: Create Windows release archive
         run: |
           cd release
-          zip -r ../quest-ue4-modloader-${{ github.ref_name }}.zip .
+          # Remove linux subdir from main zip
+          zip -r ../quest-ue-modloader-${{ github.ref_name }}-windows.zip . -x "linux/*"
+
+      - name: Create Linux release archive
+        run: |
+          # Copy shared files into linux release
+          cp release/libmodloader.so release/linux/
+          cp -r release/mods release/linux/mods 2>/dev/null || true
+          cp -r release/tools release/linux/tools 2>/dev/null || true
+          cp -r release/examples release/linux/examples 2>/dev/null || true
+          cp release/README.md release/linux/ 2>/dev/null || true
+          cp release/LICENSE release/linux/ 2>/dev/null || true
+          cd release/linux
+          tar czf ../../quest-ue-modloader-${{ github.ref_name }}-linux.tar.gz .
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: quest-ue4-modloader-${{ github.ref_name }}.zip
+          files: |
+            quest-ue-modloader-${{ github.ref_name }}-windows.zip
+            quest-ue-modloader-${{ github.ref_name }}-linux.tar.gz
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}

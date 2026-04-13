@@ -39,7 +39,108 @@ pub fn find_modloader_so(override_path: Option<&str>) -> Result<PathBuf> {
     )
 }
 
-/// Full install pipeline
+/// Patch a local APK file — no device needed.
+/// Decompiles the APK, injects the modloader, recompiles, and signs.
+pub fn patch_local_apk(
+    apk_path: &str,
+    package_hint: Option<&str>,
+    so_override: Option<&str>,
+    output: Option<&str>,
+) -> Result<()> {
+    let apk = PathBuf::from(apk_path);
+    if !apk.exists() {
+        bail!("APK not found: {}", apk_path);
+    }
+
+    let so_path = find_modloader_so(so_override)?;
+    log::info!("libmodloader.so: {}", so_path.display());
+
+    // Determine game profile from package hint or APK name
+    let game_name = if let Some(pkg) = package_hint {
+        game_db::find_by_package(pkg)
+            .map(|g| g.name)
+            .unwrap_or(pkg)
+    } else {
+        let stem = apk.file_stem().unwrap_or_default().to_string_lossy();
+        // Try to detect game from APK filename
+        let detected = game_db::GAMES.iter().find(|g| stem.contains(g.package));
+        detected.map(|g| g.name).unwrap_or("Unknown Game")
+    };
+
+    // Detect smali target — use game_db if we know the package, otherwise guess UE4 default
+    let smali_target = if let Some(pkg) = package_hint {
+        game_db::find_by_package(pkg)
+            .map(|g| g.smali_target)
+            .unwrap_or("com/epicgames/unreal/GameActivity")
+    } else {
+        // Auto-detect: try to find the smali target after decompilation
+        "com/epicgames/unreal/GameActivity"
+    };
+
+    let work_dir = tempfile::tempdir()?;
+
+    // 1. Decompile
+    log::info!("[1/5] Decompiling {}...", apk.file_name().unwrap_or_default().to_string_lossy());
+    let decompiled = work_dir.path().join("decompiled");
+    smali::decompile(&apk, &decompiled)?;
+
+    // 2. Try known smali targets, then auto-detect
+    log::info!("[2/5] Injecting modloader...");
+    let inject_result = smali::inject_loadlibrary(&decompiled, smali_target);
+    if inject_result.is_err() && package_hint.is_none() {
+        // Try all known targets
+        let mut injected = false;
+        for g in game_db::GAMES {
+            if smali::inject_loadlibrary(&decompiled, g.smali_target).is_ok() {
+                log::info!("Auto-detected smali target: {} ({})", g.smali_target, g.name);
+                injected = true;
+                break;
+            }
+        }
+        if !injected {
+            bail!("Could not find smali injection target.\n\
+                   Use --package <com.package.name> to specify the game.");
+        }
+    } else {
+        inject_result?;
+    }
+
+    smali::add_native_lib(&decompiled, &so_path)?;
+    smali::fix_manifest(&decompiled)?;
+
+    // 3. Recompile
+    log::info!("[3/5] Recompiling APK...");
+    let recompiled = work_dir.path().join("patched.apk");
+    smali::recompile(&decompiled, &recompiled)?;
+
+    // 4. Sign
+    log::info!("[4/5] Signing APK...");
+    let signed = signer::sign_apk(&recompiled)?;
+
+    // 5. Copy to output
+    let output_path = if let Some(out) = output {
+        PathBuf::from(out)
+    } else {
+        let stem = apk.file_stem().unwrap_or_default().to_string_lossy();
+        apk.parent().unwrap_or(Path::new(".")).join(format!("{}-modded.apk", stem))
+    };
+
+    std::fs::copy(&signed, &output_path)?;
+    let size_mb = std::fs::metadata(&output_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
+
+    log::info!("[5/5] Done!");
+    log::info!("═══════════════════════════════════════════");
+    log::info!("✅ Patched APK: {} ({:.1} MB)", output_path.display(), size_mb);
+    log::info!("   Game: {}", game_name);
+    log::info!("═══════════════════════════════════════════");
+    log::info!("");
+    log::info!("Install on device:");
+    log::info!("  adb install -r -d -g {}", output_path.display());
+
+    Ok(())
+}
+
+/// Full install pipeline (device-connected mode)
 pub fn install(
     serial: &str,
     game: &game_db::GameProfile,

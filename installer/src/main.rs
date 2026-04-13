@@ -28,6 +28,15 @@ struct Args {
     #[arg(long)]
     modloader_so: Option<String>,
 
+    /// Patch a local APK file instead of pulling from device.
+    /// No ADB/device needed — just injects the modloader into the APK.
+    #[arg(long)]
+    apk: Option<String>,
+
+    /// Output path for the patched APK (used with --apk)
+    #[arg(long, short)]
+    output: Option<String>,
+
     /// Skip all confirmation prompts (auto-yes)
     #[arg(long, short = 'y')]
     yes: bool,
@@ -39,6 +48,16 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Local APK patching mode (no device required)
+    if let Some(ref apk_path) = args.apk {
+        return pipeline::patch_local_apk(
+            apk_path,
+            args.package.as_deref(),
+            args.modloader_so.as_deref(),
+            args.output.as_deref(),
+        );
+    }
 
     if args.cli {
         cli::run(args.serial, args.package, args.modloader_so, args.yes)?;
