@@ -1,10 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  Signer — zipalign + sign APKs (apksigner / uber-apk-signer / jarsigner)
+//  Signer — zipalign + sign APKs
+//  Auto-downloads uber-apk-signer if no signing tool is available.
+//  Priority: apksigner (SDK) → uber-apk-signer → jarsigner (JDK)
 // ═══════════════════════════════════════════════════════════════════════
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::tools_setup;
 
 /// Common SDK install paths (Windows)
 const SDK_SEARCH_DIRS: &[&str] = &[
@@ -30,16 +34,13 @@ fn find_latest_build_tools(sdk: &Path) -> Option<PathBuf> {
 
 /// Search all known SDK locations for a build-tools binary
 fn find_build_tool(name: &str) -> Option<PathBuf> {
-    // Build list of candidate filenames: name, name.exe, name.bat
     let exe = format!("{}.exe", name);
     let bat = format!("{}.bat", name);
     let candidates = [name, exe.as_str(), bat.as_str()];
 
-    // 1. PATH (which handles .exe/.bat on Windows automatically)
     if let Ok(p) = which::which(name) { return Some(p); }
     if let Ok(p) = which::which(&bat) { return Some(p); }
 
-    // Helper: check all candidate filenames in a build-tools dir
     let check_bt = |bt: &Path| -> Option<PathBuf> {
         for c in &candidates {
             let p = bt.join(c);
@@ -48,7 +49,6 @@ fn find_build_tool(name: &str) -> Option<PathBuf> {
         None
     };
 
-    // 2. Env vars
     for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT", "LOCALAPPDATA"] {
         if let Ok(val) = std::env::var(var) {
             let sdk = if var == "LOCALAPPDATA" {
@@ -61,7 +61,6 @@ fn find_build_tool(name: &str) -> Option<PathBuf> {
             }
         }
     }
-    // 3. Hardcoded common paths
     for dir in SDK_SEARCH_DIRS {
         if let Some(bt) = find_latest_build_tools(Path::new(dir)) {
             if let Some(p) = check_bt(&bt) { return Some(p); }
@@ -72,19 +71,15 @@ fn find_build_tool(name: &str) -> Option<PathBuf> {
 
 // ── Zipalign ────────────────────────────────────────────────────────────
 
-/// Zipalign an APK (required for Android R+ / API 30+)
-pub fn zipalign(apk: &Path) -> Result<PathBuf> {
+fn zipalign(apk: &Path) -> Result<PathBuf> {
     let tool = find_build_tool("zipalign")
         .ok_or_else(|| anyhow::anyhow!("zipalign not found"))?;
     let aligned = apk.with_file_name(
         format!("{}-aligned.apk", apk.file_stem().unwrap_or_default().to_string_lossy())
     );
     let output = Command::new(&tool)
-        .arg("-p")       // page-align shared libs
-        .arg("-f")       // overwrite output
-        .arg("4")        // 4-byte alignment
-        .arg(apk)
-        .arg(&aligned)
+        .arg("-p").arg("-f").arg("4")
+        .arg(apk).arg(&aligned)
         .output()
         .context("zipalign")?;
     if !output.status.success() {
@@ -94,12 +89,17 @@ pub fn zipalign(apk: &Path) -> Result<PathBuf> {
     Ok(aligned)
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+//  Main entry point — sign with best available tool, auto-download if needed
+// ═══════════════════════════════════════════════════════════════════════
+
 /// Sign the APK with the best available tool.
-/// Zipaligns first, then signs.
+/// Zipaligns first if possible, then signs.
+/// **Auto-downloads uber-apk-signer** if no signing tool is found.
 pub fn sign_apk(apk: &Path) -> Result<PathBuf> {
     log::info!("Signing APK...");
 
-    // Step 1: Zipalign (required for Android R+)
+    // Step 1: Zipalign (optional — uber-apk-signer does its own alignment)
     let aligned = match zipalign(apk) {
         Ok(a) => a,
         Err(e) => {
@@ -108,46 +108,69 @@ pub fn sign_apk(apk: &Path) -> Result<PathBuf> {
         }
     };
 
-    // Step 2: Sign (prefer apksigner for v2 signing, then uber, then jarsigner)
-    if let Ok(()) = try_apksigner(&aligned) {
-        return Ok(aligned);
-    }
-    if let Ok(out) = try_uber_sign(&aligned) {
-        return Ok(out);
-    }
-    if let Ok(()) = try_jarsigner(&aligned) {
-        return Ok(aligned);
+    // Step 2: Try signing tools in order of preference
+    // 2a. apksigner (Android SDK — best, does v2/v3 signing)
+    match try_apksigner(&aligned) {
+        Ok(()) => return Ok(aligned),
+        Err(e) => log::debug!("apksigner: {}", e),
     }
 
+    // 2b. uber-apk-signer (standalone jar — does zipalign + v1/v2 signing)
+    match try_uber_sign(&aligned) {
+        Ok(out) => return Ok(out),
+        Err(e) => log::debug!("uber-apk-signer: {}", e),
+    }
+
+    // 2c. jarsigner (JDK — v1 signing only, but works)
+    match try_jarsigner(&aligned) {
+        Ok(()) => return Ok(aligned),
+        Err(e) => log::debug!("jarsigner: {}", e),
+    }
+
+    // Step 3: No signing tool found — auto-download uber-apk-signer and retry
+    log::info!("No signing tool found — downloading uber-apk-signer...");
+    match tools_setup::setup_uber_signer() {
+        Ok(jar) => {
+            log::info!("Downloaded uber-apk-signer, retrying...");
+            match run_uber_sign(&jar, &aligned) {
+                Ok(out) => return Ok(out),
+                Err(e) => log::error!("uber-apk-signer failed after download: {}", e),
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to download uber-apk-signer: {}", e);
+        }
+    }
+
+    // Step 4: Last resort — try jarsigner with auto-created keystore
+    // (user might have Java but no keytool in PATH — unlikely but possible)
+
     bail!(
-        "No signing tool found. Install one of:\n\
-         1. apksigner (Android SDK Build-Tools)\n\
-         2. uber-apk-signer: https://github.com/nicehash/uber-apk-signer\n\
-         3. jarsigner (JDK)"
+        "Could not sign the APK. No signing tool available.\n\n\
+         The installer tried to auto-download uber-apk-signer but it requires Java.\n\
+         Please install Java from https://adoptium.net/ (Temurin JDK 17+)\n\
+         Then restart the installer.\n\n\
+         Alternatively, install one of:\n\
+         • Android SDK Build-Tools (includes apksigner + zipalign)\n\
+         • uber-apk-signer: https://github.com/nicehash/uber-apk-signer\n\
+         • JDK (includes jarsigner + keytool)"
     )
 }
 
 // ── uber-apk-signer ────────────────────────────────────────────────────
 
-fn find_uber_signer() -> Option<PathBuf> {
-    // Check PATH
-    if let Ok(p) = which::which("uber-apk-signer") { return Some(p); }
-    // Check common jar locations
-    for dir in [r"C:\tools", r"C:\apktool", r".", r"tools"] {
-        for name in ["uber-apk-signer.jar", "uber-apk-signer-1.3.0.jar"] {
-            let p = PathBuf::from(dir).join(name);
-            if p.exists() { return Some(p); }
-        }
-    }
-    None
+fn try_uber_sign(apk: &Path) -> Result<PathBuf> {
+    // Use tools_setup to find uber-apk-signer (checks PATH + tools dir + common locations)
+    let jar = tools_setup::find_uber_signer()
+        .ok_or_else(|| anyhow::anyhow!("uber-apk-signer not found"))?;
+    run_uber_sign(&jar, apk)
 }
 
-fn try_uber_sign(apk: &Path) -> Result<PathBuf> {
-    let jar = find_uber_signer().ok_or_else(|| anyhow::anyhow!("uber-apk-signer not found"))?;
+fn run_uber_sign(jar: &Path, apk: &Path) -> Result<PathBuf> {
     let out_dir = apk.parent().unwrap_or(Path::new("."));
 
     let output = Command::new("java")
-        .arg("-jar").arg(&jar)
+        .arg("-jar").arg(jar)
         .arg("--apks").arg(apk)
         .arg("--out").arg(out_dir)
         .arg("--overwrite")
@@ -155,7 +178,9 @@ fn try_uber_sign(apk: &Path) -> Result<PathBuf> {
         .context("uber-apk-signer")?;
 
     if !output.status.success() {
-        bail!("uber-apk-signer failed: {}", String::from_utf8_lossy(&output.stderr));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!("uber-apk-signer failed:\n{}\n{}", stdout, stderr);
     }
 
     // uber-apk-signer outputs to <name>-aligned-debugSigned.apk
@@ -181,7 +206,6 @@ fn try_apksigner(apk: &Path) -> Result<()> {
     let tool = find_build_tool("apksigner")
         .ok_or_else(|| anyhow::anyhow!("apksigner not found"))?;
 
-    // Generate a debug keystore if needed
     let ks = debug_keystore()?;
 
     let output = Command::new(&tool)
@@ -204,7 +228,8 @@ fn try_apksigner(apk: &Path) -> Result<()> {
 // ── jarsigner ──────────────────────────────────────────────────────────
 
 fn try_jarsigner(apk: &Path) -> Result<()> {
-    let tool = which::which("jarsigner").map_err(|_| anyhow::anyhow!("jarsigner not found"))?;
+    let tool = which::which("jarsigner")
+        .map_err(|_| anyhow::anyhow!("jarsigner not found"))?;
     let ks = debug_keystore()?;
 
     let output = Command::new(&tool)
@@ -228,7 +253,6 @@ fn try_jarsigner(apk: &Path) -> Result<()> {
 // ── Debug keystore ─────────────────────────────────────────────────────
 
 fn debug_keystore() -> Result<PathBuf> {
-    // Use Android's default debug keystore
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
@@ -238,11 +262,11 @@ fn debug_keystore() -> Result<PathBuf> {
     // Create one with keytool
     log::info!("Creating debug keystore...");
     std::fs::create_dir_all(ks.parent().unwrap())?;
-    let keytool = which::which("keytool").context("keytool not found — install JDK")?;
+    let keytool = which::which("keytool")
+        .context("keytool not found — install JDK from https://adoptium.net/")?;
     let output = Command::new(&keytool)
         .args([
-            "-genkeypair",
-            "-v",
+            "-genkeypair", "-v",
             "-keystore", &ks.to_string_lossy(),
             "-alias", "androiddebugkey",
             "-keyalg", "RSA",
