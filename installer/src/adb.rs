@@ -32,6 +32,11 @@ pub fn shell(serial: &str, cmd: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+pub fn path_exists(serial: &str, remote: &str) -> Result<bool> {
+    let out = shell(serial, &format!("[ -e '{}' ] && echo Y || echo N", remote))?;
+    Ok(out.contains('Y'))
+}
+
 // ── Device Discovery ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -110,6 +115,36 @@ pub fn pull_apk(serial: &str, app: &InstalledApp, dest_dir: &Path) -> Result<Pat
     let size = std::fs::metadata(&local).map(|m| m.len() / 1_000_000).unwrap_or(0);
     log::info!("Pulled {} ({} MB)", local.display(), size);
     Ok(local)
+}
+
+pub fn pull_path(serial: &str, remote: &str, local: &Path) -> Result<()> {
+    if let Some(parent) = local.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let o = adb_s(serial, &["pull", remote, &local.to_string_lossy()])?;
+    if !o.status.success() {
+        bail!(
+            "Pull failed ({}): {}{}",
+            remote,
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub fn push_path(serial: &str, local: &Path, remote: &str) -> Result<()> {
+    let o = adb_s(serial, &["push", &local.to_string_lossy(), remote])?;
+    if !o.status.success() {
+        bail!(
+            "Push failed ({} -> {}): {}{}",
+            local.display(),
+            remote,
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    Ok(())
 }
 
 // ── Install APK ─────────────────────────────────────────────────────────

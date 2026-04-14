@@ -157,6 +157,58 @@ pub fn sign_apk(apk: &Path) -> Result<PathBuf> {
     )
 }
 
+/// Verify that an APK is fully signed before install.
+/// Enforces both v1 and v2 signature schemes via apksigner.
+pub fn verify_apk_full_signature(apk: &Path) -> Result<()> {
+    let tool = find_build_tool("apksigner")
+        .ok_or_else(|| anyhow::anyhow!(
+            "apksigner not found. Full signature verification is required before install.\n\
+             Install Android SDK Build-Tools (apksigner) and retry."
+        ))?;
+
+    let output = Command::new(&tool)
+        .arg("verify")
+        .arg("--verbose")
+        .arg("--print-certs")
+        .arg(apk)
+        .output()
+        .context("apksigner verify")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    if !output.status.success() {
+        bail!("apksigner verify failed:\n{}", combined);
+    }
+
+    let mut v1_ok = false;
+    let mut v2_ok = false;
+    for raw in combined.lines() {
+        let line = raw.trim().to_ascii_lowercase();
+        if line.contains("verified using v1 scheme") {
+            v1_ok = line.contains(": true");
+        }
+        if line.contains("verified using v2 scheme") {
+            v2_ok = line.contains(": true");
+        }
+    }
+
+    if !v1_ok || !v2_ok {
+        bail!(
+            "Full signing verification failed (required: v1=true and v2=true).\n\
+             v1={} v2={}\n\
+             apksigner output:\n{}",
+            v1_ok,
+            v2_ok,
+            combined
+        );
+    }
+
+    log::info!("Signature verified (v1 + v2): {}", apk.display());
+    Ok(())
+}
+
 // ── uber-apk-signer ────────────────────────────────────────────────────
 
 fn try_uber_sign(apk: &Path) -> Result<PathBuf> {
@@ -183,21 +235,62 @@ fn run_uber_sign(jar: &Path, apk: &Path) -> Result<PathBuf> {
         bail!("uber-apk-signer failed:\n{}\n{}", stdout, stderr);
     }
 
-    // uber-apk-signer outputs to <name>-aligned-debugSigned.apk
+    // Common output patterns from uber-apk-signer:
+    //   <name>-aligned-debugSigned.apk
+    //   <name>-debugSigned.apk
+    // Also search directory in case naming differs across versions.
     let stem = apk.file_stem().unwrap_or_default().to_string_lossy();
-    let signed = out_dir.join(format!("{}-aligned-debugSigned.apk", stem));
-    if signed.exists() {
+
+    let direct_candidates = [
+        out_dir.join(format!("{}-aligned-debugSigned.apk", stem)),
+        out_dir.join(format!("{}-debugSigned.apk", stem)),
+        out_dir.join(format!("{}-signed.apk", stem)),
+    ];
+    for signed in &direct_candidates {
+        if signed.exists() {
+            log::info!("Signed with uber-apk-signer → {}", signed.display());
+            return Ok(signed.clone());
+        }
+    }
+
+    // Fallback: pick newest *signed*.apk that starts with the input stem.
+    let mut scanned: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(out_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase() != "apk" {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if !name.starts_with(&stem.to_string()) {
+                continue;
+            }
+            let lname = name.to_ascii_lowercase();
+            if !(lname.contains("debugsigned") || lname.contains("signed")) {
+                continue;
+            }
+            let modified = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            scanned.push((modified, p));
+        }
+    }
+    scanned.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some((_, signed)) = scanned.into_iter().next() {
         log::info!("Signed with uber-apk-signer → {}", signed.display());
         return Ok(signed);
     }
 
-    // Sometimes it signs in-place
-    if apk.exists() {
-        log::info!("Signed with uber-apk-signer (in-place)");
-        return Ok(apk.to_path_buf());
-    }
-
-    bail!("uber-apk-signer produced no output")
+    // IMPORTANT: never return the input path here. If we can't locate a signed
+    // output, returning the original APK can cause INSTALL_PARSE_FAILED_NO_CERTIFICATES.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    bail!(
+        "uber-apk-signer completed but no signed APK was found in {}.\nstdout:\n{}\nstderr:\n{}",
+        out_dir.display(),
+        stdout,
+        stderr
+    )
 }
 
 // ── apksigner (Android SDK) ────────────────────────────────────────────
