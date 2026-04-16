@@ -18,6 +18,8 @@
 #include <cstring>
 #include <atomic>
 #include <setjmp.h>
+#include <algorithm>
+#include <limits>
 
 namespace lua_uobject
 {
@@ -68,6 +70,100 @@ namespace lua_uobject
         return result;
     }
 
+    static size_t marshaled_min_size(const reflection::PropertyInfo &pi)
+    {
+        auto clamp_elem = [&]() -> size_t
+        {
+            return pi.element_size > 0 ? static_cast<size_t>(pi.element_size) : static_cast<size_t>(1);
+        };
+
+        switch (pi.type)
+        {
+        case reflection::PropType::BoolProperty:
+            if (pi.bool_byte_mask)
+                return static_cast<size_t>(pi.bool_byte_offset) + 1;
+            return std::max(clamp_elem(), static_cast<size_t>(1));
+
+        case reflection::PropType::Int8Property:
+        case reflection::PropType::ByteProperty:
+            return std::max(clamp_elem(), static_cast<size_t>(1));
+
+        case reflection::PropType::Int16Property:
+        case reflection::PropType::UInt16Property:
+            return std::max(clamp_elem(), static_cast<size_t>(2));
+
+        case reflection::PropType::IntProperty:
+        case reflection::PropType::UInt32Property:
+        case reflection::PropType::FloatProperty:
+        case reflection::PropType::EnumProperty:
+            return std::max(clamp_elem(), static_cast<size_t>(4));
+
+        case reflection::PropType::Int64Property:
+        case reflection::PropType::UInt64Property:
+        case reflection::PropType::DoubleProperty:
+        case reflection::PropType::NameProperty:
+        case reflection::PropType::ObjectProperty:
+        case reflection::PropType::WeakObjectProperty:
+        case reflection::PropType::SoftObjectProperty:
+        case reflection::PropType::LazyObjectProperty:
+        case reflection::PropType::ClassProperty:
+        case reflection::PropType::SoftClassProperty:
+        case reflection::PropType::InterfaceProperty:
+            return std::max(clamp_elem(), static_cast<size_t>(8));
+
+        case reflection::PropType::DelegateProperty:
+            return std::max(clamp_elem(), static_cast<size_t>(16));
+
+        case reflection::PropType::StrProperty:
+            // FString raw layout: { char16_t* data; int32 num; int32 max } => 16 bytes on ARM64
+            return std::max(clamp_elem(), static_cast<size_t>(16));
+
+        case reflection::PropType::TextProperty:
+            return std::max(clamp_elem(), static_cast<size_t>(24));
+
+        case reflection::PropType::StructProperty:
+        case reflection::PropType::ArrayProperty:
+        case reflection::PropType::MapProperty:
+        case reflection::PropType::SetProperty:
+        case reflection::PropType::FieldPathProperty:
+        case reflection::PropType::MulticastDelegateProperty:
+        case reflection::PropType::MulticastInlineDelegateProperty:
+        case reflection::PropType::MulticastSparseDelegateProperty:
+        case reflection::PropType::Unknown:
+        default:
+            return clamp_elem();
+        }
+    }
+
+    static bool marshaled_range_valid(uint16_t parms_size,
+                                      const reflection::PropertyInfo &pi,
+                                      const std::string &class_name,
+                                      const std::string &func_name,
+                                      const char *tag)
+    {
+        if (pi.offset < 0)
+        {
+            logger::log_error(tag, "%s::%s has negative property offset for '%s' (offset=%d)",
+                              class_name.c_str(), func_name.c_str(), pi.name.c_str(), pi.offset);
+            return false;
+        }
+
+        size_t min_sz = marshaled_min_size(pi);
+        size_t start = static_cast<size_t>(pi.offset);
+        size_t limit = static_cast<size_t>(parms_size);
+
+        if (start > limit || min_sz > (limit - start))
+        {
+            logger::log_error(tag,
+                              "%s::%s param '%s' out of bounds (offset=%d min_size=%zu parms_size=%u type=%d)",
+                              class_name.c_str(), func_name.c_str(), pi.name.c_str(), pi.offset,
+                              min_sz, parms_size, static_cast<int>(pi.type));
+            return false;
+        }
+
+        return true;
+    }
+
     static void dispatch_gt_call(GtCallItem item)
     {
         // This runs ON the game thread (called from pe_hook queue drain)
@@ -75,9 +171,37 @@ namespace lua_uobject
         // 1. We're on the game thread (thread-safe for UE)
         // 2. The queue drain has s_draining guard preventing recursive drains
         // 3. Going through the hook ensures normal UE hook processing
-        auto pe_fn = symbols::ProcessEvent;
+        auto pe_fn = pe_hook::get_original();
         if (!pe_fn)
+            pe_fn = symbols::ProcessEvent;
+        if (!pe_fn)
+        {
+            if (item.fstring_allocs)
+                for (auto *p : *item.fstring_allocs)
+                    delete[] p;
             return;
+        }
+
+        // Defensive validation — queued calls may execute later when object/function
+        // is already destroyed or GC'd.
+        if (!item.obj || !ue::is_mapped_ptr(item.obj) || !ue::is_valid_ptr(item.obj) || !ue::is_valid_uobject(item.obj))
+        {
+            logger::log_warn("CALLBG", "[GT] Dropping call %s::%s — invalid object %p",
+                             item.class_name.c_str(), item.func_name.c_str(), item.obj);
+            if (item.fstring_allocs)
+                for (auto *p : *item.fstring_allocs)
+                    delete[] p;
+            return;
+        }
+        if (!item.func || !ue::is_mapped_ptr(item.func) || !ue::is_valid_ptr(item.func))
+        {
+            logger::log_warn("CALLBG", "[GT] Dropping call %s::%s — invalid function %p",
+                             item.class_name.c_str(), item.func_name.c_str(), item.func);
+            if (item.fstring_allocs)
+                for (auto *p : *item.fstring_allocs)
+                    delete[] p;
+            return;
+        }
 
         void *params_ptr = item.params ? item.params->data() : nullptr;
 
@@ -89,6 +213,7 @@ namespace lua_uobject
             logger::log_error("CALLBG", "ProcessEvent CRASHED (signal %d) calling %s::%s on %p "
                                         "— recovered, skipping",
                               pe_crash_sig, item.class_name.c_str(), item.func_name.c_str(), item.obj);
+            g_in_call_ufunction = 0;
             // Still clean up allocations
             if (item.fstring_allocs)
                 for (auto *p : *item.fstring_allocs)
@@ -1163,6 +1288,14 @@ namespace lua_uobject
         if (!obj || !symbols::ProcessEvent)
             return sol::nil;
 
+        // Strong guard against stale/dangling LuaUObject wrappers.
+        // Invalid-but-non-null UObject* causes native crashes inside ProcessEvent.
+        if (!ue::is_mapped_ptr(obj) || !ue::is_valid_ptr(obj) || !ue::is_valid_uobject(obj))
+        {
+            logger::log_warn("CALL", "Skipping call on invalid UObject: %p::%s", obj, func_name.c_str());
+            return sol::nil;
+        }
+
         ue::UClass *cls = ue::uobj_get_class(obj);
         if (!cls)
             return sol::nil;
@@ -1183,6 +1316,12 @@ namespace lua_uobject
         }
 
         ue::UFunction *func = static_cast<ue::UFunction *>(rf->raw);
+        if (!func || !ue::is_mapped_ptr(func) || !ue::is_valid_ptr(func))
+        {
+            logger::log_warn("CALL", "Skipping call %s::%s — invalid UFunction %p",
+                             class_name.c_str(), func_name.c_str(), func);
+            return sol::nil;
+        }
 
         // Allocate params buffer
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
@@ -1196,9 +1335,13 @@ namespace lua_uobject
                 logger::log_error("CALL", "ProcessEvent CRASHED (signal %d) calling %s::%s (no params) "
                                           "— recovered, returning nil",
                                   pe_crash_sig, class_name.c_str(), func_name.c_str());
+                g_in_call_ufunction = 0;
                 return sol::nil;
             }
-            symbols::ProcessEvent(obj, func, nullptr);
+            auto pe_fn = pe_hook::get_original();
+            if (!pe_fn)
+                pe_fn = symbols::ProcessEvent;
+            pe_fn(obj, func, nullptr);
             g_in_call_ufunction = 0;
             return sol::nil;
         }
@@ -1256,6 +1399,13 @@ namespace lua_uobject
             // Skip non-parameter properties (Blueprint locals, return values)
             if (!(pi.flags & ue::CPF_Parm) || (pi.flags & ue::CPF_ReturnParm))
                 continue;
+
+            if (!marshaled_range_valid(parms_size, pi, class_name, func_name, "CALL"))
+            {
+                for (auto *p : fstring_allocs)
+                    delete[] p;
+                return sol::nil;
+            }
 
             sol::object arg = va[arg_idx];
             uint8_t *param_ptr = params_buf.data() + pi.offset;
@@ -1539,11 +1689,15 @@ namespace lua_uobject
             logger::log_error("CALL", "ProcessEvent CRASHED (signal %d) calling %s::%s on %p "
                                       "— recovered, returning nil",
                               pe_crash_sig, class_name.c_str(), func_name.c_str(), obj);
+            g_in_call_ufunction = 0;
             for (auto *p : fstring_allocs)
                 delete[] p;
             return sol::nil;
         }
-        symbols::ProcessEvent(obj, func, params);
+        auto pe_fn = pe_hook::get_original();
+        if (!pe_fn)
+            pe_fn = symbols::ProcessEvent;
+        pe_fn(obj, func, params);
         // NOTE: crash guard (g_in_call_ufunction) stays ON through return extraction
         // so that crashes in return value reading are also caught by siglongjmp.
 
@@ -1571,7 +1725,8 @@ namespace lua_uobject
         };
         CallGuardCleaner _call_guard{g_in_call_ufunction};
 
-        if (rf->return_prop && rf->return_prop->raw && rf->return_offset < parms_size)
+        if (rf->return_prop && rf->return_prop->raw &&
+            marshaled_range_valid(parms_size, *rf->return_prop, class_name, func_name, "CALLRET"))
         {
             const uint8_t *ret_ptr = params_buf.data() + rf->return_offset;
 
@@ -1696,8 +1851,28 @@ namespace lua_uobject
             }
             case reflection::PropType::ArrayProperty:
             {
-                // Return TArray from call result — copy the 16 bytes (Data, Num, Max)
-                // into an owning LuaTArray
+                // IMPORTANT: Do not return LuaTArray backed by params_buf memory.
+                // params_buf is stack-local and freed when Call() returns.
+                // Return a copied Lua table snapshot instead.
+                struct RawTArrayRet
+                {
+                    void *data;
+                    int32_t num;
+                    int32_t max;
+                };
+
+                const RawTArrayRet *arr = reinterpret_cast<const RawTArrayRet *>(ret_ptr);
+                sol::table out = lua.create_table();
+                if (!arr || !arr->data || arr->num <= 0)
+                    return out;
+
+                if (arr->num < 0 || arr->max < 0 || arr->num > arr->max || arr->num > 8192)
+                {
+                    logger::log_warn("CALLRET", "%s::%s returned suspicious TArray (num=%d max=%d)",
+                                     class_name.c_str(), func_name.c_str(), arr->num, arr->max);
+                    return out;
+                }
+
                 ue::FProperty *inner_prop = nullptr;
                 if (rf->return_prop->raw && ue::is_valid_ptr(rf->return_prop->raw))
                 {
@@ -1705,11 +1880,34 @@ namespace lua_uobject
                     if (inner_prop && !ue::is_mapped_ptr(inner_prop))
                         inner_prop = nullptr;
                 }
-                lua_tarray::LuaTArray arr;
-                arr.array_ptr = const_cast<uint8_t *>(ret_ptr);
-                arr.inner_prop = inner_prop;
-                arr.element_size = inner_prop ? ue::fprop_get_element_size(inner_prop) : 0;
-                return sol::make_object(lua, arr);
+                if (!inner_prop)
+                {
+                    logger::log_warn("CALLRET", "%s::%s returned ArrayProperty without valid inner prop",
+                                     class_name.c_str(), func_name.c_str());
+                    return out;
+                }
+
+                int32_t elem_sz = ue::fprop_get_element_size(inner_prop);
+                if (elem_sz <= 0 || elem_sz > 4096 || !ue::is_mapped_ptr(arr->data))
+                {
+                    logger::log_warn("CALLRET", "%s::%s returned invalid TArray data (elem_sz=%d data=%p)",
+                                     class_name.c_str(), func_name.c_str(), elem_sz, arr->data);
+                    return out;
+                }
+
+                const uint8_t *arr_base = reinterpret_cast<const uint8_t *>(arr->data);
+                for (int32_t i = 0; i < arr->num; ++i)
+                {
+                    const uint8_t *elem = arr_base + static_cast<size_t>(i) * static_cast<size_t>(elem_sz);
+                    if (!ue::is_mapped_ptr(elem))
+                    {
+                        logger::log_warn("CALLRET", "%s::%s TArray element %d not mapped — truncating snapshot",
+                                         class_name.c_str(), func_name.c_str(), i);
+                        break;
+                    }
+                    out[i + 1] = lua_tarray::read_element(lua, elem, inner_prop);
+                }
+                return out;
             }
             default:
                 return sol::make_object(lua, sol::lightuserdata_value(const_cast<uint8_t *>(ret_ptr)));
@@ -1733,6 +1931,12 @@ namespace lua_uobject
         if (!obj || !symbols::ProcessEvent)
             return false;
 
+        if (!ue::is_mapped_ptr(obj) || !ue::is_valid_ptr(obj) || !ue::is_valid_uobject(obj))
+        {
+            logger::log_warn("CALLBG", "Skipping background call on invalid UObject: %p::%s", obj, func_name.c_str());
+            return false;
+        }
+
         ue::UClass *cls = ue::uobj_get_class(obj);
         if (!cls)
             return false;
@@ -1753,6 +1957,12 @@ namespace lua_uobject
         }
 
         ue::UFunction *func = static_cast<ue::UFunction *>(rf->raw);
+        if (!func || !ue::is_mapped_ptr(func) || !ue::is_valid_ptr(func))
+        {
+            logger::log_warn("CALLBG", "Skipping background call %s::%s — invalid UFunction %p",
+                             class_name.c_str(), func_name.c_str(), func);
+            return false;
+        }
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
 
         if (parms_size == 0)
@@ -1781,6 +1991,13 @@ namespace lua_uobject
                 break;
             if (!(pi.flags & ue::CPF_Parm) || (pi.flags & ue::CPF_ReturnParm))
                 continue;
+
+            if (!marshaled_range_valid(parms_size, pi, class_name, func_name, "CALLBG"))
+            {
+                for (auto *p : *fstring_allocs)
+                    delete[] p;
+                return false;
+            }
 
             sol::object arg = va[arg_idx];
             uint8_t *param_ptr = params_buf->data() + pi.offset;
@@ -1919,7 +2136,13 @@ namespace lua_uobject
                 }
                 else if (arg.get_type() == sol::type::table)
                 {
-                    ue::UStruct *inner_struct = ue::read_field<ue::UStruct *>(pi.raw, ue::fprop::STRUCT_INNER_STRUCT_OFF());
+                    ue::UStruct *inner_struct = nullptr;
+                    if (pi.raw && ue::is_valid_ptr(pi.raw))
+                    {
+                        ue::UStruct *candidate = ue::read_field<ue::UStruct *>(pi.raw, ue::fprop::STRUCT_INNER_STRUCT_OFF());
+                        if (candidate && ue::is_mapped_ptr(candidate))
+                            inner_struct = candidate;
+                    }
                     if (inner_struct)
                         lua_ustruct::fill_from_table(param_ptr, inner_struct, arg.as<sol::table>());
                 }
@@ -1962,6 +2185,12 @@ namespace lua_uobject
         if (!obj || !symbols::ProcessEvent || !raw_params || params_len <= 0)
             return false;
 
+        if (!ue::is_mapped_ptr(obj) || !ue::is_valid_ptr(obj) || !ue::is_valid_uobject(obj))
+        {
+            logger::log_warn("CALLBG", "RawCallBg skipped on invalid UObject: %p::%s", obj, func_name.c_str());
+            return false;
+        }
+
         ue::UClass *cls = ue::uobj_get_class(obj);
         if (!cls)
             return false;
@@ -1985,6 +2214,12 @@ namespace lua_uobject
         }
 
         ue::UFunction *func = static_cast<ue::UFunction *>(rf->raw);
+        if (!func || !ue::is_mapped_ptr(func) || !ue::is_valid_ptr(func))
+        {
+            logger::log_warn("CALLBG", "RawCall: invalid UFunction %p for %s::%s",
+                             func, class_name.c_str(), func_name.c_str());
+            return false;
+        }
 
         // Allocate buffer sized to UFunction's ParmsSize (not just caller's buffer)
         // ProcessEvent may read/write beyond the caller's params for return values,
@@ -2020,6 +2255,12 @@ namespace lua_uobject
         if (!obj || !symbols::ProcessEvent || !raw_params || params_len <= 0)
             return false;
 
+        if (!ue::is_mapped_ptr(obj) || !ue::is_valid_ptr(obj) || !ue::is_valid_uobject(obj))
+        {
+            logger::log_warn("CALLRAW", "RawCall skipped on invalid UObject: %p::%s", obj, func_name.c_str());
+            return false;
+        }
+
         ue::UClass *cls = ue::uobj_get_class(obj);
         if (!cls)
             return false;
@@ -2042,6 +2283,12 @@ namespace lua_uobject
         }
 
         ue::UFunction *func = static_cast<ue::UFunction *>(rf->raw);
+        if (!func || !ue::is_mapped_ptr(func) || !ue::is_valid_ptr(func))
+        {
+            logger::log_warn("CALLRAW", "RawCall: invalid UFunction %p for %s::%s",
+                             func, class_name.c_str(), func_name.c_str());
+            return false;
+        }
 
         // Allocate buffer sized to max(ParmsSize, params_len, 32)
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
@@ -2061,9 +2308,13 @@ namespace lua_uobject
             logger::log_error("CALLRAW", "ProcessEvent CRASHED (signal %d) calling %s::%s on %p "
                                          "— recovered, returning false",
                               pe_crash_sig, class_name.c_str(), func_name.c_str(), obj);
+            g_in_call_ufunction = 0;
             return false;
         }
-        symbols::ProcessEvent(obj, func, params_buf.data());
+        auto pe_fn = pe_hook::get_original();
+        if (!pe_fn)
+            pe_fn = symbols::ProcessEvent;
+        pe_fn(obj, func, params_buf.data());
         g_in_call_ufunction = 0;
         return true;
     }

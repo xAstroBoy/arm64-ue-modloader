@@ -227,10 +227,10 @@ namespace game_profile
         p.display_name = "Pinball FX VR";
         p.engine_lib_name = "libUnreal.so";
         p.engine_version = "UE5";
-        p.detected_engine_version = EngineVersion::UE5_4;
+        p.detected_engine_version = EngineVersion::UE5_3;
 
         // Build offsets from engine_versions.h constants (derived from UE source)
-        p.offsets = build_offsets_for_version(EngineVersion::UE5_4);
+        p.offsets = build_offsets_for_version(EngineVersion::UE5_3);
 
         // ── Pinball FX VR specific overrides (verified on live binary) ──
         // FUObjectItem is 0x14 (20 bytes) — no padding, no RefCount in this build
@@ -286,6 +286,26 @@ namespace game_profile
             {"_ZN5FText10FromStringEO7FString", 0}, // not needed — Kismet path used
             {"_ZN5FTextD2Ev", 0},                   // not needed — Kismet path used
             {"_ZN5FTextC1Ev", 0},                   // not needed — Kismet path used
+
+            // ── AES key extraction hooks (v1.7 libUnreal.so, IDA zero-based offsets) ──
+            // sub_6258DC0 = AES_set_decrypt_key(const uint8* userKey, int bits, AES_KEY* out)
+            // sub_6258BA0 = AES_set_encrypt_key(const uint8* userKey, int bits, AES_KEY* out)
+            // Both are called when setting up AES key schedules.
+            // For PAK decryption, UE5 calls one of these with the raw 32-byte key.
+            // Hooking both guarantees capture regardless of encrypt vs decrypt path.
+            // X0 = raw key bytes, W1 = key bits (256 for AES-256), X2 = schedule output.
+            {"AES_set_decrypt_key", 0x6258DC0},
+            {"AES_set_encrypt_key", 0x6258BA0},
+
+            // ── UE T-table AES (the REAL PAK decryption path) ──
+            // sub_13FBEE4 = FAES::DecryptData(void* data, int64_t size, uint8_t* key32)
+            //   Standalone T-table AES-256 decryption. Called by FPakFile::DecryptData
+            //   (sub_228F334) for all PAK index/content decryption. arg3 = raw 32-byte key.
+            //   This does NOT use OpenSSL — completely separate implementation.
+            {"FAES_DecryptData", 0x13FBEE4},
+            // sub_228E614 = GetPakEncryptionKey(uint8_t* outKey32, FGuid* encryptionKeyGuid)
+            //   Resolves encryption key GUID → 32-byte key buffer. Called before FAES_DecryptData.
+            {"GetPakEncryptionKey", 0x228E614},
         };
 
         // ── Pattern signatures for dynamic scanning ──

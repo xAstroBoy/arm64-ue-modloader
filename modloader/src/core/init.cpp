@@ -23,6 +23,7 @@
 #include "modloader/adb_bridge.h"
 #include "modloader/notification.h"
 #include "modloader/object_monitor.h"
+#include "modloader/aes_extractor.h"
 #include "modloader/config.h"
 #include "modloader/game_profile.h"
 #include "modloader/auto_offsets.h"
@@ -325,6 +326,20 @@ namespace init
         // No need to mount here — the hooks handle it automatically.
         logger::log_info("DEFER", "PAK mounting handled by Dobby hooks (Frida-style capture)");
 
+        // ── Deferred AES fallback scan ─────────────────────────────────────
+        // Some UE5 builds do not expose FAES::DecryptData symbolically. Run
+        // one delayed scan after engine startup to capture candidate keys.
+        {
+            struct timespec ts = {8, 0};
+            nanosleep(&ts, nullptr);
+            int found = aes_extractor::scan_for_keys();
+            logger::log_info("DEFER", "AES fallback scan found %d candidate key(s), total=%zu",
+                             found, aes_extractor::key_count());
+
+            std::string aes_dump_path = paths::data_dir() + "/aes_keys.txt";
+            aes_extractor::dump_keys_to_file(aes_dump_path);
+        }
+
         // Post SDK notification
         if (notif_ok && !classes.empty())
         {
@@ -424,6 +439,10 @@ namespace init
         // ── Step 6: Initialize pattern scanner ──────────────────────────────
         pattern::init();
         logger::log_info("BOOT", "Pattern scanner initialized");
+
+        // ── Step 6.1: Initialize AES extractor ─────────────────────────────
+        aes_extractor::init();
+        logger::log_info("BOOT", "AES extractor initialized");
 
         // ── Step 6.5: Run dynamic offset discovery ──────────────────────────
         // Auto-discovers GNames, GUObjectArray, ProcessEvent, FUObjectItem size,

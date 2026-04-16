@@ -41,6 +41,10 @@ namespace aes_extractor
     // Get the most recently extracted key (or empty key if none found)
     AESKey get_latest_key();
 
+    // Get the single best PAK encryption key (prioritizes FAES::DecryptData source).
+    // Returns empty key if none found.
+    AESKey get_pak_key();
+
     // Check if any keys have been extracted
     bool has_keys();
 
@@ -60,6 +64,8 @@ namespace aes_extractor
     // This is a heuristic scan — looks for 32-byte aligned blobs near
     // string references to "PakEncryptionKey" or "EncryptionKey".
     // Returns number of candidate keys found.
+    // NOTE: For PFXVR, these strings don't exist — scan returns 0.
+    // The primary extraction method is hooking AES_set_decrypt_key.
     int scan_for_keys();
 
     // Write all extracted keys to a log file

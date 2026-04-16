@@ -1164,6 +1164,468 @@ namespace sdk_gen
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // .usmap generator — FModel/UE4SS compatible binary mapping format
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Format spec (version 3, no compression):
+    //   u16 magic = 0x30C4
+    //   u8  version = 3
+    //   u8  has_package_versions = 0 (we skip package versioning)
+    //   u8  compression = 0 (None)
+    //   u32 compressed_size = decompressed_size
+    //   u32 decompressed_size
+    //   [payload bytes]
+    //
+    // Payload:
+    //   u32 names_count; for each: u8 name_len, char[name_len]
+    //   u32 enums_count; for each: u32 name_idx, u8 values_count, { u32 name_idx }[]
+    //   u32 structs_count; for each: u32 name_idx, u32 super_idx, u16 prop_count,
+    //                                u32 serialization_idx, { u16 schema_idx, u8 array_dim, u8 name_idx(u32), EPropertyType ... }[]
+
+    // Helper: write little-endian u8/u16/u32 to a byte buffer
+    class UsmapWriter
+    {
+    public:
+        std::vector<uint8_t> buf;
+
+        void write_u8(uint8_t v) { buf.push_back(v); }
+        void write_u16(uint16_t v)
+        {
+            buf.push_back(v & 0xFF);
+            buf.push_back((v >> 8) & 0xFF);
+        }
+        void write_u32(uint32_t v)
+        {
+            buf.push_back(v & 0xFF);
+            buf.push_back((v >> 8) & 0xFF);
+            buf.push_back((v >> 16) & 0xFF);
+            buf.push_back((v >> 24) & 0xFF);
+        }
+        void write_i32(int32_t v) { write_u32(static_cast<uint32_t>(v)); }
+    };
+
+    // .usmap EPropertyType enum (matches FModel/UE4SS spec)
+    // Must match CUE4Parse's EPropertyType exactly:
+    // CUE4Parse/MappingsProvider/Usmap/EPropertyType.cs
+    enum class UsmapPropertyType : uint8_t
+    {
+        ByteProperty = 0,
+        BoolProperty = 1,
+        IntProperty = 2,
+        FloatProperty = 3,
+        ObjectProperty = 4,
+        NameProperty = 5,
+        DelegateProperty = 6,
+        DoubleProperty = 7,
+        ArrayProperty = 8,
+        StructProperty = 9,
+        StrProperty = 10,
+        TextProperty = 11,
+        InterfaceProperty = 12,
+        MulticastDelegateProperty = 13,
+        WeakObjectProperty = 14,
+        LazyObjectProperty = 15,
+        AssetObjectProperty = 16,
+        SoftObjectProperty = 17,
+        UInt64Property = 18,
+        UInt32Property = 19,
+        UInt16Property = 20,
+        Int64Property = 21,
+        Int16Property = 22,
+        Int8Property = 23,
+        MapProperty = 24,
+        SetProperty = 25,
+        EnumProperty = 26,
+        FieldPathProperty = 27,
+        OptionalProperty = 28,
+        // Extended types (CUE4Parse 31+):
+        ClassProperty = 31,
+        MulticastInlineDelegateProperty = 32,
+        SoftClassProperty = 33,
+    };
+
+    // Map reflection PropType → usmap EPropertyType
+    static UsmapPropertyType to_usmap_type(reflection::PropType t)
+    {
+        using PT = reflection::PropType;
+        switch (t)
+        {
+        case PT::BoolProperty:
+            return UsmapPropertyType::BoolProperty;
+        case PT::ByteProperty:
+            return UsmapPropertyType::ByteProperty;
+        case PT::Int8Property:
+            return UsmapPropertyType::Int8Property;
+        case PT::Int16Property:
+            return UsmapPropertyType::Int16Property;
+        case PT::IntProperty:
+            return UsmapPropertyType::IntProperty;
+        case PT::Int64Property:
+            return UsmapPropertyType::Int64Property;
+        case PT::UInt16Property:
+            return UsmapPropertyType::UInt16Property;
+        case PT::UInt32Property:
+            return UsmapPropertyType::UInt32Property;
+        case PT::UInt64Property:
+            return UsmapPropertyType::UInt64Property;
+        case PT::FloatProperty:
+            return UsmapPropertyType::FloatProperty;
+        case PT::DoubleProperty:
+            return UsmapPropertyType::DoubleProperty;
+        case PT::NameProperty:
+            return UsmapPropertyType::NameProperty;
+        case PT::StrProperty:
+            return UsmapPropertyType::StrProperty;
+        case PT::TextProperty:
+            return UsmapPropertyType::TextProperty;
+        case PT::ObjectProperty:
+            return UsmapPropertyType::ObjectProperty;
+        case PT::WeakObjectProperty:
+            return UsmapPropertyType::WeakObjectProperty;
+        case PT::LazyObjectProperty:
+            return UsmapPropertyType::LazyObjectProperty;
+        case PT::SoftObjectProperty:
+            return UsmapPropertyType::SoftObjectProperty;
+        case PT::ClassProperty:
+            return UsmapPropertyType::ObjectProperty; // ClassProperty → ObjectProperty for compat
+        case PT::SoftClassProperty:
+            return UsmapPropertyType::SoftObjectProperty; // SoftClassProperty → SoftObjectProperty for compat
+        case PT::InterfaceProperty:
+            return UsmapPropertyType::InterfaceProperty;
+        case PT::StructProperty:
+            return UsmapPropertyType::StructProperty;
+        case PT::ArrayProperty:
+            return UsmapPropertyType::ArrayProperty;
+        case PT::MapProperty:
+            return UsmapPropertyType::MapProperty;
+        case PT::SetProperty:
+            return UsmapPropertyType::SetProperty;
+        case PT::EnumProperty:
+            return UsmapPropertyType::EnumProperty;
+        case PT::DelegateProperty:
+            return UsmapPropertyType::DelegateProperty;
+        case PT::MulticastDelegateProperty:
+            return UsmapPropertyType::MulticastDelegateProperty;
+        case PT::MulticastInlineDelegateProperty:
+            return UsmapPropertyType::MulticastDelegateProperty; // → MCDelegate for compat
+        case PT::MulticastSparseDelegateProperty:
+            return UsmapPropertyType::MulticastDelegateProperty;
+        case PT::FieldPathProperty:
+            return UsmapPropertyType::FieldPathProperty;
+        default:
+            return UsmapPropertyType::ByteProperty;
+        }
+    }
+
+    // Check if a usmap property type needs an inner type name index
+    // (Object, Struct, Enum, SoftObject, etc.)
+    static bool usmap_type_has_inner(UsmapPropertyType t)
+    {
+        switch (t)
+        {
+        case UsmapPropertyType::EnumProperty:
+        case UsmapPropertyType::StructProperty:
+        case UsmapPropertyType::ObjectProperty:
+        case UsmapPropertyType::WeakObjectProperty:
+        case UsmapPropertyType::LazyObjectProperty:
+        case UsmapPropertyType::SoftObjectProperty:
+        case UsmapPropertyType::ClassProperty:
+        case UsmapPropertyType::SoftClassProperty:
+        case UsmapPropertyType::InterfaceProperty:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Check if a usmap property type has a nested property type (Array, Set, Map, Enum w/ underlying)
+    static bool usmap_type_has_nested(UsmapPropertyType t)
+    {
+        switch (t)
+        {
+        case UsmapPropertyType::ArrayProperty:
+        case UsmapPropertyType::SetProperty:
+        case UsmapPropertyType::MapProperty:
+        case UsmapPropertyType::EnumProperty:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    int generate_usmap()
+    {
+        // .usmap format reference: Dumper-7 MappingGenerator
+        // https://github.com/Encryqed/Dumper-7
+        //
+        // Version enum:
+        //   0 = Initial            (u8 name len, u8 enum count)
+        //   1 = PackageVersioning  (adds int32 bHasVersionInfo)
+        //   2 = LongFName          (u16 name len)
+        //   3 = LargeEnums         (u16 enum member count)
+        //   4 = ExplicitEnumValues (int32 value per enum member)
+        //
+        // We use version 0 (Initial) for maximum compatibility and simplicity.
+        // Header: u16 magic, u8 version(0), u8 compression(0), u32 compSz, u32 decompSz
+
+        const auto &classes = reflection::get_classes();
+        const auto &structs = reflection::get_structs();
+        const auto &enums = reflection::get_enums();
+
+        // ── Step 1: Build names table ──
+        std::vector<std::string> names;
+        std::map<std::string, int32_t> name_to_idx;
+
+        auto add_name = [&](const std::string &n) -> int32_t
+        {
+            auto it = name_to_idx.find(n);
+            if (it != name_to_idx.end())
+                return it->second;
+            int32_t idx = static_cast<int32_t>(names.size());
+            name_to_idx[n] = idx;
+            names.push_back(n);
+            return idx;
+        };
+
+        // Add empty name at index 0 as sentinel
+        add_name("");
+
+        // Pre-collect all names from enums
+        for (const auto &e : enums)
+        {
+            add_name(e.name);
+            for (const auto &v : e.values)
+                add_name(v.first);
+        }
+
+        // Pre-collect all names from structs and classes
+        auto add_struct_names = [&](const std::string &name, const std::string &parent,
+                                    const std::vector<reflection::PropertyInfo> &props)
+        {
+            add_name(name);
+            if (!parent.empty())
+                add_name(parent);
+            for (const auto &p : props)
+            {
+                add_name(p.name);
+                if (!p.inner_type_name.empty())
+                    add_name(p.inner_type_name);
+                if (!p.inner_type_name2.empty())
+                    add_name(p.inner_type_name2);
+            }
+        };
+
+        for (const auto &s : structs)
+            add_struct_names(s.name, s.parent_name, s.properties);
+        for (const auto &c : classes)
+            add_struct_names(c.name, c.parent_name, c.properties);
+
+        // ── Step 2: Build payload ──
+        UsmapWriter payload;
+
+        // Names table: u32 count, then for each: u16 len + chars (version >= 2 = u16 lengths)
+        payload.write_u32(static_cast<uint32_t>(names.size()));
+        for (const auto &n : names)
+        {
+            uint16_t len = static_cast<uint16_t>(n.size() > 65535 ? 65535 : n.size());
+            payload.write_u16(len);
+            for (uint16_t i = 0; i < len; i++)
+                payload.write_u8(static_cast<uint8_t>(n[i]));
+        }
+
+        // Enums table: u32 count, then for each: i32 nameIdx, u16 numMembers, then i32 memberNameIdx[]
+        payload.write_u32(static_cast<uint32_t>(enums.size()));
+        for (const auto &e : enums)
+        {
+            payload.write_i32(name_to_idx[e.name]);
+            uint16_t count = static_cast<uint16_t>(e.values.size() > 65535 ? 65535 : e.values.size());
+            payload.write_u16(count);
+            for (uint16_t i = 0; i < count; i++)
+                payload.write_i32(name_to_idx[e.values[i].first]);
+        }
+
+        // Helper: write a single property type recursively (matches Dumper-7 GeneratePropertyType)
+        std::function<void(const reflection::PropertyInfo &)> write_property_type;
+        write_property_type = [&](const reflection::PropertyInfo &prop)
+        {
+            UsmapPropertyType utype = to_usmap_type(prop.type);
+            payload.write_u8(static_cast<uint8_t>(utype));
+
+            // EnumProperty: write underlying type (ByteProperty), then i32 enum name index
+            if (utype == UsmapPropertyType::EnumProperty)
+            {
+                // Underlying type is always ByteProperty
+                payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
+                // Enum class name
+                int32_t enum_idx = prop.inner_type_name.empty() ? 0 : name_to_idx[prop.inner_type_name];
+                payload.write_i32(enum_idx);
+                return;
+            }
+
+            // StructProperty: write i32 struct name index
+            if (utype == UsmapPropertyType::StructProperty)
+            {
+                int32_t inner_idx = prop.inner_type_name.empty() ? 0 : name_to_idx[prop.inner_type_name];
+                payload.write_i32(inner_idx);
+                return;
+            }
+
+            // ObjectProperty and variants: NO extra data in usmap format
+            // CUE4Parse does not read any extra bytes for these types
+            if (utype == UsmapPropertyType::ObjectProperty ||
+                utype == UsmapPropertyType::WeakObjectProperty ||
+                utype == UsmapPropertyType::LazyObjectProperty ||
+                utype == UsmapPropertyType::SoftObjectProperty ||
+                utype == UsmapPropertyType::ClassProperty ||
+                utype == UsmapPropertyType::SoftClassProperty ||
+                utype == UsmapPropertyType::InterfaceProperty)
+            {
+                return;
+            }
+
+            // ArrayProperty/SetProperty: recursively write inner element type
+            if (utype == UsmapPropertyType::ArrayProperty || utype == UsmapPropertyType::SetProperty)
+            {
+                if (!prop.inner_type_name.empty())
+                {
+                    reflection::StructInfo *si = reflection::find_struct(prop.inner_type_name);
+                    if (si)
+                    {
+                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::StructProperty));
+                        payload.write_i32(name_to_idx[prop.inner_type_name]);
+                    }
+                    else
+                    {
+                        // ObjectProperty — NO extra data after type byte
+                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ObjectProperty));
+                    }
+                }
+                else
+                {
+                    payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
+                }
+                return;
+            }
+
+            // MapProperty: recursively write key type + value type
+            if (utype == UsmapPropertyType::MapProperty)
+            {
+                // Key type
+                if (!prop.inner_type_name.empty())
+                {
+                    reflection::StructInfo *si = reflection::find_struct(prop.inner_type_name);
+                    if (si)
+                    {
+                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::StructProperty));
+                        payload.write_i32(name_to_idx[prop.inner_type_name]);
+                    }
+                    else
+                    {
+                        // ObjectProperty — NO extra data after type byte
+                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ObjectProperty));
+                    }
+                }
+                else
+                {
+                    payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
+                }
+                // Value type
+                if (!prop.inner_type_name2.empty())
+                {
+                    reflection::StructInfo *si = reflection::find_struct(prop.inner_type_name2);
+                    if (si)
+                    {
+                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::StructProperty));
+                        payload.write_i32(name_to_idx[prop.inner_type_name2]);
+                    }
+                    else
+                    {
+                        // ObjectProperty — NO extra data after type byte
+                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ObjectProperty));
+                    }
+                }
+                else
+                {
+                    payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
+                }
+                return;
+            }
+
+            // All other types (Bool, Int, Float, etc.): no extra data needed
+        };
+
+        // Structs table: u32 count, then for each struct:
+        //   i32 nameIdx, i32 superIdx (-1=none), u16 propCount, u16 serializablePropCount
+        //   then for each serializable property:
+        //     u16 index, u8 arrayDim, i32 nameIdx, then property type (recursive)
+        uint32_t total_structs = static_cast<uint32_t>(structs.size() + classes.size());
+        payload.write_u32(total_structs);
+
+        auto write_struct_entry = [&](const std::string &name, const std::string &parent,
+                                      const std::vector<reflection::PropertyInfo> &props)
+        {
+            payload.write_i32(name_to_idx[name]);
+            // Super struct name index (-1 = none)
+            if (!parent.empty() && name_to_idx.count(parent))
+                payload.write_i32(name_to_idx[parent]);
+            else
+                payload.write_i32(-1);
+            // PropertyCount = total property slots (sum of array dims)
+            uint16_t prop_count = static_cast<uint16_t>(props.size() > 65535 ? 65535 : props.size());
+            payload.write_u16(prop_count);
+            // SerializablePropertyCount = number of property entries we write
+            payload.write_u16(prop_count);
+            // Properties
+            for (uint16_t i = 0; i < prop_count; i++)
+            {
+                const auto &p = props[i];
+                payload.write_u16(i);                   // Schema index
+                payload.write_u8(1);                    // ArrayDim (1 = not a static array)
+                payload.write_i32(name_to_idx[p.name]); // Property name index
+                write_property_type(p);                 // Property type (recursive)
+            }
+        };
+
+        for (const auto &s : structs)
+            write_struct_entry(s.name, s.parent_name, s.properties);
+        for (const auto &c : classes)
+            write_struct_entry(c.name, c.parent_name, c.properties);
+
+        // ── Step 3: Write file ──
+        std::string filepath = paths::usmap_path();
+        FILE *f = fopen(filepath.c_str(), "wb");
+        if (!f)
+        {
+            logger::log_error("SDK", "Failed to create usmap file: %s (%s)",
+                              filepath.c_str(), strerror(errno));
+            return 0;
+        }
+
+        UsmapWriter header;
+        // Magic: 0x30C4
+        header.write_u16(0x30C4);
+        // Version: 3 (LargeEnums) — u16 name lengths, u16 enum value counts
+        header.write_u8(3);
+        // bHasVersioning: false (version >= 1 requires this as int32, UE bool = 4 bytes)
+        header.write_u32(0);
+        // Compression: 0 (None)
+        header.write_u8(0);
+        // Compressed size = decompressed size (no compression)
+        uint32_t payload_size = static_cast<uint32_t>(payload.buf.size());
+        header.write_u32(payload_size);
+        header.write_u32(payload_size);
+
+        fwrite(header.buf.data(), 1, header.buf.size(), f);
+        fwrite(payload.buf.data(), 1, payload.buf.size(), f);
+        fclose(f);
+
+        logger::log_info("SDK", "Usmap: %s (%u bytes, %zu names, %zu enums, %u structs)",
+                         filepath.c_str(), static_cast<unsigned>(header.buf.size() + payload_size),
+                         names.size(), enums.size(), total_structs);
+        return 1;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Top-level API
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -1192,6 +1654,9 @@ namespace sdk_gen
 
         // 3. Legacy per-class SDK
         total_files += generate_legacy_sdk();
+
+        // 4. Usmap binary mappings (FModel/UE4SS compatible)
+        total_files += generate_usmap();
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);

@@ -27,6 +27,10 @@ namespace lua_engine
     // Check if initialized
     bool is_initialized();
 
+    // Shared recursive execution mutex for ALL C++ entrypoints into the Lua VM.
+    // Recursive because Lua callbacks can legitimately re-enter via ProcessEvent.
+    std::recursive_mutex &execution_mutex();
+
     // Execute a Lua string (for ADB exec_lua)
     // max_instructions: 0 = unlimited, >0 = abort after N Lua VM instructions (prevents infinite loops/recursion)
     ExecResult exec_string(const std::string &code, const std::string &chunk_name = "=exec", int max_instructions = 0);

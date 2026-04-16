@@ -15,6 +15,7 @@
 #include "modloader/symbols.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
+#include "modloader/aes_extractor.h"
 
 #include <nlohmann/json.hpp>
 
@@ -287,7 +288,61 @@ namespace adb_bridge
             total_calls += fs.call_count;
         result["total_hook_calls"] = total_calls;
         result["active_hooks"] = stats.size();
+        result["aes_key_count"] = aes_extractor::key_count();
 
+        return ok_response(result);
+    }
+
+    static std::string handle_aes_scan()
+    {
+        int found = aes_extractor::scan_for_keys();
+        json result;
+        result["found_now"] = found;
+        result["total_keys"] = aes_extractor::key_count();
+        return ok_response(result);
+    }
+
+    static std::string handle_aes_latest()
+    {
+        auto key = aes_extractor::get_latest_key();
+        bool empty = true;
+        for (int i = 0; i < 32; i++)
+        {
+            if (key.bytes[i] != 0)
+            {
+                empty = false;
+                break;
+            }
+        }
+
+        if (empty)
+        {
+            return error_response("no AES keys captured yet");
+        }
+
+        json result;
+        result["hex"] = aes_extractor::key_to_hex(key);
+        result["base64"] = aes_extractor::key_to_base64(key);
+        result["source"] = key.source;
+        result["pak"] = key.pak_name;
+        result["timestamp_ms"] = key.timestamp;
+        return ok_response(result);
+    }
+
+    static std::string handle_aes_keys()
+    {
+        auto keys = aes_extractor::get_keys();
+        json result = json::array();
+        for (const auto &k : keys)
+        {
+            json entry;
+            entry["hex"] = aes_extractor::key_to_hex(k);
+            entry["base64"] = aes_extractor::key_to_base64(k);
+            entry["source"] = k.source;
+            entry["pak"] = k.pak_name;
+            entry["timestamp_ms"] = k.timestamp;
+            result.push_back(entry);
+        }
         return ok_response(result);
     }
 
@@ -388,6 +443,12 @@ namespace adb_bridge
             return handle_find_class(cmd);
         if (command == "object_count")
             return handle_object_count();
+        if (command == "aes_scan")
+            return handle_aes_scan();
+        if (command == "aes_latest")
+            return handle_aes_latest();
+        if (command == "aes_keys")
+            return handle_aes_keys();
 
         // ═══ PE Trace commands ═══════════════════════════════════════════════
         if (command == "pe_trace_start")
@@ -573,6 +634,7 @@ namespace adb_bridge
                 "dump_sdk", "mount_pak", "list_paks", "log_tail", "get_stats",
                 "find_object", "find_class", "object_count", "dump_symbols",
                 "exec_console", "dump_console_commands",
+                "aes_scan", "aes_latest", "aes_keys",
                 "pe_trace_start", "pe_trace_stop", "pe_trace_clear", "pe_trace_status",
                 "pe_trace_top", "pe_trace_dump", "ping"};
             for (auto &b : built)

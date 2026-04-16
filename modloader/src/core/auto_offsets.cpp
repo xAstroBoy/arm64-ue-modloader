@@ -417,6 +417,48 @@ namespace auto_offsets
             return EngineVersion::UE4_27; // best guess
         }
 
+        // Meta Quest fork detection: look for source path strings like
+        // "UE5_3_2_MetaFork" or "UE4_25_MetaFork" embedded in .rodata
+        // These come from __FILE__ macros in compiled engine source.
+        {
+            struct MetaForkMarker
+            {
+                const char *pattern;
+                EngineVersion version;
+                const char *label;
+            };
+            static const MetaForkMarker mf_markers[] = {
+                {"UE5_6", EngineVersion::UE5_6, "5.6"},
+                {"UE5_5", EngineVersion::UE5_5, "5.5"},
+                {"UE5_4", EngineVersion::UE5_4, "5.4"},
+                {"UE5_3", EngineVersion::UE5_3, "5.3"},
+                {"UE5_2", EngineVersion::UE5_2, "5.2"},
+                {"UE5_1", EngineVersion::UE5_1, "5.1"},
+                {"UE5_0", EngineVersion::UE5_0, "5.0"},
+                {"UE4_27", EngineVersion::UE4_27, "4.27"},
+                {"UE4_26", EngineVersion::UE4_26, "4.26"},
+                {"UE4_25", EngineVersion::UE4_25, "4.25"},
+            };
+            for (const auto &mf : mf_markers)
+            {
+                void *found = pattern::find_string(mf.pattern);
+                if (found)
+                {
+                    bool is_meta_fork = pattern::find_string("IsUnrealEngineMetaFork") != nullptr;
+                    logger::log_info("AUTOOFF", "Engine version detected via source path: %s%s (at 0x%lX)",
+                                     mf.label, is_meta_fork ? " (Meta fork)" : "",
+                                     reinterpret_cast<unsigned long>(found));
+                    if (out_version_string)
+                    {
+                        *out_version_string = mf.pattern;
+                        if (is_meta_fork)
+                            *out_version_string += "_MetaFork";
+                    }
+                    return mf.version;
+                }
+            }
+        }
+
         // UE5 without +UE5+ marker: check for UE5-specific strings
         if (pattern::find_string("FNamePool") || pattern::find_string("PreAllocatedObjects"))
         {

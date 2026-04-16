@@ -17,7 +17,7 @@ void save(const std::string& data_dir);
 
 // ── Auto-dump settings ──────────────────────────────────────────────────
 
-// Whether to generate the SDK on boot (default: true)
+// Whether to generate the SDK on boot (default: false)
 bool auto_dump_on_boot();
 
 // Whether to auto-redump SDK when object count grows (level load) (default: false)

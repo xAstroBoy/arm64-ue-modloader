@@ -72,6 +72,21 @@ namespace crash_handler
     static struct sigaction s_old_sigbus;
     static struct sigaction s_old_sigfpe;
 
+    // Original platform handlers captured at first install().
+    // These are used as a stable fallback so we keep debuggerd/tombstones working.
+    static struct sigaction s_orig_sigsegv;
+    static struct sigaction s_orig_sigabrt;
+    static struct sigaction s_orig_sigbus;
+    static struct sigaction s_orig_sigfpe;
+
+    // Tombstone-first mode:
+    // When true, forward fatal signals immediately to previous/system handlers
+    // and skip all in-process recovery guards.
+    //
+    // Keep this OFF in production so safe_call / hook / ProcessEvent siglongjmp
+    // recovery can prevent expected mod-side faults from killing the game.
+    static constexpr bool kTombstoneOnlyMode = false;
+
     // Boot grace period — skip SIGABRT logging during first 5 seconds.
     // Frida's gadget (libfrda.so) calls abort() ~1.4s after boot which
     // is expected/handled. After boot completes, we catch everything.
@@ -197,8 +212,85 @@ namespace crash_handler
         return "unknown code";
     }
 
+    static void forward_to_handler_or_default(int sig, siginfo_t *info, void *ucontext_raw)
+    {
+        struct sigaction *old_action = nullptr;
+        switch (sig)
+        {
+        case SIGSEGV:
+            old_action = &s_old_sigsegv;
+            break;
+        case SIGABRT:
+            old_action = &s_old_sigabrt;
+            break;
+        case SIGBUS:
+            old_action = &s_old_sigbus;
+            break;
+        case SIGFPE:
+            old_action = &s_old_sigfpe;
+            break;
+        }
+
+        if (old_action && old_action->sa_sigaction)
+        {
+            old_action->sa_sigaction(sig, info, ucontext_raw);
+            return;
+        }
+        if (old_action && old_action->sa_handler != SIG_DFL && old_action->sa_handler != SIG_IGN)
+        {
+            old_action->sa_handler(sig);
+            return;
+        }
+
+        // Fallback to original system handlers captured at initial install.
+        struct sigaction *orig = nullptr;
+        switch (sig)
+        {
+        case SIGSEGV:
+            orig = &s_orig_sigsegv;
+            break;
+        case SIGABRT:
+            orig = &s_orig_sigabrt;
+            break;
+        case SIGBUS:
+            orig = &s_orig_sigbus;
+            break;
+        case SIGFPE:
+            orig = &s_orig_sigfpe;
+            break;
+        }
+        if (orig && orig->sa_sigaction)
+        {
+            orig->sa_sigaction(sig, info, ucontext_raw);
+            return;
+        }
+        if (orig && orig->sa_handler != SIG_DFL && orig->sa_handler != SIG_IGN)
+        {
+            orig->sa_handler(sig);
+            return;
+        }
+
+        signal(sig, SIG_DFL);
+        if (sig == SIGABRT)
+        {
+            raise(SIGABRT);
+            while (true)
+            {
+                pause();
+            }
+        }
+        // For synchronous faults (SIGSEGV/SIGBUS/SIGFPE), return under SIG_DFL,
+        // letting the fault re-trigger and debuggerd generate a tombstone.
+    }
+
     static void crash_handler_fn(int sig, siginfo_t *info, void *ucontext_raw)
     {
+        if (kTombstoneOnlyMode)
+        {
+            forward_to_handler_or_default(sig, info, ucontext_raw);
+            return;
+        }
+
         // ── SIGABRT BOOT GRACE PERIOD ────────────────────────────────────────
         // During the first ~5s, Frida's gadget calls abort() which is expected.
         // Don't intercept it — let the old handler deal with it.
@@ -530,6 +622,12 @@ namespace crash_handler
         sigaction(SIGABRT, &sa, &s_old_sigabrt);
         sigaction(SIGBUS, &sa, &s_old_sigbus);
         sigaction(SIGFPE, &sa, &s_old_sigfpe);
+
+        // Save original handlers once for stable fallback chaining.
+        s_orig_sigsegv = s_old_sigsegv;
+        s_orig_sigabrt = s_old_sigabrt;
+        s_orig_sigbus = s_old_sigbus;
+        s_orig_sigfpe = s_old_sigfpe;
     }
 
     void mark_boot_complete()
@@ -554,11 +652,28 @@ namespace crash_handler
         sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
 
-        // Save whatever is currently installed (Oculus/Frida handler) as our chain target
-        sigaction(SIGSEGV, &sa, &s_old_sigsegv);
-        sigaction(SIGABRT, &sa, &s_old_sigabrt);
-        sigaction(SIGBUS, &sa, &s_old_sigbus);
-        sigaction(SIGFPE, &sa, &s_old_sigfpe);
+        // Peek current handlers first.
+        struct sigaction cur_segv, cur_abrt, cur_bus, cur_fpe;
+        sigaction(SIGSEGV, nullptr, &cur_segv);
+        sigaction(SIGABRT, nullptr, &cur_abrt);
+        sigaction(SIGBUS, nullptr, &cur_bus);
+        sigaction(SIGFPE, nullptr, &cur_fpe);
+
+        // Re-install ours.
+        sigaction(SIGSEGV, &sa, nullptr);
+        sigaction(SIGABRT, &sa, nullptr);
+        sigaction(SIGBUS, &sa, nullptr);
+        sigaction(SIGFPE, &sa, nullptr);
+
+        // Update chain targets only if previous handlers were not ourselves.
+        if (cur_segv.sa_sigaction != crash_handler_fn)
+            s_old_sigsegv = cur_segv;
+        if (cur_abrt.sa_sigaction != crash_handler_fn)
+            s_old_sigabrt = cur_abrt;
+        if (cur_bus.sa_sigaction != crash_handler_fn)
+            s_old_sigbus = cur_bus;
+        if (cur_fpe.sa_sigaction != crash_handler_fn)
+            s_old_sigfpe = cur_fpe;
 
         logger::log_info("CRASH", "Signal handler re-installed (protecting against runtime handler replacement)");
     }
