@@ -79,7 +79,7 @@ namespace pak_mounter
                 fclose(f);
                 if (n > 0 && buf[0] != '\0')
                 {
-                    return std::string("/storage/emulated/0/Android/data/") + buf + "/files/paks";
+                    return std::string("/storage/emulated/0/Android/data/") + buf + "/modloader/paks";
                 }
             }
             // Absolute last resort — cannot determine package. This path won't
@@ -88,7 +88,7 @@ namespace pak_mounter
                                 "[PAK] CRITICAL: Cannot determine package name for PAK path!");
             return "";
         }
-        return "/storage/emulated/0/Android/data/" + pkg + "/files/paks";
+        return "/storage/emulated/0/Android/data/" + pkg + "/modloader/paks";
     }
 
     static std::string s_early_paks_path;
