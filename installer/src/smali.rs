@@ -347,7 +347,7 @@ pub fn fix_manifest(decompiled: &Path) -> Result<()> {
     let content = std::fs::read_to_string(&manifest)?;
 
     let mut new_content = content.clone();
-    let mut changes = Vec::new();
+    let mut changes: Vec<String> = Vec::new();
 
     // ── extractNativeLibs="true" — required for native .so loading ──
     if new_content.contains("android:extractNativeLibs=\"false\"") {
@@ -355,13 +355,13 @@ pub fn fix_manifest(decompiled: &Path) -> Result<()> {
             "android:extractNativeLibs=\"false\"",
             "android:extractNativeLibs=\"true\"",
         );
-        changes.push("extractNativeLibs → true");
+        changes.push("extractNativeLibs → true".into());
     } else if !new_content.contains("android:extractNativeLibs") {
         new_content = new_content.replace(
             "<application ",
             "<application android:extractNativeLibs=\"true\" ",
         );
-        changes.push("added extractNativeLibs=\"true\"");
+        changes.push("added extractNativeLibs=\"true\"".into());
     }
 
     // ── debuggable="true" — enables ADB debugging, logcat, etc. ──
@@ -370,13 +370,13 @@ pub fn fix_manifest(decompiled: &Path) -> Result<()> {
             "android:debuggable=\"false\"",
             "android:debuggable=\"true\"",
         );
-        changes.push("debuggable → true");
+        changes.push("debuggable → true".into());
     } else if !new_content.contains("android:debuggable") {
         new_content = new_content.replace(
             "<application ",
             "<application android:debuggable=\"true\" ",
         );
-        changes.push("added debuggable=\"true\"");
+        changes.push("added debuggable=\"true\"".into());
     }
 
     // ── allowBackup="true" — enables ADB backup, data persistence ──
@@ -385,13 +385,54 @@ pub fn fix_manifest(decompiled: &Path) -> Result<()> {
             "android:allowBackup=\"false\"",
             "android:allowBackup=\"true\"",
         );
-        changes.push("allowBackup → true");
+        changes.push("allowBackup → true".into());
     } else if !new_content.contains("android:allowBackup") {
         new_content = new_content.replace(
             "<application ",
             "<application android:allowBackup=\"true\" ",
         );
-        changes.push("added allowBackup=\"true\"");
+        changes.push("added allowBackup=\"true\"".into());
+    }
+
+    // ── requestLegacyExternalStorage="true" — Android 10 scoped storage bypass ──
+    if !new_content.contains("android:requestLegacyExternalStorage") {
+        new_content = new_content.replace(
+            "<application ",
+            "<application android:requestLegacyExternalStorage=\"true\" ",
+        );
+        changes.push("added requestLegacyExternalStorage=\"true\"".into());
+    } else if new_content.contains("android:requestLegacyExternalStorage=\"false\"") {
+        new_content = new_content.replace(
+            "android:requestLegacyExternalStorage=\"false\"",
+            "android:requestLegacyExternalStorage=\"true\"",
+        );
+        changes.push("requestLegacyExternalStorage → true".into());
+    }
+
+    // ── preserveLegacyExternalStorage="true" — Android 11+ keeps legacy mode on upgrade ──
+    if !new_content.contains("android:preserveLegacyExternalStorage") {
+        new_content = new_content.replace(
+            "<application ",
+            "<application android:preserveLegacyExternalStorage=\"true\" ",
+        );
+        changes.push("added preserveLegacyExternalStorage=\"true\"".into());
+    }
+
+    // ── Storage permissions — ensure all three are present ──
+    let required_perms = [
+        ("android.permission.READ_EXTERNAL_STORAGE", "READ_EXTERNAL_STORAGE"),
+        ("android.permission.WRITE_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"),
+        ("android.permission.MANAGE_EXTERNAL_STORAGE", "MANAGE_EXTERNAL_STORAGE"),
+    ];
+    for (perm, label) in &required_perms {
+        if !new_content.contains(perm) {
+            // Insert before </manifest>
+            new_content = new_content.replace(
+                "</manifest>",
+                &format!("    <uses-permission android:name=\"{}\"/>\n</manifest>", perm),
+            );
+            changes.push(format!("added {}", label));
+        }
     }
 
     if new_content != content {

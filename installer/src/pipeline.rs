@@ -192,8 +192,51 @@ pub fn install(
     // Now propagate any install failure
     install_result?;
 
-    report(10, "Finalizing...");
+    report(10, "Finalizing — setting up directories & permissions...");
+    setup_game_dirs(serial, game)?;
 
     log::info!("✅ {} modloader installed successfully!", game.name);
+    Ok(())
+}
+
+/// Post-install: grant runtime permissions only.
+///
+/// CRITICAL: Do NOT create directories under /sdcard/Android/data/<pkg>/ via
+/// adb shell. On Android 11+, this path is scoped storage — only the app
+/// itself can create files/dirs there. Creating them as the shell user (UID 2000)
+/// corrupts the FUSE permission layer, breaks MTP (Windows file explorer shows
+/// infinite loading), and makes files undeletable.
+///
+/// The modloader (running as the app) creates mods/ and paks/ directories
+/// at startup via paths::ensure_dir(). Let it do its job.
+fn setup_game_dirs(serial: &str, game: &game_db::GameProfile) -> Result<()> {
+    let pkg = game.package;
+
+    // Grant runtime storage permissions via Android's permission manager
+    let perms = [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.MANAGE_EXTERNAL_STORAGE",
+    ];
+    for perm in &perms {
+        adb::shell(serial, &format!("pm grant {} {} 2>/dev/null", pkg, perm))?;
+    }
+
+    // Enable "All files access" for Android 11+
+    adb::shell(serial, &format!(
+        "appops set {} MANAGE_EXTERNAL_STORAGE allow 2>/dev/null", pkg
+    ))?;
+
+    // Clean up damage from previous installer versions that ran chmod/chown
+    // on /sdcard/ paths. If .modloader_bak dirs are left over, remove them.
+    let cleanup_paths = [
+        format!("/sdcard/Android/data/{}.modloader_bak", pkg),
+        format!("/sdcard/Android/obb/{}.modloader_bak", pkg),
+    ];
+    for path in &cleanup_paths {
+        adb::shell(serial, &format!("rm -rf '{}' 2>/dev/null", path))?;
+    }
+
+    log::info!("Runtime permissions granted (dirs will be created by modloader on first launch)");
     Ok(())
 }
