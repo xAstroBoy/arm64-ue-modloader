@@ -27,7 +27,6 @@ obj.PropertyName = value          -- dynamic __newindex (same as Set)
 
 ### 2. Call() WITH TABLE ARGS FOR STRUCT PARAMS NOW WORKS
 `obj:Call("SetDrawSize", {X=500, Y=2000})` **now correctly fills struct fields via reflection**.
-The modloader's `Call()` serializes Lua tables into UE4 struct parameters by walking the struct's FProperty list.
 
 ```lua
 -- ✅ WORKS: table → struct for Call() params
@@ -74,85 +73,41 @@ tostring(ds)        -- "UStruct(IntPoint: X=500, Y=2000)"
 
 ### 4. ENUM API — Named Constants + Memory-Edit UEnum
 The modloader exposes ALL game enums via the `Enums` global (lazy-loaded from reflection).
-You can also **memory-edit** UEnum objects to append custom values.
 
 ```lua
--- ✅ Named constants via lazy Enums table (auto-populated from UE4 reflection)
+-- ✅ Named constants via lazy Enums table
 Enums.DebugMenuType         -- {NewEnumerator5=0, NewEnumerator0=1, ...}
 Enums.ECollisionChannel     -- {ECC_WorldStatic=0, ...}
 
 -- ✅ Lookup functions
-local ue = FindEnum("DebugMenuType")           -- returns UEnum* lightuserdata
-local t  = GetEnumTable("DebugMenuType")       -- returns {Name=Value, ...} table
-local names = GetEnumNames()                   -- returns {"DebugMenuType", "ECollisionChannel", ...}
+local ue = FindEnum("DebugMenuType")
+local t  = GetEnumTable("DebugMenuType")
+local names = GetEnumNames()
 
 -- ✅ MEMORY-EDIT: Append a new value to the live UEnum TArray
--- This edits the actual UEnum object in memory (data ptr, count, capacity).
--- Creates a real FName via FName::Init and writes it as a TPair<FName,int64>.
 AppendEnumValue("DebugMenuType", "ModsPage", 99)   -- returns true/false
 
 -- After appending, Enums.DebugMenuType auto-refreshes:
 Enums.DebugMenuType.ModsPage  -- 99
-
--- ⚠️ IMPORTANT: Appending to UEnum updates REFLECTION METADATA only.
--- It does NOT create new Blueprint logic. The game's switch/branch per
--- enum value is compiled. New values need explicit handling in hook code.
--- Example: DebugMenuAPI hooks NewMenu() and handles AM=99 itself.
-
--- ✅ Works with UEnumMethods too:
-UEnumMethods.GetNameByValue(ue, 99)  -- "ModsPage" (after append)
-UEnumMethods.ForEachName(ue, function(name, value) ... end)
 ```
 
 ### 5. WIDGET CREATION — CreateWidget() Factory
-`CreateWidget(className)` creates a proper UMG widget via `WidgetBlueprintLibrary::Create`.
-This handles Blueprint widget initialization, widget trees, and Slate setup properly.
-
 ```lua
--- ✅ Create any UserWidget subclass (Blueprint or native)
 local optWidget = CreateWidget("DebugOptionWidget_C")
-local textBlock = CreateWidget("TextBlock")
-local vbox      = CreateWidget("VerticalBox")
-local img       = CreateWidget("Image")
-
--- ✅ With owning player (optional)
 local pc = FindFirstOf("PlayerController")
 local w  = CreateWidget("DebugOptionWidget_C", pc)
-
--- ✅ Add widgets to containers via reflection
-local parent = someVerticalBox  -- any PanelWidget
 parent:Call("AddChild", optWidget)
-
--- ✅ Works with DebugVBoxList_C for debug menu:
-local dm  = FindFirstOf("DebugMenu_C")
-local pw  = dm:Get("ParentWidget")
-local vbl = pw:Get("DebugVBoxList")
-local pvb = vbl:Get("ParentVBox")     -- the actual VerticalBox
-pvb:Call("AddChildToVerticalBox", optWidget) -- returns VerticalBoxSlot
 ```
 
 ### 6. FText PROPERTIES — Full Read/Write/Call Support
-FText properties (like `TextBlock.Text`) are now fully supported.
-Reading returns a Lua string, writing accepts a Lua string.
-
 ```lua
--- ✅ Read FText property → returns Lua string
-local text = textBlock:Get("Text")     -- "Hello World"
-
--- ✅ Write FText property from string
+local text = textBlock:Get("Text")     -- returns Lua string
 textBlock:Set("Text", "New Text")
-
--- ✅ Pass FText as Call() parameter
-textBlock:Call("SetText", "My Text")   -- FText param auto-constructed
-
--- ✅ Works with DebugOptionWidget_C text fields:
-local opt = CreateWidget("DebugOptionWidget_C")
-opt:Set("OptionName", "My Option")     -- FString property
-opt:Call("Setup")                      -- Updates visual text from OptionName
+textBlock:Call("SetText", "My Text")
 ```
 
 ### 7. ALWAYS USE SEPARATE pcall BLOCKS
-Never put multiple critical operations in one pcall. If one fails, everything after it is skipped.
+Never put multiple critical operations in one pcall.
 
 ```lua
 -- WRONG:
@@ -176,74 +131,120 @@ Post-hooks STILL fire even when blocked.
 ### 10. TEST VIA BRIDGE BEFORE DEPLOYING
 **MANDATORY: Always test new API calls, hooks, and game state queries via the ADB bridge BEFORE deploying mod code.**
 
-#### Bridge Connection
 ```python
 import socket, json
 
-def bridge_exec(code):
-    """Execute Lua on the running game via bridge and return result."""
-    s = socket.socket()
-    s.settimeout(5)
-    s.connect(('127.0.0.1', 19420))
-    s.sendall(json.dumps({'cmd': 'exec_lua', 'code': code}).encode() + b'\n')
-    data = s.recv(65536).decode()
-    s.close()
-    return json.loads(data)
-```
-
-#### What to Test
-1. **Before writing any hook**: Verify the UFunction exists
-   ```python
-   bridge_exec('local obj = FindFirstOf("ClassName"); return obj ~= nil')
-   ```
-2. **Before using Get/Set**: Verify the property exists and returns expected type
-   ```python
-   bridge_exec('local o = FindFirstOf("DebugMenu_C"); return tostring(o:Get("ActiveMenu"))')
-   ```
-3. **Before using Call**: Verify the UFunction is callable
-   ```python
-   bridge_exec('local dm = FindFirstOf("DebugMenu_C"); dm:Call("CreateActiveOption", "Test"); return "ok"')
-   ```
-4. **After deploying**: Verify hooks fired and state is correct
-   ```python
-   bridge_exec('return SharedAPI and SharedAPI.DebugMenu and SharedAPI.DebugMenu.VERSION or "nil"')
-   ```
-
-#### Bridge Commands (built into modloader)
-```bash
-python tools\deploy.py console
-> ping                          # Check bridge is alive
-> exec_lua <lua code>           # Execute arbitrary Lua
-> list_mods                     # List loaded mods
-> debugmenu_status              # DebugMenuAPI status
-> debugmenu_pages               # Dump all registered pages + items
-> debugmenu_open                # Open Mods page directly
-> debugmenu_toggle {"mod":"X"}  # Toggle a specific mod
-```
-
-#### Quick Python Test Script Pattern
-Save as `_test.py` in project root, run with `python _test.py`:
-```python
-import socket, json
-
-def send(code):
+def send(cmd):
     s = socket.socket(); s.settimeout(5)
     s.connect(('127.0.0.1', 19420))
-    s.sendall(json.dumps({'cmd': 'exec_lua', 'code': code}).encode() + b'\n')
-    r = json.loads(s.recv(65536).decode()); s.close()
-    return r
+    s.sendall(json.dumps({'cmd': 'exec_lua', 'code': cmd}).encode() + b'\n')
+    return json.loads(s.recv(8192).decode())
 
-# Test whatever you need:
-print(send('local dm = FindFirstOf("DebugMenu_C"); return tostring(dm:Get("ActiveMenu"))'))
+result = send('local dm = FindFirstOf("DebugMenu_C"); return tostring(dm:Get("ActiveMenu"))')
+print(result)
 ```
 
-⚠️ **NEVER deploy untested hooks or API calls.** If you can't test via bridge first (e.g., game not running), wrap ALL new code in pcall blocks.
+```bash
+python tools\ue_tool.py console
+> ping
+> exec_lua local dm = FindFirstOf("DebugMenu_C"); return dm:GetName()
+> list_mods
+```
 
 ### 11. ANALYZE BEFORE CODING
 Before writing or modifying any debug menu code, read and understand:
 - The SDK class dump for every class involved (in `Current Modloader SDK/Classes/`)
 - The deep API analysis (in `docs/DEBUG_MENU_API_ANALYSIS.md`)
 - The existing mod code and what it already does
+
+---
+
+## ⛔ CRASH DIAGNOSIS — MANDATORY RULES (NEVER SKIP)
+
+### 12. NEVER DECLARE A CRASH FIXED WITHOUT FRESH EVIDENCE
+
+**You are NOT allowed to say "fixed", "resolved", "should work now", or "no crash" unless ALL of the following are true:**
+
+1. ✅ A fresh `diagnose` was run AFTER the last deploy (DONT RUN IF YOU USED `monitor`)
+2. ✅ The crashlog timestamp was checked — it must be NEWER than the last deploy time
+3. ✅ The full log was read — not searched, not grepped, not summarized
+4. ✅ The game PID is currently running OR you confirmed it exited cleanly
+5. ✅ No new tombstones were found
+
+**If you have not done all five, say "I don't have enough evidence — run `python tools\ue_tool.py diagnose` if You haven't used `monitor`"**
+
+### 13. ALWAYS CHECK LOG TIMESTAMPS BEFORE DRAWING ANY CONCLUSION
+
+The `diagnose` and `crashlog` commands print a timestamp header for every log file:
+```
+──────────────────────────────────────────────────────────────
+  modloader_crash.log
+  local  : C:\...\logs\modloader_crash.log  (4,821 bytes)
+  pulled : 2025-01-15 14:32:07  (3m 12s ago)
+  device : 2025-01-15 14:28:44  (6m 35s ago)
+  ⚠  LOG IS 6m 35s OLD — may not reflect the current session
+──────────────────────────────────────────────────────────────
+```
+
+**Rules:**
+- If the crashlog is older than the last deploy → it is **stale**. Do not use it as evidence of anything.
+- If the crashlog mtime predates the current session → it may be from a previous crash. Do not declare the current build clean.
+- If the crashlog is missing entirely → that is **one** data point, not proof of no crash. The game may not have reached the point where it writes the crash log.
+- An empty crashlog + no tombstones + PID is alive = actually clean session. This is the only safe conclusion.
+
+### 14. READ THE ENTIRE LOG FILE — NEVER GREP OR SUMMARIZE
+
+**NEVER:**
+- Search for individual lines or patterns (`grep "error"`, `grep "crash"`)
+- Look only at the first N lines
+- Look only at the last N lines
+- Summarize what you "expect" the log to say
+- Skip reading a log because "it should be fine"
+
+**ALWAYS:**
+- Read and process the **entire** log file content, beginning to end
+- The `diagnose` command prints the full content — read all of it
+- If the log is very long, that is still not a reason to skim it
+- Crashes often appear mid-log, not just at the end
+- Warning signs appear before the fatal line — you need both
+
+### 15. CRASH DIAGNOSIS WORKFLOW — FOLLOW THIS EXACTLY
+
+When investigating a crash or suspected crash:
+
+```bash
+# Step 1: Pull everything fresh
+python tools\ue_tool.py diagnose
+
+# Step 2: Read the FULL output — every line matters
+# The diagnose command pulls tombstones, crashlog, and main log
+# and prints timestamps for all of them
+
+# Step 3: Check if game is running
+python tools\ue_tool.py diagnose
+# Output includes: "✓ com.Armature.VR4 is RUNNING (pid=XXXX)"
+# or              "✗ com.Armature.VR4 is NOT RUNNING"
+
+# Step 4: If you see a tombstone — it IS a crash. Full stop.
+# Tombstones = native crash = the game died. Do not rationalize.
+
+# Step 5: If crashlog exists and timestamp is recent — the mod crashed.
+# Read the full crashlog content before forming any theory.
+
+# Step 6: If game is NOT running and no logs — something killed it.
+# Run monitor to catch the next crash live:
+python tools\ue_tool.py monitor
+```
+
+### 16. IF THE GAME IS VISIBLY CRASHING — TRUST THE EVIDENCE
+
+If the user says "the game is crashing" or "it's crashing" — **believe them**.
+- Do NOT say "the code looks correct"
+- Do NOT say "it should be fixed now"
+- Do NOT ask them to "try again and see"
+- DO run `diagnose`, read the full output, find the actual cause
+
+The user can see the game. You cannot. Their observation overrides any code analysis.
 
 ---
 
@@ -269,6 +270,7 @@ Before writing or modifying any debug menu code, read and understand:
 | `tools/bindump/` | **Rust binary analysis tool** (BDMP database) |
 | `docs/` | Documentation (LUA_API.md, this file) |
 | `logs/` | Tombstones and game logs |
+| `logs/sessions/` | Per-session logcat + tombstone captures |
 | `Pinball FX VR Patches/` | PFX VR binary analysis dumps + BDMP database |
 
 ### Device & Connection
@@ -290,36 +292,18 @@ tools\bindump\target\release\bindump.exe
 ```
 
 ### BDMP Database
-The tool uses a merged IDA+BINJA binary database for cross-view analysis:
 ```
 "Pinball FX VR Patches\bindump.bdmp"    # 7.28 GB, 263K functions, 245K cross-matched
 ```
 
 ### Common Commands
 ```bash
-# Search for strings in the binary
 bindump.exe strings "GEngine" --db "Pinball FX VR Patches\bindump.bdmp"
-
-# Find string cross-references (which functions reference a string)
 bindump.exe strxrefs "Create GEngine" --db "Pinball FX VR Patches\bindump.bdmp"
-
-# Get function details (decompilation, assembly, xrefs)
 bindump.exe func 0x3FFF768 --extract --db "Pinball FX VR Patches\bindump.bdmp"
-
-# Grep through decompiled C or assembly for patterns
 bindump.exe grep "GEngine" "c_binja" --db "Pinball FX VR Patches\bindump.bdmp"
-bindump.exe grep "qword_73CF" "asm_ida" --db "Pinball FX VR Patches\bindump.bdmp"
-
-# Search for function by name/pattern
 bindump.exe search "ProcessEvent" --db "Pinball FX VR Patches\bindump.bdmp"
-
-# List exports from the binary
 bindump.exe exports "." --db "Pinball FX VR Patches\bindump.bdmp"
-
-# Get database info
-bindump.exe info --db "Pinball FX VR Patches\bindump.bdmp"
-
-# View cross-references for a function
 bindump.exe xrefs 0x16774DC --db "Pinball FX VR Patches\bindump.bdmp"
 ```
 
@@ -346,63 +330,51 @@ cd c:\Users\xAstroBoy\Desktop\re4\modloader
 .\build.bat
 ```
 
-### Deploy Commands (tools/deploy.py)
+### Deploy Commands (tools/ue_tool.py — ALL-IN-ONE)
 ```bash
 # RE4 VR (default game):
-python tools\deploy.py mods              # Push all Lua mods
-python tools\deploy.py modloader         # Push libmodloader.so
-python tools\deploy.py all               # Push modloader + all mods
-python tools\deploy.py log               # Pull UEModLoader.log
-python tools\deploy.py tombstones        # Pull & purge crash tombstones
-python tools\deploy.py launch            # Kill + relaunch game
-python tools\deploy.py console           # Interactive bridge console
+python tools\ue_tool.py mods              # Push all Lua mods
+python tools\ue_tool.py modloader         # Push libmodloader.so
+python tools\ue_tool.py all               # Push modloader + all mods
+python tools\ue_tool.py log               # Pull UEModLoader.log (FULL, with timestamp)
+python tools\ue_tool.py crashlog          # Pull modloader_crash.log (FULL, with timestamp)
+python tools\ue_tool.py tombstones        # Pull & purge crash tombstones (FULL content)
+python tools\ue_tool.py diagnose          # ← USE THIS FOR CRASH INVESTIGATION
+python tools\ue_tool.py launch            # Kill + relaunch game
+python tools\ue_tool.py monitor           # Live session monitor (logcat + tombstones)
+python tools\ue_tool.py console           # Interactive bridge console
 
 # Pinball FX VR (use --game pfxvr):
-python tools\deploy.py --game pfxvr mods
-python tools\deploy.py --game pfxvr all
-python tools\deploy.py --game pfxvr log
-python tools\deploy.py --game pfxvr launch
-python tools\deploy.py --game pfxvr console
-python tools\deploy.py --game pfxvr sdk    # Pull SDK dump from device
+python tools\ue_tool.py --game pfxvr mods
+python tools\ue_tool.py --game pfxvr diagnose
+python tools\ue_tool.py --game pfxvr monitor
 ```
 
 ### Common Workflow
 ```bash
-# Mod-only change (no C++ rebuild needed):
-python tools\deploy.py mods
-python tools\deploy.py launch
+# Mod-only change:
+python tools\ue_tool.py mods
+python tools\ue_tool.py launch
 
 # After C++ modloader changes:
 cd modloader && .\build.bat
-python tools\deploy.py all
-python tools\deploy.py launch
+python tools\ue_tool.py all
+python tools\ue_tool.py launch
 
-# Debug after crash:
-python tools\deploy.py tombstones
-python tools\deploy.py log
+# Investigating a crash (MANDATORY SEQUENCE):
+python tools\ue_tool.py diagnose          # pulls + timestamps + FULL content
+# Read ALL output. Check timestamps. Find the actual error.
+
+# Watch live for next crash:
+python tools\ue_tool.py monitor
 ```
 
 ### Bridge Console (Live Testing)
 ```bash
-python tools\deploy.py console
+python tools\ue_tool.py console
 > ping
 > exec_lua local dm = FindFirstOf("DebugMenu_C"); return dm:GetName()
-> debugmenu_status
 > list_mods
-```
-
-### Python Test Script Pattern
-```python
-import socket, json
-
-def send(cmd):
-    s = socket.socket(); s.settimeout(5)
-    s.connect(('127.0.0.1', 19420))
-    s.sendall(json.dumps({'cmd': 'exec_lua', 'code': cmd}).encode() + b'\n')
-    return json.loads(s.recv(8192).decode())
-
-result = send('local dm = FindFirstOf("DebugMenu_C"); return tostring(dm:Get("ActiveMenu"))')
-print(result)
 ```
 
 ---
@@ -426,26 +398,308 @@ print(result)
 
 ### Verified Working API Calls (Bridge-Tested)
 ```lua
--- These ALL work correctly:
-vbl:Set("MaxVisible", 50)              -- ✅ Confirmed 5→50
-vbl:Set("Selection", 3)                -- ✅ Direct property write
-vbl:Set("FirstVisible", 0)             -- ✅ Direct property write
-dm:Set("CurrentIndex", 3)              -- ✅ Direct property write
-dm:Call("UpdateOptionHighlight")        -- ✅ Visual highlight updates
-vbl:Call("SelectionIncremented")        -- ✅ Selection 0→1
-vbl:Call("SelectionDecremented")        -- ✅ Selection decrements
-vbl:Call("UpdateListView")              -- ✅ Refreshes visibility/scrolling
-dm:Call("ClearWidgets")                 -- ✅ Clears all option widgets
-dm:Call("CreateActiveOption", "Test")   -- ✅ Creates new option widget
-```
-
-### NOW-FIXED API Calls (previously broken, now working)
-```lua
--- These ALL work now with LuaUStruct support:
-widget:Call("SetDrawSize", {X=500, Y=2000})  -- ✅ Table → struct via reflection
-widget:Set("DrawSize", {X=500, Y=2000})      -- ✅ Table → struct via reflection
+vbl:Set("MaxVisible", 50)
+vbl:Set("Selection", 3)
+vbl:Set("FirstVisible", 0)
+dm:Set("CurrentIndex", 3)
+dm:Call("UpdateOptionHighlight")
+vbl:Call("SelectionIncremented")
+vbl:Call("SelectionDecremented")
+vbl:Call("UpdateListView")
+dm:Call("ClearWidgets")
+dm:Call("CreateActiveOption", "Test")
+widget:Call("SetDrawSize", {X=500, Y=2000})
+widget:Set("DrawSize", {X=500, Y=2000})
 local ds = widget:Get("DrawSize")
-ds.X                                          -- ✅ LuaUStruct __index
-ds.Y                                          -- ✅ LuaUStruct __index
-ds.X = 500                                    -- ✅ LuaUStruct __newindex (writes to live UObject memory)
+ds.X; ds.Y; ds.X = 500
 ```
+### 17. DO NOT CREATE OR USE PYTHON VIRTUAL ENVIRONMENTS
+
+**NEVER create, suggest, or require a Python virtual environment (`venv`, `virtualenv`, `pipenv`, `poetry`, etc.).**
+
+#### ❌ FORBIDDEN:
+```bash
+python -m venv venv
+python -m venv .venv
+source venv/bin/activate
+venv\Scripts\activate
+pip install -r requirements.txt
+
+❌ ALSO FORBIDDEN:
+Suggesting “use a virtual environment”
+Adding requirements.txt for the purpose of isolation
+Any workflow that introduces environment setup overhead
+
+✅ REQUIRED:
+Use the system Python environment only
+Assume all required tools are already available (adb, ssh, sftp, standard library)
+If a dependency is missing, provide a direct install command only, no environment setup
+RATIONALE:
+This project is device-debugging focused, not package-distribution
+Virtual environments add unnecessary friction and time waste
+All tooling must be immediately runnable with zero setup
+
+### 18. PERFORMANCE PROFILING — MANDATORY LAG DETECTION & ANALYSIS
+
+**YOU MUST actively detect, analyze, and mitigate performance issues (lag, stutter, frame drops) in the modloader and Lua mods.**
+
+This is not optional. Performance regressions are treated as **critical bugs**.
+
+---
+
+### 🔍 REQUIRED CAPABILITIES
+
+#### 1. TRACK RUNTIME EXECUTION COST
+You MUST measure:
+- Hook execution time
+- Lua function execution time
+- Per-frame workload (especially tick/update hooks)
+
+#### 2. IDENTIFY LAG SOURCES
+When lag is reported or suspected, you MUST:
+- Determine which hook, mod, or function is slow
+- Measure execution time (not guess)
+- Identify frequency (per-frame vs occasional)
+
+#### 3. NO GUESSING — ONLY MEASURED DATA
+❌ Forbidden:
+- “This might be slow”
+- “This could cause lag”
+- Blind optimizations without evidence
+
+✅ Required:
+- “Hook X takes 12ms per call (called every frame → 720ms/sec)”
+- “Function Y allocates tables repeatedly causing GC spikes”
+
+---
+
+### 🧪 TESTING WORKFLOW (MANDATORY)
+
+Before declaring any performance improvement:
+
+1. Run the game with monitor:
+```bash
+python tools\ue_tool.py monitor
+
+Capture session logs
+Use bridge to benchmark:
+local t0 = os.clock()
+-- code to test
+local dt = (os.clock() - t0) * 1000
+print("took", dt, "ms")
+Compare BEFORE vs AFTER
+⚠️ COMMON LAG SOURCES (YOU MUST CHECK THESE)
+❌ Per-frame heavy work
+Hooks on Tick / Update / Input events doing expensive logic
+Rebuilding UI every frame
+Calling FindFirstOf() repeatedly
+❌ Reflection spam
+Excessive Get() / Set() calls in loops
+Re-fetching the same UObject every frame instead of caching
+❌ Allocation pressure
+Creating tables every frame ({} inside loops)
+Rebuilding structs instead of mutating existing ones
+❌ Logging spam
+Printing every frame
+Excessive debug output flooding logcat
+❌ Widget misuse
+Creating widgets repeatedly instead of reusing
+Calling UpdateListView too often
+🛠 REQUIRED OPTIMIZATION STRATEGIES
+1. CACHE EVERYTHING POSSIBLE
+-- BAD:
+local dm = FindFirstOf("DebugMenu_C") -- every frame
+
+-- GOOD:
+if not dm then dm = FindFirstOf("DebugMenu_C") end
+2. AVOID PER-FRAME ALLOCATIONS
+-- BAD:
+obj:Call("SetDrawSize", {X=500, Y=2000}) -- alloc each call
+
+-- GOOD:
+if not cachedSize then cachedSize = {X=500, Y=2000} end
+obj:Call("SetDrawSize", cachedSize)
+3. THROTTLE EXECUTION
+local last = 0
+Hook("Tick", function()
+    local now = os.clock()
+    if now - last < 0.1 then return end -- 10Hz instead of 90Hz
+    last = now
+end)
+4. MINIMIZE REFLECTION CALLS
+-- BAD:
+for i=1,100 do
+    obj:Get("Value")
+end
+
+-- GOOD:
+local v = obj:Get("Value")
+for i=1,100 do
+    -- use v
+end
+
+📊 REQUIRED OUTPUT WHEN ANALYZING LAG
+
+You MUST report findings like this:
+
+Lag Analysis:
+- Hook: BndEvt__DebugInputScrollDown
+- Frequency: ~90 calls/sec
+- Avg time: 3.2 ms
+- Total cost: ~288 ms/sec → CRITICAL
+
+Root cause:
+- Rebuilding widget list every input tick
+
+Fix:
+- Cache widgets
+- Only update on index change
+
+Result:
+- New avg time: 0.2 ms
+- Total cost: ~18 ms/sec
+⛔ DO NOT DECLARE PERFORMANCE FIXES WITHOUT EVIDENCE
+
+Same standard as crash diagnosis:
+
+You are NOT allowed to say:
+
+“optimized”
+“should be faster”
+“lag fixed”
+
+UNLESS:
+
+You measured execution time BEFORE
+You measured execution time AFTER
+You compared both
+
+Otherwise say:
+
+“No measured performance data — run benchmark via bridge or monitor”
+
+🚀 OPTIONAL (HIGHLY RECOMMENDED)
+
+If possible, integrate:
+
+Per-hook timing instrumentation in C++ modloader
+Aggregated stats exposed via bridge (get_stats)
+Top slowest hooks/functions list
+FINAL RULE
+
+If the game stutters, freezes, or drops frames — THERE IS A MEASURABLE CAUSE.
+Your job is to find it, quantify it, and eliminate it, not guess.
+
+
+## 19. POWERHELL EXECUTION — STRICT, MINIMAL, NO BULLSHIT
+
+**ALL PowerShell commands MUST be simple, deterministic, and free of unnecessary arguments, wrappers, or environment hacks.**
+
+If a command errors due to complexity, that is considered a failure of implementation.
+
+---
+
+### ⛔ ABSOLUTE RULES
+
+#### 1. NO VENV USAGE — EVER
+- DO NOT reference `.venv`
+- DO NOT use custom Python paths inside virtual environments
+
+```powershell
+# ❌ FORBIDDEN
+$py = ".venv/Scripts/python.exe"
+
+# ✅ REQUIRED
+$py = "python"
+2. NO UNNECESSARY ENV SETUP
+DO NOT set encoding unless it is PROVEN required
+DO NOT use chcp 65001 unless debugging encoding issues
+DO NOT set $env:PYTHONIOENCODING
+# ❌ FORBIDDEN
+chcp 65001
+$env:PYTHONIOENCODING='utf-8'
+
+# ✅ REQUIRED
+# nothing
+3. NO BACKGROUND JOB COMPLEXITY UNLESS ABSOLUTELY REQUIRED
+
+PowerShell jobs (Start-Job) introduce:
+
+race conditions
+silent failures
+debugging complexity
+
+Use them ONLY if there is NO alternative.
+
+4. NO RESERVED VARIABLE COLLISIONS
+
+PowerShell has built-in variables:
+
+$PID
+$PSHOME
+$HOST
+
+DO NOT reuse them.
+
+# ❌ FORBIDDEN
+$pid = ...
+
+# ✅ REQUIRED
+$procId = ...
+5. KEEP COMMANDS LINEAR AND DEBUGGABLE
+
+Split logic into clear steps. No mega one-liners.
+
+# ❌ FORBIDDEN (your current script style)
+everything chained in one unreadable command
+
+# ✅ REQUIRED
+Set-Location "C:\path"
+
+python tools\ue_tool.py launch
+
+Start-Sleep 5
+
+python tools\ue_tool.py monitor --once
+
+python tools\ue_tool.py diagnose
+✅ REQUIRED WORKFLOW (NO FAILURE MODE)
+SIMPLE, RELIABLE VERSION:
+Set-Location "C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader"
+
+python tools\ue_tool.py launch
+
+Start-Sleep -Seconds 8
+
+python tools\ue_tool.py monitor --once
+
+python tools\ue_tool.py diagnose
+🔥 ZERO-ERROR RULE
+
+If a command:
+
+fails due to encoding
+fails due to env vars
+fails due to Python path
+fails due to PowerShell quirks
+
+REMOVE the complexity — do NOT add more.
+
+🧠 DESIGN PRINCIPLE
+
+If a command cannot be explained in 5 seconds, it is too complex and WILL break.
+
+🚫 FINAL WARNING
+
+Do NOT:
+
+wrap everything in jobs
+dynamically build scripts
+chain 10 operations in one command
+introduce “smart” logic that hides failure
+✅ GOAL
+You run it
+It works
+No hidden state
+No race conditions
+No garbage
