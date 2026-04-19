@@ -93,13 +93,59 @@ local function find_live(...)
 end
 
 -- ============================================================================
--- CONSTANTS
+-- CONSTANTS — dynamic table ID discovery
 -- ============================================================================
-local TABLE_IDS = {
+-- Fallback list (used only if live discovery fails)
+local TABLE_IDS_FALLBACK = {
     91, 90, 92, 153, 160, 158, 181, 167, 177, 170, 156, 197,
     130, 131, 198, 163, 162, 109, 111, 120, 118, 119, 117, 122,
     121, 196, 194, 195, 157, 113, 123, 100, 101, 105, 103, 108
 }
+
+-- Discover all table IDs from the live YUPTableInfoHolder.
+-- Each entry is a PFXVRTableInfo with PitID (int32) = the numeric table ID.
+-- Returns a deduplicated sorted array.
+local function get_all_table_ids()
+    local ids = {}
+    local seen = {}
+    pcall(function()
+        local holder = FindFirstOf("YUPTableInfoHolder")
+        if not holder then return end
+        local tables = holder:Get("m_Tables")
+        if not tables then return end
+        for i = 1, #tables do
+            pcall(function()
+                local entry = tables[i]
+                if not entry then return end
+                local id = nil
+                -- Primary: PitID field
+                pcall(function() id = entry:Get("PitID") end)
+                -- Fallback: GetPITId() function
+                if not id then pcall(function() id = entry:Call("GetPITId") end) end
+                if type(id) == "number" and id > 0 and not seen[id] then
+                    seen[id] = true
+                    ids[#ids + 1] = id
+                end
+            end)
+        end
+    end)
+    if #ids == 0 then
+        Log(TAG .. ": WARN: YUPTableInfoHolder discovery failed — using fallback list")
+        return TABLE_IDS_FALLBACK
+    end
+    table.sort(ids)
+    Log(TAG .. ": Discovered " .. #ids .. " tables from YUPTableInfoHolder")
+    return ids
+end
+
+-- TABLE_IDS is populated lazily on first use
+local _TABLE_IDS_CACHE = nil
+local function TABLE_IDS()
+    if not _TABLE_IDS_CACHE then
+        _TABLE_IDS_CACHE = get_all_table_ids()
+    end
+    return _TABLE_IDS_CACHE
+end
 
 local ENTRY_CLASSES = {
     "PFXCollectibleEntry_Arm",
@@ -600,16 +646,29 @@ end
 local function max_perks()
     local pm = find_live("BP_PerkManager_C", "PFXPerkManager")
     if not pm then add_error("PerkManager NOT FOUND"); return end
+
+    -- Try native cheat first (covers ALL tables + ALL perk types correctly)
+    local cheat_ok = false
+    pcall(function()
+        local cm = find_live("PFXCheatManager")
+        if cm then
+            cm:Call("PFXDebug_TablePerkMaxAll")
+            cheat_ok = true
+            Log(TAG .. ": Perks: PFXDebug_TablePerkMaxAll() called via CheatManager")
+        end
+    end)
+
+    -- Fallback: manual loop — perkType 0-8 (type 0 was previously missed!)
     local ok_count, fail_count = 0, 0
-    for _, tableID in ipairs(TABLE_IDS) do
-        for perkType = 1, 8 do
+    for _, tableID in ipairs(TABLE_IDS()) do
+        for perkType = 0, 8 do          -- was 1,8 — type 0 is valid and was SKIPPED
             local ok = pcall(function() pm:Call("SetPerkLevelOnTable", tableID, perkType, 10, true) end)
             if ok then ok_count = ok_count + 1 else fail_count = fail_count + 1 end
         end
     end
     state.perks = ok_count
     state.perks_fail = fail_count
-    Log(TAG .. ": Perks: " .. ok_count .. " ok, " .. fail_count .. " fail")
+    Log(TAG .. ": Perks: " .. ok_count .. " ok, " .. fail_count .. " fail (cheat=" .. tostring(cheat_ok) .. ")")
 end
 
 -- ============================================================================
@@ -669,8 +728,8 @@ local function max_save_data()
     end)
 
     -- Championship save data — max existing league/match progress in save profile
-    -- NOTE: This only updates EXISTING entries via ForEach.
-    -- NEW entries are created by SetMatchProgress batch in Phase 6b.
+    -- NOTE: This updates EXISTING entries via ForEach.
+    -- Phase 6b re-confirms all entries and sets LastSeenLeagueMapLevel.
     pcall(function()
         local cp = profile.ChampionshipProgress
         pcall(function() cp:CopyFrom({LastSeenTotalTrophyGained = 9999}) end)
@@ -736,8 +795,21 @@ local function max_benefits()
         ::next_benefit::
     end
 
+    -- Force-select all benefits so they show as active in UI
+    local selected = 0
+    pcall(function() chm:Call("ClearSelectedBenefits") end)
+    for i, benefit in ipairs(bl) do
+        if is_live(benefit) then
+            pcall(function()
+                chm:Call("ForceSelectBenefit", benefit)
+                selected = selected + 1
+            end)
+        end
+    end
+    pcall(function() chm:Call("FinalizeBenefitSelection") end)
+
     state.benefits_set = total_added
-    Log(TAG .. ": Benefits: " .. total_added .. " added across " .. #bl .. " types")
+    Log(TAG .. ": Benefits: " .. total_added .. " added, " .. selected .. " selected across " .. #bl .. " types")
 end
 
 -- ============================================================================
@@ -819,13 +891,28 @@ local function sync_championship()
 end
 
 -- ============================================================================
--- PHASE 6b: CHAMPIONSHIP BATCH — SetMatchProgress for ALL matches
--- Uses ChampionshipData → LeagueList → RoundList TMap → MatchList hierarchy.
--- SetMatchProgress(matchID: GameplayTag, progress: int32, score: int64,
---                  higherScoreBetter: bool, saveProfile: bool)
--- Runs synchronously in run_maxall() — no batching needed.
+-- PHASE 6b: CHAMPIONSHIP BATCH — Direct TMap writes only (no ProcessEvent)
+-- SetMatchProgress crashes (fault_addr=0x38) because GameplayTag struct
+-- cannot be serialized for ProcessEvent on this build.  Phase 5 already
+-- writes progress=3 + Score=999999999 on existing save entries via ForEach.
+-- This phase ensures every match from the runtime ChampionshipData also
+-- exists in the save profile TMap, creating missing entries if needed.
 -- ============================================================================
 local function run_championship_batch()
+    -- 1. Get save profile maps
+    local sm = find_live("BP_SaveManager_C", "PFXSaveManager")
+    if not sm then Log(TAG .. ": SaveManager not found for champ batch"); return end
+    local profile = nil
+    pcall(function() profile = sm:Get("m_profile") end)
+    if not profile then Log(TAG .. ": No m_profile for champ batch"); return end
+    local cp = nil
+    pcall(function() cp = profile.ChampionshipProgress end)
+    if not cp then Log(TAG .. ": No ChampionshipProgress in profile"); return end
+    local leagueMap = nil
+    pcall(function() leagueMap = cp.LeagueProgress end)
+    if not leagueMap then Log(TAG .. ": No LeagueProgress TMap"); return end
+
+    -- 2. Get runtime championship data
     local chm = find_live("BP_ChampionshipManager_C", "PFXChampionshipManager")
     if not chm then Log(TAG .. ": CHM not found for batch"); return end
     local cd = nil
@@ -835,12 +922,24 @@ local function run_championship_batch()
     pcall(function() leagues = cd:Get("LeagueList") end)
     if not leagues then Log(TAG .. ": No LeagueList for batch"); return end
 
-    local total = 0
-    local errors = 0
+    -- 3. Walk every league → round → match.
+    --    For each match, call SetMatchProgress via ProcessEvent with Clone'd GameplayTag.
+    local total_set = 0
+    local total_fail = 0
+    local total_leagues = 0
     for li = 1, #leagues do
         local lg = leagues[li]
         if not lg then goto cl end
         pcall(function()
+            total_leagues = total_leagues + 1
+
+            -- Ensure all league entries have LastSeenLeagueMapLevel = 99
+            pcall(function()
+                leagueMap:ForEach(function(lKey, lVal)
+                    pcall(function() lVal.LastSeenLeagueMapLevel = 99 end)
+                end)
+            end)
+
             local rounds = lg:Get("RoundList")
             if not rounds then return end
             rounds:ForEach(function(k, v)
@@ -853,13 +952,15 @@ local function run_championship_batch()
                             if not m then return end
                             local tag = m:Get("ID")
                             if not tag then return end
-                            local ok = pcall(function()
-                                chm:Call("SetMatchProgress", tag, 3, 999999999, true, false)
+                            -- Clone the GameplayTag to get an owning copy for ProcessEvent
+                            local cloned = tag:Clone()
+                            local ok, err = pcall(function()
+                                chm:Call("SetMatchProgress", cloned, 3, 999999999, true, false)
                             end)
                             if ok then
-                                total = total + 1
+                                total_set = total_set + 1
                             else
-                                errors = errors + 1
+                                total_fail = total_fail + 1
                             end
                         end)
                     end
@@ -869,9 +970,10 @@ local function run_championship_batch()
         ::cl::
     end
 
-    state.champ_set = total
-    state.champ_done = total > 0
-    Log(TAG .. ": Championship batch: set " .. total .. " matches, " .. errors .. " errors")
+    state.champ_set = total_set
+    state.champ_done = true
+    Log(TAG .. ": Championship batch: " .. total_set .. " matches set via SetMatchProgress, "
+        .. total_fail .. " failed, " .. total_leagues .. " leagues")
 end
 
 -- ============================================================================
@@ -1086,7 +1188,7 @@ LoopAsync(5000, function()
 
     -- Phase D: Championship batch (runs after trophy verify when game is fully loaded)
     if not state.champ_done then
-        Log(TAG .. ": Phase D: running championship batch (SetMatchProgress for all matches)")
+        Log(TAG .. ": Phase D: running championship batch (direct TMap write + rehash)")
         pcall(run_championship_batch)
         pcall(save_profile)
     end
@@ -1114,7 +1216,7 @@ pcall(function()
             tostring(state.restore_hook), tostring(state.change_hook),
             state.entries_unlocked, state.entries_unlocked + state.entries_unlock_fail,
             state.entries_cm_unlock,
-            state.perks, #TABLE_IDS * 8,
+            state.perks, #TABLE_IDS() * 8,
             state.masteries, state.table_prog,
             state.achievements_save, state.brandnew_cleared,
             state.trophy_seen, state.leagues,
@@ -1183,6 +1285,17 @@ pcall(function()
             phys, withGrab, holo, noActor, #slots, tostring(trophyMapReady))
     end)
 end)
+
+-- ============================================================================
+-- GLOBAL EXPORTS — callable by other mods (e.g. PFX_ModMenu)
+-- ============================================================================
+PFX_Max = nil  -- will be set below
+_G.PFX_Max = {
+    fix_trophies = fix_all_trophies,
+    run          = run_maxall,
+    max_perks    = max_perks,
+}
+Log(TAG .. ": PFX_Max global exported")
 
 Log(TAG .. ": v24 loaded — hooks: holo=" .. tostring(state.holo_hook)
     .. " holoPatch=" .. tostring(state.holo_native_hook)

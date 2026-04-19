@@ -64,4 +64,8 @@ namespace lua_tarray
     // Write a single element to raw memory using an FProperty for type dispatch
     void write_element(void *element_ptr, ue::FProperty *prop, const sol::object &value);
 
+    // Register a buffer as "owned by modloader" so grow_buffer can safely
+    // realloc it. Used when engine takes ownership of a conversion buffer.
+    void mark_owned_external(void *ptr);
+
 } // namespace lua_tarray

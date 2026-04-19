@@ -211,4 +211,7 @@ namespace reflection
     // Get a UObject by its GUObjectArray index (public wrapper)
     ue::UObject *get_object_by_index(int32_t index);
 
+    // Get the serial number for a UObject from GUObjectArray (for TWeakObjectPtr)
+    int32_t get_object_serial_number(int32_t internal_index);
+
 } // namespace reflection

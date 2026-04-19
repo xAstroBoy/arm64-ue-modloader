@@ -986,23 +986,40 @@ namespace lua_bindings
             return sol::nil;
         }
 
-        // 5. Get world context
-        ue::UObject* world = nullptr;
-        if (symbols::GWorld) {
-            world = *reinterpret_cast<ue::UObject**>(symbols::GWorld);
+        // 5. Get owning player (required for blueprint UserWidgets).
+        //    WBL::Create needs a valid APlayerController — UWorld itself does NOT work
+        //    as WorldContextObject because GetWorld() returns null on raw UWorld.
+        ue::UObject* player = nullptr;
+        if (owner_arg && owner_arg->is<lua_uobject::LuaUObject>()) {
+            player = owner_arg->as<lua_uobject::LuaUObject&>().ptr;
         }
-        if (!world) {
-            logger::log_error("LUA", "CreateWidget: no world context (GWorld is null)");
+
+        // Auto-find PlayerController if none provided
+        if (!player) {
+            auto* pc_rc = rebuilder::rebuild("PlayerController");
+            if (pc_rc) {
+                player = pc_rc->get_first_instance();
+            }
+        }
+        // Fallback: try known game-specific controller class names
+        if (!player) {
+            for (const char* ctrl_name : {"BP_PlayerController_C", "VR4PlayerController_BP_C", "PFXPlayerController_C", "PFXPlayerController"}) {
+                auto* rc2 = rebuilder::rebuild(ctrl_name);
+                if (rc2) {
+                    player = rc2->get_first_instance();
+                    if (player) break;
+                }
+            }
+        }
+
+        if (!player) {
+            logger::log_error("LUA", "CreateWidget: no PlayerController found — cannot create '%s'", cls_name_str.c_str());
             return sol::nil;
         }
 
-        // 6. Get owning player (optional)
-        ue::UObject* player = nullptr;
-        if (owner_arg) {
-            if (owner_arg->is<lua_uobject::LuaUObject>()) {
-                player = owner_arg->as<lua_uobject::LuaUObject&>().ptr;
-            }
-        }
+        // WorldContextObject must be the PlayerController (an Actor whose GetWorld() works),
+        // NOT the raw UWorld pointer.
+        ue::UObject* world_ctx = player;
 
         // 7. Set up params buffer and call ProcessEvent
         ue::UFunction* func = static_cast<ue::UFunction*>(rf->raw);
@@ -1014,7 +1031,7 @@ namespace lua_bindings
             uint8_t* p = params_buf.data() + pi.offset;
 
             if (pi.name == "WorldContextObject") {
-                *reinterpret_cast<ue::UObject**>(p) = world;
+                *reinterpret_cast<ue::UObject**>(p) = world_ctx;
             } else if (pi.name == "WidgetType") {
                 *reinterpret_cast<ue::UClass**>(p) = widget_cls;
             } else if (pi.name == "OwningPlayer") {
@@ -1022,14 +1039,16 @@ namespace lua_bindings
             }
         }
 
-        logger::log_info("LUA", "CreateWidget: calling WBL::Create for '%s' (world=%p, player=%p)",
-                          cls_name_str.c_str(), world, player);
+        logger::log_info("LUA", "CreateWidget: calling WBL::Create for '%s' (world_ctx=%p, player=%p)",
+                          cls_name_str.c_str(), world_ctx, player);
         symbols::ProcessEvent(wbl_cdo, func, params_buf.data());
 
         // 8. Extract return value
         if (rf->return_prop && rf->return_prop->raw) {
             const uint8_t* ret_ptr = params_buf.data() + rf->return_offset;
             ue::UObject* created = *reinterpret_cast<ue::UObject* const*>(ret_ptr);
+            logger::log_info("LUA", "CreateWidget: return_offset=%u raw_ptr=%p valid=%d",
+                              (unsigned)rf->return_offset, created, created ? (int)ue::is_valid_ptr(created) : 0);
             if (created && ue::is_valid_ptr(created)) {
                 std::string result_cls = reflection::get_short_name(
                     reinterpret_cast<const ue::UObject*>(ue::uobj_get_class(created)));
@@ -1040,9 +1059,12 @@ namespace lua_bindings
                 wrapped.ptr = created;
                 return sol::make_object(lua, wrapped);
             }
+        } else {
+            logger::log_error("LUA", "CreateWidget: no return_prop found for WBL::Create — parms_size=%u return_offset=%u",
+                               (unsigned)parms_size, (unsigned)rf->return_offset);
         }
 
-        logger::log_error("LUA", "CreateWidget: WBL::Create returned null");
+        logger::log_error("LUA", "CreateWidget: WBL::Create returned null for '%s'", cls_name_str.c_str());
         return sol::nil; });
 
         // ── Class Rebuild API ───────────────────────────────────────────────

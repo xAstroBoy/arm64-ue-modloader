@@ -12,6 +12,7 @@
 #include "modloader/symbols.h"
 #include "modloader/logger.h"
 #include "modloader/types.h"
+#include "modloader/ue_memory.h"
 
 #include <cstring>
 #include <vector>
@@ -27,49 +28,70 @@ namespace lua_tarray
     // Subsequent grows: realloc our buffer (zero leak, fast).
     // ═══════════════════════════════════════════════════════════════════════
     static std::mutex s_owned_mtx;
-    static std::unordered_set<void*> s_owned_buffers;
+    static std::unordered_set<void *> s_owned_buffers;
 
-    static bool is_owned(void* ptr) {
+    static bool is_owned(void *ptr)
+    {
         std::lock_guard<std::mutex> lk(s_owned_mtx);
         return s_owned_buffers.count(ptr) > 0;
     }
-    static void mark_owned(void* ptr) {
+    static void mark_owned(void *ptr)
+    {
         std::lock_guard<std::mutex> lk(s_owned_mtx);
         s_owned_buffers.insert(ptr);
     }
-    static void unmark_owned(void* ptr) {
+    static void unmark_owned(void *ptr)
+    {
         std::lock_guard<std::mutex> lk(s_owned_mtx);
         s_owned_buffers.erase(ptr);
     }
 
-    // Grow a buffer: realloc if ours, malloc+copy+leak if UE's.
+    void mark_owned_external(void *ptr)
+    {
+        if (ptr)
+            mark_owned(ptr);
+    }
+
+    // Grow a buffer: realloc if ours, UE realloc/malloc if UE's.
     // Returns new buffer (already registered as owned). old_data may be freed.
-    static void* grow_buffer(void* old_data, int32_t old_count, int32_t elem_size, int32_t new_max) {
+    static void *grow_buffer(void *old_data, int32_t old_count, int32_t elem_size, int32_t new_max)
+    {
         size_t new_bytes = static_cast<size_t>(new_max) * elem_size;
         size_t old_bytes = static_cast<size_t>(old_count) * elem_size;
 
-        if (old_data && is_owned(old_data)) {
-            // We allocated this — safe to realloc
+        if (old_data && is_owned(old_data))
+        {
+            // We allocated this via UE allocator — safe to UE realloc
             unmark_owned(old_data);
-            void* new_data = realloc(old_data, new_bytes);
-            if (!new_data) {
+            void *new_data = ue_memory::available()
+                                 ? ue_memory::realloc(old_data, new_bytes, 16)
+                                 : realloc(old_data, new_bytes);
+            if (!new_data)
+            {
                 // realloc failed, old buffer still valid
                 mark_owned(old_data);
                 return nullptr;
             }
             // Zero the new portion
             if (new_bytes > old_bytes)
-                std::memset(static_cast<uint8_t*>(new_data) + old_bytes, 0, new_bytes - old_bytes);
+                std::memset(static_cast<uint8_t *>(new_data) + old_bytes, 0, new_bytes - old_bytes);
             mark_owned(new_data);
             return new_data;
         }
 
-        // UE-allocated — malloc new, copy, leak old
-        void* new_data = malloc(new_bytes);
-        if (!new_data) return nullptr;
+        // UE-allocated — use UE's allocator for the new buffer, copy, free old via UE
+        void *new_data = ue_memory::available()
+                             ? ue_memory::malloc(new_bytes, 16)
+                             : malloc(new_bytes);
+        if (!new_data)
+            return nullptr;
         std::memset(new_data, 0, new_bytes);
         if (old_data && old_count > 0)
             std::memcpy(new_data, old_data, old_bytes);
+        // NOTE: We intentionally LEAK the old UE-owned buffer here.
+        // Freeing it is unsafe because the blueprint VM may still hold
+        // cached pointers to elements within it (use-after-free).
+        // The leak is small and bounded (only happens on TArray/TMap growth).
         mark_owned(new_data);
         return new_data;
     }
@@ -93,6 +115,211 @@ namespace lua_tarray
     //                       FSparseArrayAllocationInfo FirstFreeIndex; }
     // Simplified — we iterate valid elements via sparse array metadata
     // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TMap/TSet Hash Table Rebuild
+    //
+    // UE5 TMap uses FScriptSet internally, which stores a hash table for
+    // O(1) key lookups. Each entry in the sparse array has:
+    //   TPair<Key,Value> + int32 HashNextId + int32 HashIndex
+    // The hash table is an array of int32 bucket heads (FSetElementId).
+    //
+    // ARM64 FScriptSet layout:
+    //   [Sparse Array: 56 bytes]
+    //     offset  0: void*  Data             (8 bytes)
+    //     offset  8: int32  ArrayNum          (4 bytes)
+    //     offset 12: int32  ArrayMax          (4 bytes)
+    //     offset 16: TBitArray inline         (32 bytes: 16 InlineData + 8 SecPtr + 4 NumBits + 4 MaxBits)
+    //     offset 48: int32  FirstFreeIndex    (4 bytes)
+    //     offset 52: int32  NumFreeIndices    (4 bytes)
+    //   [Hash Allocator: 24 bytes + HashSize]
+    //     offset 56: FScriptContainerElement InlineData[1] (8 bytes — inline storage for 1 bucket)
+    //     offset 64: void*  SecondaryHeapPtr  (8 bytes — heap-allocated bucket array ptr)
+    //     offset 72: int32  HashNum           (4 bytes — current number of buckets)
+    //     offset 76: int32  HashMax           (4 bytes — allocated capacity)
+    //   offset 80: int32  HashSize            (4 bytes — number of hash buckets)
+    //
+    // Hash fields within each entry (at end of stride):
+    //     entry + stride - 8: int32 HashNextId  (next element in same bucket, -1 = end)
+    //     entry + stride - 4: int32 HashIndex   (which bucket this element is in)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // Tracker for hash bucket arrays we allocated (so we can free on re-hash)
+    static std::mutex s_hash_mtx;
+    static std::unordered_set<void *> s_hash_buffers;
+
+    static bool is_hash_owned(void *ptr)
+    {
+        std::lock_guard<std::mutex> lk(s_hash_mtx);
+        return s_hash_buffers.count(ptr) > 0;
+    }
+    static void mark_hash_owned(void *ptr)
+    {
+        std::lock_guard<std::mutex> lk(s_hash_mtx);
+        s_hash_buffers.insert(ptr);
+    }
+    static void unmark_hash_owned(void *ptr)
+    {
+        std::lock_guard<std::mutex> lk(s_hash_mtx);
+        s_hash_buffers.erase(ptr);
+    }
+
+    /// Rebuild the hash table for a TMap/TSet after mutation (Add/Remove).
+    /// Computes key hashes and inserts all valid entries into proper buckets.
+    /// Key hash = first 4 bytes of key data (correct for FName, FGameplayTag, int32, uint32, enum).
+    static void rehash_map(uint8_t *sparse_base, int32_t entry_stride, int32_t key_offset, int32_t key_size)
+    {
+        void *data = *reinterpret_cast<void **>(sparse_base);
+        int32_t array_num = *reinterpret_cast<int32_t *>(sparse_base + 8);
+        int32_t first_free = *reinterpret_cast<int32_t *>(sparse_base + 48);
+        int32_t num_free_idx = *reinterpret_cast<int32_t *>(sparse_base + 52);
+        if (num_free_idx < 0)
+            num_free_idx = 0;
+
+        int32_t num_valid = array_num - num_free_idx;
+
+        // Empty map — clear hash table
+        if (!data || array_num <= 0 || num_valid <= 0)
+        {
+            std::memset(sparse_base + 56, 0, 24);               // zero InlineData + HeapPtr + HashNum + HashMax
+            *reinterpret_cast<int32_t *>(sparse_base + 80) = 0; // HashSize = 0
+            return;
+        }
+
+        // Compute hash size: power-of-2, at least 2x num_valid (UE5 formula)
+        int32_t hash_size;
+        if (num_valid >= 8)
+        {
+            hash_size = 1;
+            while (hash_size < num_valid * 2)
+                hash_size <<= 1;
+        }
+        else if (num_valid >= 4)
+        {
+            hash_size = 8;
+        }
+        else
+        {
+            hash_size = 1;
+        }
+
+        // Build free-index set
+        std::vector<bool> is_free(array_num, false);
+        if (first_free >= 0 && num_free_idx > 0)
+        {
+            int32_t idx = first_free;
+            int32_t safety = num_free_idx + 1;
+            while (idx >= 0 && idx < array_num && safety-- > 0)
+            {
+                is_free[idx] = true;
+                const uint8_t *slot = reinterpret_cast<const uint8_t *>(data) + idx * entry_stride;
+                idx = *reinterpret_cast<const int32_t *>(slot + 4); // NextFreeIndex
+            }
+        }
+
+        // Hash field offsets within each entry
+        int32_t hn_off = entry_stride - 8; // HashNextId
+        int32_t hi_off = entry_stride - 4; // HashIndex
+
+        // Allocate or reuse bucket array
+        int32_t *buckets = nullptr;
+        bool using_inline = (hash_size <= 1);
+
+        if (using_inline)
+        {
+            // Use inline storage at offset 56 (InlineData[0])
+            buckets = reinterpret_cast<int32_t *>(sparse_base + 56);
+        }
+        else
+        {
+            // Free previous hash allocation if ours
+            void *old_heap = *reinterpret_cast<void **>(sparse_base + 64);
+            if (old_heap && is_hash_owned(old_heap))
+            {
+                unmark_hash_owned(old_heap);
+                ue_memory::free(old_heap);
+            }
+            buckets = reinterpret_cast<int32_t *>(ue_memory::malloc(hash_size * sizeof(int32_t), 8));
+            if (!buckets)
+            {
+                logger::log_error("TMAP", "Rehash: malloc failed for %d buckets", hash_size);
+                return;
+            }
+            mark_hash_owned(buckets);
+        }
+
+        // Initialize all buckets to -1 (empty/invalid FSetElementId)
+        for (int32_t i = 0; i < hash_size; i++)
+        {
+            buckets[i] = -1;
+        }
+
+        // Insert each valid entry into the hash table
+        int32_t inserted = 0;
+        for (int32_t i = 0; i < array_num; i++)
+        {
+            uint8_t *entry = reinterpret_cast<uint8_t *>(data) + i * entry_stride;
+
+            if (is_free[i])
+            {
+                // Clear hash fields on free entries
+                *reinterpret_cast<int32_t *>(entry + hn_off) = -1;
+                *reinterpret_cast<int32_t *>(entry + hi_off) = -1;
+                continue;
+            }
+
+            // Compute key hash: first 4 bytes of key data
+            // Correct for FName (ComparisonIndex), FGameplayTag (wraps FName),
+            // int32, uint32, enum values
+            uint32_t key_hash;
+            const uint8_t *key_ptr = entry + key_offset;
+            if (key_size >= 4)
+            {
+                key_hash = *reinterpret_cast<const uint32_t *>(key_ptr);
+            }
+            else if (key_size == 2)
+            {
+                key_hash = *reinterpret_cast<const uint16_t *>(key_ptr);
+            }
+            else
+            {
+                key_hash = *key_ptr;
+            }
+
+            int32_t bucket = static_cast<int32_t>(key_hash & static_cast<uint32_t>(hash_size - 1));
+
+            // Insert at head of bucket chain
+            *reinterpret_cast<int32_t *>(entry + hn_off) = buckets[bucket]; // HashNextId = old head
+            *reinterpret_cast<int32_t *>(entry + hi_off) = bucket;          // HashIndex = our bucket
+            buckets[bucket] = i;                                            // Bucket head = this entry
+            inserted++;
+        }
+
+        // Write hash allocator fields
+        // UE5 ARM64 layout after sparse array (offset 56):
+        //   +56: InlineData[0] (8 bytes)
+        //   +64: SecondaryHeapPtr (void*, 8 bytes)
+        //   +72: HashNum (int32)
+        //   +76: HashMax (int32)
+        //   +80: HashSize (int32)
+        if (using_inline)
+        {
+            // InlineData[0] already written (buckets pointed to sparse_base+56)
+            *reinterpret_cast<void **>(sparse_base + 64) = nullptr;     // SecondaryHeapPtr = null (using inline)
+            *reinterpret_cast<int32_t *>(sparse_base + 72) = hash_size; // HashNum
+            *reinterpret_cast<int32_t *>(sparse_base + 76) = 1;         // HashMax (inline capacity)
+        }
+        else
+        {
+            // InlineData stays as-is (unused when heap-allocated)
+            *reinterpret_cast<void **>(sparse_base + 64) = reinterpret_cast<void *>(buckets); // SecondaryHeapPtr
+            *reinterpret_cast<int32_t *>(sparse_base + 72) = hash_size;                       // HashNum
+            *reinterpret_cast<int32_t *>(sparse_base + 76) = hash_size;                       // HashMax
+        }
+        *reinterpret_cast<int32_t *>(sparse_base + 80) = hash_size;
+
+        logger::log_info("TMAP", "Rehash: %d entries into %d buckets", inserted, hash_size);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Element type dispatch — read from raw memory via FProperty
@@ -619,8 +846,9 @@ namespace lua_tarray
                                         if (raw->num >= raw->max)
                                         {
                                             int32_t new_max = (raw->max < 4) ? 8 : raw->max * 2;
-                                            void* new_data = grow_buffer(raw->data, raw->num, self.element_size, new_max);
-                                            if (!new_data) {
+                                            void *new_data = grow_buffer(raw->data, raw->num, self.element_size, new_max);
+                                            if (!new_data)
+                                            {
                                                 logger::log_error("TARRAY", "Add: grow failed (max=%d)", new_max);
                                                 return 0;
                                             }
@@ -1435,13 +1663,28 @@ namespace lua_tarray
             *reinterpret_cast<int32_t*>(b + 48) = -1;  // FirstFreeIndex = -1
             *reinterpret_cast<int32_t*>(b + 52) = 0;   // NumFreeIndices = 0
 
-            // Zero hash table (starts at offset 56 in FScriptSet)
-            // Hash is a TBitArray-like: InlineData[16] + ptr(8) + NumBits(4) + MaxBits(4) = 32 bytes
-            // Then int32 HashSize at offset 88
-            std::memset(b + 56, 0, 32); // zero hash allocation bits
-            *reinterpret_cast<int32_t*>(b + 88) = 0; // HashSize = 0
+            // Free our hash bucket allocation if we own it, before zeroing
+            // SecondaryHeapPtr is at offset 64 (NOT 80)
+            void* old_hash = *reinterpret_cast<void**>(b + 64);
+            if (old_hash && is_hash_owned(old_hash)) {
+                unmark_hash_owned(old_hash);
+                ue_memory::free(old_hash);
+            }
+
+            // Zero hash allocator (offset 56-79) + HashSize (offset 80)
+            // Layout: InlineData(8) + SecondaryHeapPtr(8) + HashNum(4) + HashMax(4) = 24 bytes
+            std::memset(b + 56, 0, 24); // zero InlineData + HeapPtr + HashNum + HashMax
+            *reinterpret_cast<int32_t*>(b + 80) = 0; // HashSize = 0
 
             logger::log_info("TMAP", "Clear: map zeroed"); },
+
+                                  // ── Rehash — rebuild hash table from scratch ─────────────
+                                  // Call after any external mutation or when hash may be stale.
+                                  "Rehash", [](LuaTMap &self)
+                                  {
+            if (!self.map_ptr) return;
+            uint8_t* b = reinterpret_cast<uint8_t*>(self.map_ptr);
+            rehash_map(b, self.entry_stride, self.key_offset, self.key_size); },
 
                                   // ── Remove — remove entry by key (add to free list) ──────
                                   // Returns true if found and removed.
@@ -1527,7 +1770,10 @@ namespace lua_tarray
                         bits[word] &= ~(1u << bit);
                     }
 
-                    logger::log_info("TMAP", "Remove: '%s' removed at slot %d", target_key.c_str(), i);
+                    // Rebuild hash table after removal
+                    rehash_map(sparse_base, self.entry_stride, self.key_offset, self.key_size);
+
+                    logger::log_info("TMAP", "Remove: '%s' removed at slot %d (hash rebuilt)", target_key.c_str(), i);
                     return true;
                 }
                 visited++;
@@ -1575,6 +1821,14 @@ namespace lua_tarray
                     *reinterpret_cast<int32_t*>(next_entry + 0) = -1; // PrevFreeIndex = -1 (new head)
                 }
 
+                // Set allocation bit (was cleared during Remove)
+                int32_t word = slot / 32;
+                int32_t bit  = slot % 32;
+                if (word < 4) {
+                    uint32_t* bits = reinterpret_cast<uint32_t*>(sparse_base + 16);
+                    bits[word] |= (1u << bit);
+                }
+
                 logger::log_info("TMAP", "Add: reusing free slot %d (remaining free=%d)", slot, num_free_idx - 1);
             }
             else if (data && array_num < array_max) {
@@ -1598,36 +1852,15 @@ namespace lua_tarray
                 logger::log_info("TMAP", "Add: appending at slot %d (num=%d, max=%d)", slot, array_num + 1, array_max);
             }
             else {
-                // Auto-grow sparse array
-                int32_t new_max = (array_max < 4) ? 8 : array_max * 2;
-                void* new_data = grow_buffer(data, array_num, self.entry_stride, new_max);
-                if (!new_data) {
-                    logger::log_error("TMAP", "Add: grow failed (max=%d)", new_max);
-                    return false;
-                }
-                // Update sparse array header
-                *reinterpret_cast<void**>(sparse_base) = new_data;          // Data ptr
-                *reinterpret_cast<int32_t*>(sparse_base + 12) = new_max;    // ArrayMax
-                data = new_data;
-
-                // Now append at end
-                slot = array_num;
-                *reinterpret_cast<int32_t*>(sparse_base + 8) = array_num + 1; // ArrayNum++
-
-                // Set allocation bit
-                int32_t word = slot / 32;
-                int32_t bit  = slot % 32;
-                if (word < 4) {
-                    uint32_t* bits = reinterpret_cast<uint32_t*>(sparse_base + 16);
-                    bits[word] |= (1u << bit);
-                }
-                int32_t num_bits = *reinterpret_cast<int32_t*>(sparse_base + 40);
-                if (slot >= num_bits) {
-                    *reinterpret_cast<int32_t*>(sparse_base + 40) = slot + 1;
-                }
-
-                logger::log_info("TMAP", "Add: grew buffer to max=%d, appending at slot %d (leaked old)",
-                                 new_max, slot);
+                // Need to grow but buffer is UE-allocated (FMallocBinned2).
+                // NEVER replace UE's data pointer with libc malloc — UE will
+                // crash later when it tries to realloc/free via its own allocator.
+                // Caller should Clear() first to reclaim capacity, or accept the limit.
+                logger::log_error("TMAP", "Add: REFUSED — capacity full (num=%d, max=%d). "
+                                  "Clear() first or ensure enough capacity. "
+                                  "Growing UE-allocated TMap buffers with libc malloc causes delayed SIGSEGV.",
+                                  array_num, array_max);
+                return false;
             }
 
             // Zero the slot and write key + value
@@ -1636,7 +1869,10 @@ namespace lua_tarray
             write_element(entry + self.key_offset, self.key_prop, key_lua);
             write_element(entry + self.value_offset, self.value_prop, value_lua);
 
-            logger::log_info("TMAP", "Add: key+value written at slot %d", slot);
+            // Rebuild hash table so UE engine can find the new entry
+            rehash_map(sparse_base, self.entry_stride, self.key_offset, self.key_size);
+
+            logger::log_info("TMAP", "Add: key+value written at slot %d (hash rebuilt)", slot);
             return true; });
     }
 

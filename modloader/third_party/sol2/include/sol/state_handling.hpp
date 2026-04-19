@@ -35,10 +35,13 @@
 #include <iostream>
 #endif
 
-namespace sol {
-	inline void register_main_thread(lua_State* L) {
+namespace sol
+{
+	inline void register_main_thread(lua_State *L)
+	{
 #if SOL_LUA_VERSION_I_ < 502
-		if (L == nullptr) {
+		if (L == nullptr)
+		{
 			lua_pushnil(L);
 			lua_setglobal(L, detail::default_main_thread_name());
 			return;
@@ -50,14 +53,16 @@ namespace sol {
 #endif
 	}
 
-	inline int default_at_panic(lua_State* L) {
+	inline int default_at_panic(lua_State *L)
+	{
 #if SOL_IS_OFF(SOL_EXCEPTIONS)
 		(void)L;
 		return -1;
 #else
 		size_t messagesize;
-		const char* message = lua_tolstring(L, -1, &messagesize);
-		if (message) {
+		const char *message = lua_tolstring(L, -1, &messagesize);
+		if (message)
+		{
 			std::string err(message, messagesize);
 			lua_settop(L, 0);
 #if SOL_IS_ON(SOL_PRINT_ERRORS)
@@ -72,30 +77,34 @@ namespace sol {
 #endif // Printing Errors
 	}
 
-	inline int default_traceback_error_handler(lua_State* L) {
+	inline int default_traceback_error_handler(lua_State *L)
+	{
 		std::string msg = "An unknown error has triggered the default error handler";
 		optional<string_view> maybetopmsg = stack::unqualified_check_get<string_view>(L, 1, &no_panic);
-		if (maybetopmsg) {
-			const string_view& topmsg = maybetopmsg.value();
+		if (maybetopmsg)
+		{
+			const string_view &topmsg = maybetopmsg.value();
 			msg.assign(topmsg.data(), topmsg.size());
 		}
-		luaL_traceback(L, L, msg.c_str(), 1);
-		optional<string_view> maybetraceback = stack::unqualified_check_get<string_view>(L, -1, &no_panic);
-		if (maybetraceback) {
-			const string_view& traceback = maybetraceback.value();
-			msg.assign(traceback.data(), traceback.size());
-		}
+		// NOTE: We intentionally skip luaL_traceback() here.
+		// luaL_traceback() calls findfield() which iterates _G via lua_next().
+		// If the Lua heap is corrupted (e.g. from a prior native crash or
+		// buffer mismanagement), lua_next can dereference garbage TString
+		// pointers in hash table nodes, causing a fatal SIGSEGV in equalkey().
+		// The error message alone is sufficient for debugging; the stack
+		// trace is not worth risking a process-killing crash.
 #if SOL_IS_ON(SOL_PRINT_ERRORS)
-		// std::cerr << "[sol2] An error occurred and was caught in traceback: ";
+		// std::cerr << "[sol2] An error occurred: ";
 		// std::cerr << msg;
 		// std::cerr << std::endl;
 #endif // Printing
 		return stack::push(L, msg);
 	}
 
-	inline void set_default_state(lua_State* L, lua_CFunction panic_function = &default_at_panic,
-	     lua_CFunction traceback_function = c_call<decltype(&default_traceback_error_handler), &default_traceback_error_handler>,
-	     exception_handler_function exf = detail::default_exception_handler) {
+	inline void set_default_state(lua_State *L, lua_CFunction panic_function = &default_at_panic,
+								  lua_CFunction traceback_function = c_call<decltype(&default_traceback_error_handler), &default_traceback_error_handler>,
+								  exception_handler_function exf = detail::default_exception_handler)
+	{
 		lua_atpanic(L, panic_function);
 		protected_function::set_default_handler(object(L, in_place, traceback_function));
 		set_default_exception_handler(L, exf);
@@ -104,47 +113,57 @@ namespace sol {
 		lua_value::set_lua_state(L);
 	}
 
-	inline std::size_t total_memory_used(lua_State* L) {
+	inline std::size_t total_memory_used(lua_State *L)
+	{
 		std::size_t kb = static_cast<std::size_t>(lua_gc(L, LUA_GCCOUNT, 0));
 		kb *= 1024;
 		kb += static_cast<std::size_t>(lua_gc(L, LUA_GCCOUNTB, 0));
 		return kb;
 	}
 
-	inline protected_function_result script_pass_on_error(lua_State*, protected_function_result result) {
+	inline protected_function_result script_pass_on_error(lua_State *, protected_function_result result)
+	{
 		return result;
 	}
 
-	inline protected_function_result script_throw_on_error(lua_State* L, protected_function_result result) {
+	inline protected_function_result script_throw_on_error(lua_State *L, protected_function_result result)
+	{
 		type t = type_of(L, result.stack_index());
 		std::string err = "sol: ";
 		err += to_string(result.status());
 		err += " error";
 #if SOL_IS_ON(SOL_EXCEPTIONS)
 		std::exception_ptr eptr = std::current_exception();
-		if (eptr) {
+		if (eptr)
+		{
 			err += " with a ";
-			try {
+			try
+			{
 				std::rethrow_exception(eptr);
 			}
-			catch (const std::exception& ex) {
+			catch (const std::exception &ex)
+			{
 				err += "std::exception -- ";
 				err.append(ex.what());
 			}
-			catch (const std::string& message) {
+			catch (const std::string &message)
+			{
 				err += "thrown message -- ";
 				err.append(message);
 			}
-			catch (const char* message) {
+			catch (const char *message)
+			{
 				err += "thrown message -- ";
 				err.append(message);
 			}
-			catch (...) {
+			catch (...)
+			{
 				err.append("thrown but unknown type, cannot serialize into error message");
 			}
 		}
 #endif // serialize exception information if possible
-		if (t == type::string) {
+		if (t == type::string)
+		{
 			err += ": ";
 			string_view serr = stack::unqualified_get<string_view>(L, result.stack_index());
 			err.append(serr.data(), serr.size());
@@ -156,13 +175,15 @@ namespace sol {
 #endif
 		// replacing information of stack error into pfr
 		int target = result.stack_index();
-		if (result.pop_count() > 0) {
+		if (result.pop_count() > 0)
+		{
 			stack::remove(L, target, result.pop_count());
 		}
 		stack::push(L, err);
 		int top = lua_gettop(L);
 		int towards = top - target;
-		if (towards != 0) {
+		if (towards != 0)
+		{
 			lua_rotate(L, top, towards);
 		}
 #if SOL_IS_OFF(SOL_EXCEPTIONS)
@@ -173,7 +194,8 @@ namespace sol {
 #endif // If exceptions are allowed
 	}
 
-	inline protected_function_result script_default_on_error(lua_State* L, protected_function_result pfr) {
+	inline protected_function_result script_default_on_error(lua_State *L, protected_function_result pfr)
+	{
 #if SOL_IS_ON(SOL_DEFAULT_PASS_ON_ERROR)
 		return script_pass_on_error(L, std::move(pfr));
 #else
@@ -181,8 +203,10 @@ namespace sol {
 #endif
 	}
 
-	namespace stack {
-		inline error get_traceback_or_errors(lua_State* L) {
+	namespace stack
+	{
+		inline error get_traceback_or_errors(lua_State *L)
+		{
 			int p = default_traceback_error_handler(L);
 			sol::error err = stack::get<sol::error>(L, -p);
 			lua_pop(L, p);

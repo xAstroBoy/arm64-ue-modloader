@@ -1,6 +1,12 @@
--- mods/EnemySpawner/main.lua v10.1
+-- mods/EnemySpawner/main.lua v10.2
 -- ═══════════════════════════════════════════════════════════════════════
 -- Direct EmSetEvent Enemy Spawner — 200+ enemies via native EmSetEvent()
+--
+-- v10.2 — Fix coordinate system: prefer GetBio4Transform (RE4 Y-up coords)
+--   GetBodyLocation returns UE4 world coords (Z-up, centimeters) which are
+--   in a completely different coordinate space than what EmSetEvent expects.
+--   Now uses GetBio4Transform() as primary source (RE4 internal Y-up coords)
+--   and correctly maps horizontal offsets to RE4 XZ plane (not UE XY).
 --
 -- v10.1 — Safer in-bounds placement
 --   Prefer grounded/body-style pawn locations, clamp distance harder, build
@@ -559,18 +565,14 @@ local function extractVectorXYZ(vec)
     return nil
 end
 
+-- Coordinate system tag: "re4" = Y-up (RE4 internal), "ue" = Z-up (UE4 world)
+local lastCoordSystem = "re4"  -- default assumption
+
 local function getPawnPositionFromMethods(pawn, label)
     if not isPawnValid(pawn) then return nil end
 
-    local ok2, loc2 = pcall(function() return pawn:Call("GetBodyLocation") end)
-    if ok2 and loc2 then
-        local x, y, z = extractVectorXYZ(loc2)
-        if x then
-            V("getPlayerPosition[%s]: GetBodyLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
-            return x, y, z
-        end
-    end
-
+    -- ═══ PRIMARY: GetBio4Transform — returns RE4 internal coords (Y-up) ═══
+    -- This is the CORRECT source for EmSetEvent which expects RE4 coordinates.
     local ok1, transform = pcall(function() return pawn:Call("GetBio4Transform") end)
     if ok1 and transform then
         local x, y, z
@@ -581,8 +583,21 @@ local function getPawnPositionFromMethods(pawn, label)
             z = loc.Z
         end)
         if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
-            V("getPlayerPosition[%s]: GetBio4Transform=(%.1f, %.1f, %.1f)", label, x, y or 0, z or 0)
+            V("getPlayerPosition[%s]: GetBio4Transform RE4=(%.1f, %.1f, %.1f)", label, x, y or 0, z or 0)
+            lastCoordSystem = "re4"
             return x, y or 0, z or 0
+        end
+    end
+
+    -- ═══ FALLBACK: UE4 methods — returns UE4 world coords (Z-up, centimeters) ═══
+    -- These are NOT in RE4's coordinate space. The spawn code must convert.
+    local ok2, loc2 = pcall(function() return pawn:Call("GetBodyLocation") end)
+    if ok2 and loc2 then
+        local x, y, z = extractVectorXYZ(loc2)
+        if x then
+            V("getPlayerPosition[%s]: GetBodyLocation UE4=(%.1f, %.1f, %.1f)", label, x, y, z)
+            lastCoordSystem = "ue"
+            return x, y, z
         end
     end
 
@@ -590,7 +605,8 @@ local function getPawnPositionFromMethods(pawn, label)
     if ok3 and loc3 then
         local x, y, z = extractVectorXYZ(loc3)
         if x then
-            V("getPlayerPosition[%s]: GetHeadLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
+            V("getPlayerPosition[%s]: GetHeadLocation UE4=(%.1f, %.1f, %.1f)", label, x, y, z)
+            lastCoordSystem = "ue"
             return x, y, z
         end
     end
@@ -599,7 +615,8 @@ local function getPawnPositionFromMethods(pawn, label)
     if ok4 and loc4 then
         local x, y, z = extractVectorXYZ(loc4)
         if x then
-            V("getPlayerPosition[%s]: K2_GetActorLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
+            V("getPlayerPosition[%s]: K2_GetActorLocation UE4=(%.1f, %.1f, %.1f)", label, x, y, z)
+            lastCoordSystem = "ue"
             return x, y, z
         end
     end
@@ -610,7 +627,8 @@ local function getPawnPositionFromMethods(pawn, label)
         if ok6 and rloc then
             local x, y, z = extractVectorXYZ(rloc)
             if x then
-                V("getPlayerPosition[%s]: RelativeLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
+                V("getPlayerPosition[%s]: RelativeLocation UE4=(%.1f, %.1f, %.1f)", label, x, y, z)
+                lastCoordSystem = "ue"
                 return x, y, z
             end
         end
@@ -658,7 +676,8 @@ local function getPlayerPosition()
         if x then return x, y, z end
     end
 
-    -- Fallback: native pPL (original method — may return 0,0,0)
+    -- Fallback: native pPL (cPlayer struct) — RE4 internal coords (Y-up)
+    -- pPL+0xa4 = RE4 X, pPL+0xa8 = RE4 Y (height), pPL+0xac = RE4 Z
     if addr_pPL then
         local pPL = nil
         pcall(function() pPL = ReadPtr(addr_pPL) end)
@@ -668,7 +687,8 @@ local function getPlayerPosition()
             pcall(function() y = ReadFloat(Offset(pPL, 0xa8)) end)
             pcall(function() z = ReadFloat(Offset(pPL, 0xac)) end)
             if x and z and (x ~= 0 or z ~= 0) then
-                V("getPlayerPosition: native pPL pos=(%.1f, %.1f, %.1f)", x, y or 0, z)
+                V("getPlayerPosition: native pPL RE4=(%.1f, %.1f, %.1f)", x, y or 0, z)
+                lastCoordSystem = "re4"
                 return x, y or 0, z
             end
         end
@@ -849,17 +869,26 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     -- HP (int16 LE at +0x08)
     pcall(function() WriteU16(Offset(buf, 0x08), hp) end)
 
-    -- Position: convert UE world coords -> RE4 EM_LIST int16 (coord / 10.0)
-    -- RE4 EM_LIST is Y-up while UE vectors are Z-up, so map:
-    --   EM posX <- UE X
-    --   EM posY <- UE Z (height)
-    --   EM posZ <- UE Y
-    local worldX = px + (offsetX or 0)
-    local worldY = py + (offsetZ or 0)
-    local worldZ = pz
-    local spawnX = worldX / 10.0
-    local spawnY = worldZ / 10.0
-    local spawnZ = worldY / 10.0
+    -- Position: convert to RE4 EM_LIST int16 (value = world_coord / 10.0)
+    -- EM_LIST is ALWAYS Y-up: posX=horizontal, posY=height, posZ=horizontal
+    -- offsetX/offsetZ are horizontal offsets (ground plane)
+    local spawnX, spawnY, spawnZ
+
+    if lastCoordSystem == "re4" then
+        -- px/py/pz are already RE4 Y-up: X=horiz, Y=height, Z=horiz
+        -- Apply horizontal offsets to X and Z, keep Y (height) unchanged
+        spawnX = (px + (offsetX or 0)) / 10.0
+        spawnY = py / 10.0                        -- height: no offset
+        spawnZ = (pz + (offsetZ or 0)) / 10.0
+        V("spawnSingle: RE4 coords -> EM posX=%.1f posY=%.1f posZ=%.1f", spawnX, spawnY, spawnZ)
+    else
+        -- px/py/pz are UE4 Z-up: X=horiz, Y=horiz, Z=height
+        -- Map: EM posX <- UE X, EM posY <- UE Z (height), EM posZ <- UE Y
+        spawnX = (px + (offsetX or 0)) / 10.0
+        spawnY = pz / 10.0                        -- UE Z = height -> EM Y
+        spawnZ = (py + (offsetZ or 0)) / 10.0     -- UE Y = horiz  -> EM Z
+        V("spawnSingle: UE4->RE4 coords -> EM posX=%.1f posY=%.1f posZ=%.1f", spawnX, spawnY, spawnZ)
+    end
 
     pcall(function() WriteU16(Offset(buf, 0x0c), toU16(spawnX)) end)  -- posX
     pcall(function() WriteU16(Offset(buf, 0x0e), toU16(spawnY)) end)  -- posY / height
@@ -1084,7 +1113,7 @@ end)
 
 RegisterCommand("spawner_status", function()
     V("cmd:spawner_status")
-    local info = TAG .. ": v10.1"
+    local info = TAG .. ": v10.2"
         .. " | diff=" .. state.difficulty
         .. " | count=" .. state.spawnCount
         .. " | dist=" .. state.spawnDistance
@@ -1231,7 +1260,7 @@ V("Init: calling initNative (non-fatal)")
 pcall(initNative)
 V("Init: nativeReady=%s", tostring(nativeReady))
 
-Log(TAG .. ": v10.1 loaded — " .. #ALL_ENEMIES .. " enemies, "
+Log(TAG .. ": v10.2 loaded — " .. #ALL_ENEMIES .. " enemies, "
     .. #CATEGORIES .. " categories"
     .. " | EmSetEvent direct spawning"
     .. " | safer body/debug pawn position + RE4 Y-up axis mapping"

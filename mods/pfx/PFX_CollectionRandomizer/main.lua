@@ -1,5 +1,5 @@
 -- ============================================================================
--- PFX_CollectionRandomizer v27 — Hub Slot Scramble + Per-Table Cosmetics
+-- PFX_CollectionRandomizer v34 — Hub Slot Scramble + Per-Table Cosmetics
 -- ============================================================================
 -- v27 CHANGES from v26:
 --   * FIX: robust slot assignment validation. If ChangeSlotEntry is a no-op,
@@ -25,7 +25,7 @@
 --     the new randomized entry (replace even when slot already occupied).
 --
 local TAG = "PFX_Randomizer"
-Log(TAG .. ": Loading v28...")
+Log(TAG .. ": Loading v40...")
 
 -- ============================================================================
 -- CATEGORY CONSTANTS
@@ -65,6 +65,31 @@ local STRICT_REPLACE_CATEGORIES = {
     [4] = true,   -- Statue
     [5] = true,   -- Gadget
 }
+
+-- Entries whose localized name contains any of these substrings are excluded from pools
+local ENTRY_NAME_BLACKLIST = {
+    "arcade2tv",
+    "arcade 2 tv",
+    "arcade2 tv",
+    "silver ball",
+    "xarcade",
+    "x arcade",
+}
+
+local function is_blacklisted_entry(entry)
+    if not entry then return false end
+    local locName = ""
+    pcall(function() locName = tostring(entry:Call("GetLocalizedName")) end)
+    if locName == "" then
+        pcall(function() locName = entry:GetName() end)
+    end
+    if type(locName) ~= "string" or locName == "" then return false end
+    local lower = locName:lower()
+    for _, bl in ipairs(ENTRY_NAME_BLACKLIST) do
+        if lower:find(bl, 1, true) then return true end
+    end
+    return false
+end
 
 local function name_of(obj)
     if not obj then return "" end
@@ -137,67 +162,60 @@ local function make_cycle_state(items, keyFn)
     local state = {
         unique = unique,
         keyFn = keyFn,
-        order = {},
-        index = 1,
-        lastKey = nil,
+        remaining = {},  -- items not yet picked this round
+        usedKeys = {},   -- keys picked this round (for dupe detection)
     }
-    for i, item in ipairs(unique) do state.order[i] = item end
-    if #state.order > 1 then shuffle(state.order) end
+    -- Fill remaining with shuffled copy
+    for i, item in ipairs(unique) do state.remaining[i] = item end
+    if #state.remaining > 1 then shuffle(state.remaining) end
     return state
 end
 
-local function reset_cycle_state(state, avoidFirstKey)
-    state.order = {}
-    for i, item in ipairs(state.unique or {}) do state.order[i] = item end
-    if #state.order > 1 then shuffle(state.order) end
-
-    if avoidFirstKey and avoidFirstKey ~= "" and #state.order > 1 then
-        local firstKey = state.keyFn(state.order[1])
-        if firstKey == avoidFirstKey then
-            local swapIndex = nil
-            for i = 2, #state.order do
-                local k = state.keyFn(state.order[i])
-                if k ~= avoidFirstKey then
-                    swapIndex = i
-                    break
-                end
-            end
-            if swapIndex then
-                state.order[1], state.order[swapIndex] = state.order[swapIndex], state.order[1]
-            end
-        end
-    end
-
-    state.index = 1
+local function refill_cycle(state)
+    state.remaining = {}
+    state.usedKeys = {}
+    for i, item in ipairs(state.unique or {}) do state.remaining[i] = item end
+    if #state.remaining > 1 then shuffle(state.remaining) end
 end
 
 local function take_from_cycle(state, avoidKey)
-    if not state or not state.order or #state.order == 0 then return nil end
+    if not state or not state.unique or #state.unique == 0 then return nil end
 
-    local previousKey = state.lastKey
-
-    for _ = 1, 2 do
-        local count = #state.order
-        local startIndex = state.index
-
-        for offset = 0, count - 1 do
-            local idx = ((startIndex + offset - 1) % count) + 1
-            local candidate = state.order[idx]
-            local key = state.keyFn(candidate)
-            if key and key ~= "" and (#state.order == 1 or key ~= (avoidKey or "")) then
-                state.index = idx + 1
-                state.lastKey = key
-                if state.index > count then
-                    reset_cycle_state(state, key)
-                end
-                return candidate
-            end
-        end
-
-        reset_cycle_state(state, previousKey)
+    -- If remaining is empty, refill (start new cycle — grab ALL items again)
+    if #state.remaining == 0 then
+        refill_cycle(state)
     end
 
-    return state.order[1]
+    -- Find first item in remaining whose key != avoidKey
+    -- usedKeys is NOT checked here — once we refill, every item is fair game
+    -- The only constraint is: don't give the slot its own current entry back
+    for i = 1, #state.remaining do
+        local candidate = state.remaining[i]
+        local key = state.keyFn(candidate)
+        if key and key ~= "" and key ~= (avoidKey or "") then
+            -- Remove from remaining (swap with last for O(1) remove)
+            state.remaining[i] = state.remaining[#state.remaining]
+            state.remaining[#state.remaining] = nil
+            state.usedKeys[key] = true
+            return candidate
+        end
+    end
+
+    -- All remaining match avoidKey — refill and try once more (new shuffle order)
+    refill_cycle(state)
+    for i = 1, #state.remaining do
+        local candidate = state.remaining[i]
+        local key = state.keyFn(candidate)
+        if key and key ~= "" then
+            state.remaining[i] = state.remaining[#state.remaining]
+            state.remaining[#state.remaining] = nil
+            state.usedKeys[key] = true
+            return candidate
+        end
+    end
+
+    -- Absolute fallback: return first unique entry
+    return state.unique[1]
 end
 
 -- ============================================================================
@@ -225,14 +243,45 @@ local function find_live(...)
     return nil
 end
 
+-- Reverse map: class-name suffix -> category ID
+local CLASS_TO_CATID = {
+    Arm         = 1,
+    SkinTone    = 2,
+    Poster      = 3,
+    Statue      = 4,
+    Gadget      = 5,
+    Floor       = 6,
+    Wall        = 7,
+    Music       = 8,
+    FlipperArm  = 9,
+    BallSkin    = 10,
+    BallTrail   = 11,
+    Trophie     = 12,
+    Cabinet     = 13,
+    HubInterior = 14,
+    Door        = 15,
+}
+
 local function get_category_id(entry)
     if not entry then return nil end
-    local catID = nil
-    pcall(function()
-        local catData = entry:Get("CategoryData")
-        if catData then catID = catData:Get("CategoryID") end
-    end)
-    if type(catID) == "number" and catID > 0 then return catID end
+    -- Primary: derive from class name (PFXCollectibleEntry_Gadget -> 5)
+    local className = nil
+    pcall(function() className = entry:GetClassName() end)
+    if className then
+        local suffix = className:match("PFXCollectibleEntry_(%w+)")
+        if suffix and CLASS_TO_CATID[suffix] then
+            return CLASS_TO_CATID[suffix]
+        end
+    end
+    -- Fallback: entry object name (PFXCollectibleEntry_Gadget_7 -> Gadget)
+    local objName = nil
+    pcall(function() objName = entry:GetName() end)
+    if objName then
+        local suffix = objName:match("PFXCollectibleEntry_(%a+)")
+        if suffix and CLASS_TO_CATID[suffix] then
+            return CLASS_TO_CATID[suffix]
+        end
+    end
     return nil
 end
 
@@ -266,6 +315,10 @@ local ballByIP = {}    -- IP -> { {entry=, mesh=}, ... }
 local trailByIP = {}   -- IP -> { {entry=, trail=}, ... }
 local flipperByIP = {} -- IP -> { entry, ... }
 local tableHintToIP = {}  -- lowercase table hint -> IP (e.g. "doom" -> "Bethesda")
+-- Per-table pools (each table has ~3 entries per cosmetic type)
+local ballByHint = {}    -- hint -> { {entry=, mesh=}, ... }
+local trailByHint = {}   -- hint -> { {entry=, trail=}, ... }
+local flipperByHint = {} -- hint -> { entry, ... }
 -- Legacy totals for logging
 local ballPoolValid = {}
 local trailPoolValid = {}
@@ -297,6 +350,9 @@ local function build_entry_pool()
     trailByIP = {}
     flipperByIP = {}
     tableHintToIP = {}
+    ballByHint = {}
+    trailByHint = {}
+    flipperByHint = {}
     ballPoolValid = {}
     trailPoolValid = {}
     flipperPoolAll = {}
@@ -311,7 +367,7 @@ local function build_entry_pool()
             local entries = FindAllOf(cls)
             if entries then
                 for _, entry in ipairs(entries) do
-                    if is_live(entry) then
+                    if is_live(entry) and not is_blacklisted_entry(entry) then
                         pcall(function()
                             local catID = get_category_id(entry)
                             local key = entry_key(entry)
@@ -354,6 +410,11 @@ local function build_entry_pool()
                                         if not ballByIP[ip] then ballByIP[ip] = {} end
                                         ballByIP[ip][#ballByIP[ip] + 1] = item
                                     end
+                                    if hint then
+                                        local hk = hint:lower()
+                                        if not ballByHint[hk] then ballByHint[hk] = {} end
+                                        ballByHint[hk][#ballByHint[hk] + 1] = item
+                                    end
                                 end
                             elseif catID == 11 then  -- BallTrail
                                 local trail = nil
@@ -366,6 +427,11 @@ local function build_entry_pool()
                                         if not trailByIP[ip] then trailByIP[ip] = {} end
                                         trailByIP[ip][#trailByIP[ip] + 1] = item
                                     end
+                                    if hint then
+                                        local hk = hint:lower()
+                                        if not trailByHint[hk] then trailByHint[hk] = {} end
+                                        trailByHint[hk][#trailByHint[hk] + 1] = item
+                                    end
                                 end
                             elseif catID == 9 then  -- FlipperArm
                                 if key ~= "" and not seenFlipper[key] then
@@ -374,6 +440,11 @@ local function build_entry_pool()
                                     if ip then
                                         if not flipperByIP[ip] then flipperByIP[ip] = {} end
                                         flipperByIP[ip][#flipperByIP[ip] + 1] = entry
+                                    end
+                                    if hint then
+                                        local hk = hint:lower()
+                                        if not flipperByHint[hk] then flipperByHint[hk] = {} end
+                                        flipperByHint[hk][#flipperByHint[hk] + 1] = entry
                                     end
                                 end
                             end
@@ -400,12 +471,28 @@ local function build_entry_pool()
     Log(TAG .. ": Pool: " .. total .. " entries | BallValid=" .. #ballPoolValid
         .. " TrailValid=" .. #trailPoolValid .. " Flipper=" .. #flipperPoolAll)
     Log(TAG .. ": FlipperByIP: " .. table.concat(ipList, ", "))
+    -- Log per-hint pool sizes for ball/trail/flipper
+    local hintBallList, hintTrailList, hintFlipperList = {}, {}, {}
+    for h, p in pairs(ballByHint) do hintBallList[#hintBallList+1] = h.."="..#p end
+    for h, p in pairs(trailByHint) do hintTrailList[#hintTrailList+1] = h.."="..#p end
+    for h, p in pairs(flipperByHint) do hintFlipperList[#hintFlipperList+1] = h.."="..#p end
+    table.sort(hintBallList); table.sort(hintTrailList); table.sort(hintFlipperList)
+    Log(TAG .. ": BallByHint(" .. #hintBallList .. "): " .. table.concat(hintBallList, ", "))
+    Log(TAG .. ": TrailByHint(" .. #hintTrailList .. "): " .. table.concat(hintTrailList, ", "))
+    Log(TAG .. ": FlipperByHint(" .. #hintFlipperList .. "): " .. table.concat(hintFlipperList, ", "))
     Log(TAG .. ": TableHints: " .. (function()
         local out = {}
         for h, ip in pairs(tableHintToIP) do out[#out+1] = h .. "->" .. ip end
         table.sort(out)
         return table.concat(out, ", ")
     end)())
+    -- Log per-category pool sizes
+    local catSizes = {}
+    for catID, items in pairs(entryPool) do
+        catSizes[#catSizes+1] = (CATEGORY_NAMES[catID] or ("Cat"..catID)) .. "=" .. #items
+    end
+    table.sort(catSizes)
+    Log(TAG .. ": PoolByCat: " .. table.concat(catSizes, ", "))
     return poolReady
 end
 
@@ -420,7 +507,11 @@ local function collect_live_slots()
         if not all then return end
         for _, slot in ipairs(all) do
             if is_live(slot) then
+                -- Use entry_id for filled slots, object name for empty ones
                 local key = entry_id(slot)
+                if key == "" then
+                    key = "__empty__" .. name_of(slot)
+                end
                 if key ~= "" and not seen[key] then
                     seen[key] = true
                     out[#out + 1] = slot
@@ -480,102 +571,120 @@ local function has_function(obj, fn)
 end
 
 -- ============================================================================
--- SWAP SLOT — 3-step: component Set + OnSlotEntryChanged + SetupWithCollectibleEntry
+-- SWAP SLOT — Bridge-verified flow (v37):
+--   1. RemovePreviousCollectible(true) — destroys old actor instantly
+--   2. Set("m_slotEntry", newEntry) — update entry reference
+--   3. SetupWithCollectibleEntry(newEntry) — async loads actor class, spawns, attaches
+-- All three calls are on AC_CollectibleSlot_C (subclass of PFXCollectibleSlotComponent).
+-- The spawn is ASYNC — actor appears after soft class finishes loading (~1-3s).
 -- ============================================================================
+local function is_floor_wall_slot(slot)
+    local cn = nil
+    pcall(function() cn = slot:GetClass():GetName() end)
+    return cn == "AC_CollectibleSlot_FloorAndWall_C"
+end
+
+local function is_hub_slot(slot)
+    local cn = nil
+    pcall(function() cn = slot:GetClass():GetName() end)
+    return cn == "AC_CollectibleSlot_Hub_C"
+end
+
+-- Cached reference to the single BP_Customization_Machine_C actor (floor/wall texture handler)
+local cachedMachine = nil
+local function get_machine()
+    if cachedMachine and is_live(cachedMachine) then return cachedMachine end
+    pcall(function() cachedMachine = FindFirstOf("BP_Customization_Machine_C") end)
+    return cachedMachine
+end
+
+-- Cached reference to the room actor (BP_VR_Room_C) that holds floor/wall materials
+local cachedRoom = nil
+local function get_room()
+    if cachedRoom and is_live(cachedRoom) then return cachedRoom end
+    local machine = get_machine()
+    if machine then
+        pcall(function() cachedRoom = machine:Get("RoomRef") end)
+    end
+    return cachedRoom
+end
+
 local function swap_slot_entry(slot, newEntry)
     if not slot or not newEntry then return false end
+    if not is_live(slot) or not is_live(newEntry) then return false end
 
     local previousEntry = nil
     pcall(function() previousEntry = slot:Get("m_slotEntry") end)
-    local hadPrevious = previousEntry and is_live(previousEntry)
 
-    local ok = false
-
-    -- For strict-replace categories (Gadget, Statue): assign new entry FIRST,
-    -- only destroy the old collectible AFTER confirming the swap succeeded.
-    -- This prevents leaving empty slots when the swap fails.
-
-    if has_function(slot, "ChangeSlotEntry") then
-        local changed = false
-        pcall(function()
-            slot:Call("ChangeSlotEntry", newEntry, true)
-            changed = true
-        end)
-        if not changed then
-            pcall(function()
-                slot:Call("ChangeSlotEntry", newEntry)
-                changed = true
-            end)
-        end
-        ok = changed
-    else
-        ok = pcall(function() slot:Set("m_slotEntry", newEntry) end)
-    end
-
-    local desiredKey = entry_key(newEntry)
-    local assignedEntry = nil
-    pcall(function() assignedEntry = slot:Get("m_slotEntry") end)
-    local assignedKey = entry_key(assignedEntry)
-    if not assignedEntry or not is_live(assignedEntry)
-        or (desiredKey ~= "" and assignedKey ~= desiredKey) then
+    if is_floor_wall_slot(slot) then
+        -- FloorAndWall slots are texture-based (no spawned actor).
+        -- Set the entry, then call ApplyFloorStyle/ApplyWallStyle on the
+        -- BP_VR_Room_C actor (accessed via machine.RoomRef) to apply the texture.
         local wrote = pcall(function() slot:Set("m_slotEntry", newEntry) end)
-        if wrote then
-            local check = nil
-            pcall(function() check = slot:Get("m_slotEntry") end)
-            if check and is_live(check) then
-                local checkKey = entry_key(check)
-                if desiredKey == "" or checkKey == desiredKey then
-                    ok = true
+        if not wrote then return false end
+        -- Apply to ALL rooms (there are multiple BP_VR_Room_C instances)
+        local cat = nil
+        pcall(function() cat = slot:Get("SlotCategory") end)
+        local rooms = nil
+        pcall(function() rooms = FindAllOf("BP_VR_Room_C") end)
+        if rooms then
+            for _, room in ipairs(rooms) do
+                if cat == 6 then
+                    pcall(function() room:Call("ApplyFloorStyle", newEntry) end)
+                elseif cat == 7 then
+                    pcall(function() room:Call("ApplyWallStyle", newEntry) end)
                 end
             end
         end
+        -- Also update the customization machine's preview display
+        local machine = get_machine()
+        if machine then
+            if cat == 6 then
+                pcall(function() machine:Call("SetPreview_Floor", newEntry) end)
+            elseif cat == 7 then
+                pcall(function() machine:Call("SetPreview_Wall", newEntry) end)
+            end
+        end
+        return true
     end
 
-    if not ok and hadPrevious then
-        -- Swap failed — leave old entry in place, don't destroy anything
-        pcall(function()
-            if has_function(slot, "ChangeSlotEntry") then
-                slot:Call("ChangeSlotEntry", previousEntry, true)
-            else
-                slot:Set("m_slotEntry", previousEntry)
-            end
-        end)
-        pcall(function() slot:Call("OnSlotEntryChanged", previousEntry) end)
-        pcall(function()
-            if has_function(slot, "SetupWithCollectibleEntry") then
-                slot:Call("SetupWithCollectibleEntry", previousEntry)
-            end
-        end)
-        pcall(function()
-            if has_function(slot, "FinalizeEntrySetup") then
-                slot:Call("FinalizeEntrySetup", previousEntry)
-            end
-        end)
+    if is_hub_slot(slot) then
+        -- Hub interior uses level streaming. Set entry then ApplyNewInterior.
+        local wrote = pcall(function() slot:Set("m_slotEntry", newEntry) end)
+        if not wrote then return false end
+        pcall(function() slot:Call("ApplyNewInterior") end)
+        return true
+    end
+
+    -- Actor-based slots: full 3-step flow
+    -- Step 1: Set entry first (SetupWithCollectibleEntry handles old actor internally)
+    local wrote = pcall(function() slot:Set("m_slotEntry", newEntry) end)
+    if not wrote then
+        -- Restore on failure
+        if previousEntry and is_live(previousEntry) then
+            pcall(function() slot:Set("m_slotEntry", previousEntry) end)
+        end
         return false
     end
 
-    pcall(function() slot:Call("OnSlotEntryChanged", newEntry) end)
-    pcall(function()
-        if has_function(slot, "SetupWithCollectibleEntry") then
-            slot:Call("SetupWithCollectibleEntry", newEntry)
-        end
-    end)
-    pcall(function()
-        if has_function(slot, "FinalizeEntrySetup") then
-            slot:Call("FinalizeEntrySetup", newEntry)
-        end
-    end)
-    pcall(function()
-        if get_category_id(newEntry) == 14 and has_function(slot, "ApplyNewInterior") then
-            slot:Call("ApplyNewInterior", newEntry)
-        end
-    end)
+    -- Step 2: Full setup — handles removing old actor, async loads new actor class, spawns
+    pcall(function() slot:Call("SetupWithCollectibleEntry", newEntry) end)
 
-    return ok
+    return true
 end
 
 local function infer_slot_category(slot)
     if not slot then return nil end
+
+    -- FloorAndWall slots have an explicit SlotCategory property (6=Floor, 7=Wall)
+    if is_floor_wall_slot(slot) then
+        local slotCat = nil
+        pcall(function() slotCat = slot:Get("SlotCategory") end)
+        if type(slotCat) == "number" and slotCat > 0 then return slotCat end
+    end
+
+    -- Hub slot is always category 14
+    if is_hub_slot(slot) then return 14 end
 
     local probes = {}
 
@@ -639,8 +748,13 @@ local function infer_slot_category(slot)
 end
 
 -- ============================================================================
--- SCRAMBLE HUB SLOTS — assign random entries with visual updates
+-- SCRAMBLE HUB SLOTS — batched with delays to avoid engine stale-ref crashes
+-- v28: Execute swaps in small batches (BATCH_SIZE per tick) with delay between
+-- batches, giving the engine time to process component updates.
 -- ============================================================================
+local SCRAMBLE_BATCH_SIZE = 8   -- swaps per batch
+local SCRAMBLE_BATCH_DELAY = 200 -- ms between batches
+
 local function scramble_all_slots()
     if not poolReady then
         Log(TAG .. ": Scramble skipped — pool not ready")
@@ -652,6 +766,9 @@ local function scramble_all_slots()
         Log(TAG .. ": Scramble skipped — RegisteredSlots empty (" .. slotCount .. ")")
         return 0
     end
+
+    -- Build work list: {slot, picked_entry} pairs
+    local workList = {}
 
     -- Group slots by category, track empty slots separately
     local slotsByCategory = {}
@@ -692,12 +809,10 @@ local function scramble_all_slots()
         end)
     end
 
-    local totalOk = 0
     local totalSkip = 0
-    local totalErr = 0
     local cyclesByCategory = {}
 
-    -- For each category: shuffle pool, deal uniquely to slots
+    -- Build work items for each category
     for catID, slotList in pairs(slotsByCategory) do
         local pool = entryPool[catID]
         if not pool or #pool == 0 then
@@ -706,30 +821,25 @@ local function scramble_all_slots()
         end
 
         if STRICT_UNIQUE_CATEGORIES[catID] then
-            local slotsByStation = {}
-            for _, slotInfo in ipairs(slotList) do
-                local sk = slotInfo.stationKey or "__global__"
-                if not slotsByStation[sk] then slotsByStation[sk] = {} end
-                slotsByStation[sk][#slotsByStation[sk] + 1] = slotInfo
+            -- v30: Global cycle for strict-unique categories — no repeats across
+            -- ALL stations until the entire pool is exhausted, then reshuffle.
+            if not cyclesByCategory[catID] then
+                cyclesByCategory[catID] = make_cycle_state(pool, entry_key)
             end
+            local cycle = cyclesByCategory[catID]
 
-            for _, stationSlots in pairs(slotsByStation) do
-                local cycle = make_cycle_state(pool, entry_key)
-                for _, slotInfo in ipairs(stationSlots) do
-                    local picked = take_from_cycle(cycle, slotInfo.currentKey)
-                    if not picked then
-                        totalSkip = totalSkip + 1
-                        goto next_station_slot
-                    end
+            -- Shuffle slot order so different shelves get variety each run
+            local shuffledSlots = {}
+            for i, si in ipairs(slotList) do shuffledSlots[i] = si end
+            shuffle(shuffledSlots)
 
-                    -- 3-step swap: data + notify + visual
-                    if swap_slot_entry(slotInfo.slot, picked) then
-                        totalOk = totalOk + 1
-                    else
-                        totalErr = totalErr + 1
-                    end
-
-                    ::next_station_slot::
+            for _, slotInfo in ipairs(shuffledSlots) do
+                local picked = take_from_cycle(cycle, slotInfo.currentKey)
+                if picked then
+                    workList[#workList + 1] = { slot = slotInfo.slot, entry = picked }
+                else
+                    -- Fallback: force pick first from pool (never leave empty)
+                    workList[#workList + 1] = { slot = slotInfo.slot, entry = pool[math.random(#pool)] }
                 end
             end
         else
@@ -740,38 +850,79 @@ local function scramble_all_slots()
 
             for _, slotInfo in ipairs(slotList) do
                 local picked = take_from_cycle(cycle, slotInfo.currentKey)
-
-                if not picked then
-                    totalSkip = totalSkip + 1
-                    goto next_slot
-                end
-
-                -- 3-step swap: data + notify + visual
-                if swap_slot_entry(slotInfo.slot, picked) then
-                    totalOk = totalOk + 1
+                if picked then
+                    workList[#workList + 1] = { slot = slotInfo.slot, entry = picked }
                 else
-                    totalErr = totalErr + 1
+                    totalSkip = totalSkip + 1
                 end
-
-                ::next_slot::
             end
         end
 
         ::next_cat::
     end
 
-    -- Fill empty slots with category-matched entries
-    local emptyFilled = 0
+    -- Fill empty slots — v30: also probe sibling slots for category hints
     if #emptySlots > 0 then
         local emptyByCategory = {}
-
+        local uncategorized = {}
         for _, emptySlot in ipairs(emptySlots) do
             pcall(function()
                 local targetCat = infer_slot_category(emptySlot)
-                if not targetCat or SKIP_CATEGORIES[targetCat] then return end
-                if not emptyByCategory[targetCat] then emptyByCategory[targetCat] = {} end
-                emptyByCategory[targetCat][#emptyByCategory[targetCat] + 1] = emptySlot
+                if targetCat and not SKIP_CATEGORIES[targetCat] then
+                    if not emptyByCategory[targetCat] then emptyByCategory[targetCat] = {} end
+                    emptyByCategory[targetCat][#emptyByCategory[targetCat] + 1] = emptySlot
+                else
+                    -- Try to infer from sibling slots on the same station
+                    local stationKey = nil
+                    pcall(function()
+                        local ownerStation = emptySlot:Get("m_ownerStationComponent")
+                        if ownerStation and is_live(ownerStation) then
+                            stationKey = entry_id(ownerStation)
+                        end
+                    end)
+                    if not stationKey then
+                        pcall(function()
+                            local outer = emptySlot:GetOuter()
+                            if outer and is_live(outer) then stationKey = entry_id(outer) end
+                        end)
+                    end
+
+                    -- Find what category other slots on the same station have
+                    local siblingCat = nil
+                    if stationKey then
+                        for catID, slotList in pairs(slotsByCategory) do
+                            for _, slotInfo in ipairs(slotList) do
+                                if slotInfo.stationKey == stationKey then
+                                    siblingCat = catID
+                                    break
+                                end
+                            end
+                            if siblingCat then break end
+                        end
+                    end
+
+                    if siblingCat and not SKIP_CATEGORIES[siblingCat] then
+                        if not emptyByCategory[siblingCat] then emptyByCategory[siblingCat] = {} end
+                        emptyByCategory[siblingCat][#emptyByCategory[siblingCat] + 1] = emptySlot
+                    else
+                        uncategorized[#uncategorized + 1] = emptySlot
+                    end
+                end
             end)
+        end
+
+        -- For uncategorized empties, try Gadget first (most common empty), then Statue
+        for _, emptySlot in ipairs(uncategorized) do
+            local bestCat = 5  -- default to Gadget
+            if entryPool[5] and #entryPool[5] > 0 then
+                bestCat = 5
+            elseif entryPool[4] and #entryPool[4] > 0 then
+                bestCat = 4
+            elseif entryPool[3] and #entryPool[3] > 0 then
+                bestCat = 3  -- Poster
+            end
+            if not emptyByCategory[bestCat] then emptyByCategory[bestCat] = {} end
+            emptyByCategory[bestCat][#emptyByCategory[bestCat] + 1] = emptySlot
         end
 
         for catID, catEmptySlots in pairs(emptyByCategory) do
@@ -783,25 +934,65 @@ local function scramble_all_slots()
                 local cycle = cyclesByCategory[catID]
                 for _, emptySlot in ipairs(catEmptySlots) do
                     local picked = take_from_cycle(cycle, nil)
-                    if picked and swap_slot_entry(emptySlot, picked) then
-                        emptyFilled = emptyFilled + 1
-                    else
-                        totalSkip = totalSkip + 1
+                    if not picked then
+                        -- Force pick: never leave a slot empty
+                        picked = pool[math.random(#pool)]
+                    end
+                    if picked then
+                        workList[#workList + 1] = { slot = emptySlot, entry = picked, isEmpty = true }
                     end
                 end
             end
         end
+
+        Log(TAG .. ": Empty slots: " .. #emptySlots .. " total, "
+            .. #uncategorized .. " uncategorized (assigned to fallback cat)")
     end
 
-    stats.sweep_ok = stats.sweep_ok + totalOk
-    stats.sweep_skip = stats.sweep_skip + totalSkip
-    stats.sweep_err = stats.sweep_err + totalErr
-    stats.empty_filled = stats.empty_filled + emptyFilled
+    -- Execute work list in staggered batches
+    local totalWork = #workList
+    local numBatches = math.ceil(totalWork / SCRAMBLE_BATCH_SIZE)
     stats.sweeps = stats.sweeps + 1
-    Log(TAG .. ": Scramble #" .. stats.sweeps .. ": " .. totalOk .. " swapped, "
-        .. totalSkip .. " skip, " .. totalErr .. " err, "
-        .. emptyFilled .. "/" .. #emptySlots .. " empty filled")
-    return totalOk + emptyFilled
+    local sweepNum = stats.sweeps
+
+    Log(TAG .. ": Scramble #" .. sweepNum .. ": " .. totalWork .. " swaps queued in "
+        .. numBatches .. " batches (" .. SCRAMBLE_BATCH_SIZE .. "/batch, "
+        .. SCRAMBLE_BATCH_DELAY .. "ms apart), " .. totalSkip .. " skip, "
+        .. #emptySlots .. " empty")
+
+    for batch = 1, numBatches do
+        local startIdx = (batch - 1) * SCRAMBLE_BATCH_SIZE + 1
+        local endIdx = math.min(batch * SCRAMBLE_BATCH_SIZE, totalWork)
+        local delay = (batch - 1) * SCRAMBLE_BATCH_DELAY
+
+        ExecuteWithDelay(delay, function()
+            local batchOk, batchErr, batchEmpty = 0, 0, 0
+            for i = startIdx, endIdx do
+                local work = workList[i]
+                if work and is_live(work.slot) and is_live(work.entry) then
+                    if swap_slot_entry(work.slot, work.entry) then
+                        batchOk = batchOk + 1
+                        if work.isEmpty then batchEmpty = batchEmpty + 1 end
+                    else
+                        batchErr = batchErr + 1
+                    end
+                else
+                    batchErr = batchErr + 1
+                end
+            end
+            stats.sweep_ok = stats.sweep_ok + batchOk
+            stats.sweep_err = stats.sweep_err + batchErr
+            stats.empty_filled = stats.empty_filled + batchEmpty
+
+            if batch == numBatches then
+                Log(TAG .. ": Scramble #" .. sweepNum .. " complete: ok="
+                    .. stats.sweep_ok .. " err=" .. stats.sweep_err
+                    .. " empty=" .. stats.empty_filled)
+            end
+        end)
+    end
+
+    return totalWork
 end
 
 -- ============================================================================
@@ -861,8 +1052,43 @@ end
 -- ============================================================================
 local hookRegistered = false
 local hook_used_by_category = {}
+local hookPoolBuilt = false   -- lazy pool build on first hook call
+local hookCallCount = 0       -- how many times the hook fired
 
-Log(TAG .. ": Hook: RestoreSlotEntryFromProfile auto-scramble disabled in v25 for stability")
+-- v36: Remove initDone guard — swap entries AS the game restores them.
+-- The game calls RestoreSlotEntryFromProfile during hub load. If actors are
+-- spawned AFTER all restores complete, our post-hook entry swaps will cause
+-- the game to spawn the correct actors. If actors are spawned during each
+-- restore, we at least ensure m_slotEntry is correct for future reference.
+pcall(function()
+    RegisterHook("/Script/PFXCollectibles.PFXCollectibleSlotComponent:RestoreSlotEntryFromProfile",
+        function(self)  -- pre-hook: do nothing, let the game restore
+        end,
+        function(self)  -- post-hook: immediately scramble entry
+            hookCallCount = hookCallCount + 1
+            pcall(function()
+                -- Lazy-build the entry pool on first call
+                if not hookPoolBuilt then
+                    pcall(build_entry_pool)
+                    hookPoolBuilt = true
+                    if poolReady then
+                        Log(TAG .. ": Hook: pool built lazily on first RestoreSlotEntryFromProfile (size="
+                            .. stats.pool_size .. ")")
+                    else
+                        Log(TAG .. ": Hook: pool build FAILED on first RestoreSlotEntryFromProfile")
+                    end
+                end
+                if not poolReady then return end
+                scramble_one_slot(self:get(), "hook")
+            end)
+        end
+    )
+    hookRegistered = true
+    Log(TAG .. ": Hook: RestoreSlotEntryFromProfile post-hook ENABLED (v36 — no initDone guard)")
+end)
+if not hookRegistered then
+    Log(TAG .. ": Hook: RestoreSlotEntryFromProfile FAILED to register")
+end
 
 -- ============================================================================
 -- PER-TABLE COSMETICS — Ball + Trail + Flippers (IP-MATCHED)
@@ -873,16 +1099,20 @@ Log(TAG .. ": Hook: RestoreSlotEntryFromProfile auto-scramble disabled in v25 fo
 -- ============================================================================
 
 -- Resolve table ID to IP by matching bundle name against tableHintToIP map
-local function resolve_table_ip(bundleKey)
+local function resolve_table_hint(bundleKey)
     if not bundleKey or bundleKey == "" then return nil end
     local bk = bundleKey:lower()
-    -- Try matching each known table hint in the bundle key
-    for hint, ip in pairs(tableHintToIP) do
+    for hint, _ in pairs(tableHintToIP) do
         if bk:find(hint, 1, true) then
-            return ip
+            return hint
         end
     end
     return nil
+end
+
+local function resolve_table_ip(bundleKey)
+    local hint = resolve_table_hint(bundleKey)
+    return hint and tableHintToIP[hint] or nil
 end
 
 local function scramble_table_cosmetics()
@@ -928,11 +1158,6 @@ local function scramble_table_cosmetics()
     local ballOk, trailOk, flipperOk, flipperFail, failed, noIP = 0, 0, 0, 0, 0, 0
     local tableCount = 0
 
-    -- Build per-IP cycles lazily
-    local ballCycleByIP = {}
-    local trailCycleByIP = {}
-    local flipperCycleByIP = {}
-
     local tableEntries = {}
     local seenTableID = {}
 
@@ -963,89 +1188,107 @@ local function scramble_table_cosmetics()
 
     table.sort(tableEntries, function(a, b) return a.tableID < b.tableID end)
 
+    -- Build work items for ball/trail, queue flippers separately
+    local cosmeticWork = {}  -- {func, tableID, arg1, arg2, kind}
+
     for _, te in ipairs(tableEntries) do
         local tableID = te.tableID
-        local ip = resolve_table_ip(te.bundleKey)
+        local hint = resolve_table_hint(te.bundleKey)
         tableCount = tableCount + 1
 
-        if not ip then
+        if not hint then
             noIP = noIP + 1
             goto next_table
         end
 
-        -- Apply random BallSkin from this table's IP pool
-        local bpool = ballByIP[ip]
+        -- Queue BallSkin override — pick randomly from this table's own entries
+        local bpool = ballByHint[hint]
         if bpool and #bpool > 0 then
-            if not ballCycleByIP[ip] then
-                ballCycleByIP[ip] = make_cycle_state(bpool, function(v) return entry_key(v.entry) end)
+            local pick = bpool[math.random(#bpool)]
+            if pick then
+                cosmeticWork[#cosmeticWork + 1] = {
+                    kind = "ball", tableID = tableID,
+                    fn = "SetTableBallMeshOverride", args = { tableID, pick.mesh, pick.entry }
+                }
             end
-            pcall(function()
-                local pick = take_from_cycle(ballCycleByIP[ip], nil)
-                if pick then
-                    local ok = pcall(function()
-                        tcm:Call("SetTableBallMeshOverride", tableID, pick.mesh, pick.entry)
-                    end)
-                    if ok then ballOk = ballOk + 1 else failed = failed + 1 end
-                else
-                    failed = failed + 1
-                end
-            end)
         end
 
-        -- Apply random BallTrail from this table's IP pool
-        local tpool = trailByIP[ip]
+        -- Queue BallTrail override — pick randomly from this table's own entries
+        local tpool = trailByHint[hint]
         if tpool and #tpool > 0 then
-            if not trailCycleByIP[ip] then
-                trailCycleByIP[ip] = make_cycle_state(tpool, function(v) return entry_key(v.entry) end)
+            local pick = tpool[math.random(#tpool)]
+            if pick then
+                cosmeticWork[#cosmeticWork + 1] = {
+                    kind = "trail", tableID = tableID,
+                    fn = "SetTableBallTrailOverride", args = { tableID, pick.trail, pick.entry }
+                }
             end
-            pcall(function()
-                local pick = take_from_cycle(trailCycleByIP[ip], nil)
-                if pick then
-                    local ok = pcall(function()
-                        tcm:Call("SetTableBallTrailOverride", tableID, pick.trail, pick.entry)
-                    end)
-                    if ok then trailOk = trailOk + 1 else failed = failed + 1 end
-                else
-                    failed = failed + 1
-                end
-            end)
         end
 
-        -- Queue flipper arm override for staggered execution (avoid rapid-fire SIGSEGV)
-        local fpool = flipperByIP[ip]
+        -- Queue flipper arm override — pick randomly from this table's own entries
+        local fpool = flipperByHint[hint]
         if fpool and #fpool > 0 then
-            if not flipperCycleByIP[ip] then
-                flipperCycleByIP[ip] = make_cycle_state(fpool, entry_key)
-            end
-            local pick = take_from_cycle(flipperCycleByIP[ip], nil)
+            local pick = fpool[math.random(#fpool)]
             if pick then
                 local fmats = nil
                 pcall(function() fmats = pick:Get("OverrideMaterials") end)
-                if fmats and #fmats > 0 then
-                    table.insert(pendingFlipperOverrides, {
-                        tableID = tableID,
-                        pick = pick,
-                    })
-                    flipperOk = flipperOk + 1  -- count as queued
-                else
-                    flipperOk = flipperOk + 1  -- no mats, skip
-                end
+                table.insert(pendingFlipperOverrides, {
+                    tableID = tableID,
+                    pick = pick,
+                })
+                flipperOk = flipperOk + 1
             end
         end
 
         ::next_table::
     end
 
-    stats.table_ball = ballOk
-    stats.table_trail = trailOk
+    -- Count queued work items synchronously
+    local ballQueued, trailQueued = 0, 0
+    for _, w in ipairs(cosmeticWork) do
+        if w.kind == "ball" then ballQueued = ballQueued + 1
+        elseif w.kind == "trail" then trailQueued = trailQueued + 1 end
+    end
+
+    -- Execute ball/trail overrides in staggered batches (4 per batch, 150ms apart)
+    local COSMETIC_BATCH = 4
+    local COSMETIC_DELAY = 150
+    local totalCos = #cosmeticWork
+    local numCosBatches = math.ceil(totalCos / COSMETIC_BATCH)
+
+    for batch = 1, numCosBatches do
+        local si = (batch - 1) * COSMETIC_BATCH + 1
+        local ei = math.min(batch * COSMETIC_BATCH, totalCos)
+        local delay = (batch - 1) * COSMETIC_DELAY
+
+        ExecuteWithDelay(delay, function()
+            local liveTcm = find_live("BP_TableCustomizationManager_C", "PFXTableCustomizationManager")
+            if not liveTcm then return end
+            for i = si, ei do
+                local w = cosmeticWork[i]
+                if w then
+                    local ok, err = pcall(function()
+                        liveTcm:Call(w.fn, w.args[1], w.args[2], w.args[3])
+                    end)
+                    if w.kind == "ball" then ballOk = ballOk + 1
+                    elseif w.kind == "trail" then trailOk = trailOk + 1 end
+                    if not ok then
+                        Log(TAG .. ": Cosmetic FAIL " .. w.kind .. " tbl=" .. w.tableID .. " fn=" .. w.fn .. " err=" .. tostring(err))
+                    end
+                end
+            end
+        end)
+    end
+
+    stats.table_ball = ballQueued
+    stats.table_trail = trailQueued
     stats.table_flipper = flipperOk
     stats.table_fail = failed
     Log(TAG .. ": Table cosmetics: " .. tableCount .. " tables (noIP=" .. noIP .. ")"
-        .. " | ball=" .. ballOk
-        .. " trail=" .. trailOk
+        .. " | ball=" .. ballQueued .. " trail=" .. trailQueued
         .. " flipper=" .. flipperOk .. "/" .. (flipperOk + flipperFail)
         .. (failed > 0 and (" FAIL=" .. failed) or ""))
-    return ballOk + trailOk
+    return ballQueued + trailQueued
 end
 
 -- Deferred flipper arm application — staggered with delays to avoid rapid SIGSEGV
@@ -1088,10 +1331,115 @@ local function apply_pending_flipper_overrides()
 end
 
 -- ============================================================================
--- INIT: Poll every 5s until RegisteredSlots >= 50
+-- DESTROY XARCADE PROMO — repeating to catch late-streamed sublevel actors
+-- BP_XArcadePromo_C lives in LVL_Arcade_80s_Rooms_OPTI_DLC1 (streamed)
+-- Also hides door logo material and disables lights/shadows
 -- ============================================================================
-local MAX_POLLS = 60
-local READY_STABLE_POLLS = 1
+local XARCADE_CLASSES = {"BP_XArcadePromo_C"}
+local xarcadeTotalDestroyed = 0
+
+local function destroy_xarcade_actors()
+    local destroyed = 0
+    for _, cls in ipairs(XARCADE_CLASSES) do
+        pcall(function()
+            local actors = FindAllOf(cls)
+            if actors then
+                for _, a in ipairs(actors) do
+                    if is_live(a) then
+                        -- Disable shadow casting + lights on all components
+                        pcall(function()
+                            local allComps = a:Call("K2_GetComponentsByClass", FindClass("ActorComponent"))
+                            if allComps then
+                                for _, comp in ipairs(allComps) do
+                                    pcall(function() comp:Set("bVisible", false) end)
+                                    pcall(function() comp:Set("CastShadow", false) end)
+                                    pcall(function() comp:Set("bCastDynamicShadow", false) end)
+                                    pcall(function() comp:Set("bCastStaticShadow", false) end)
+                                    pcall(function() comp:Set("bAffectsWorld", false) end)
+                                    pcall(function() comp:Set("Intensity", 0) end)
+                                end
+                            end
+                        end)
+                        local apath = "?"
+                        pcall(function() apath = a:GetPathName() end)
+                        Log(TAG .. ": [XArcade promo] DESTROYING: " .. apath)
+                        pcall(function() a:Call("SetActorHiddenInGame", true) end)
+                        pcall(function() a:Call("SetActorEnableCollision", false) end)
+                        pcall(function() a:Set("bActorEnableCollision", false) end)
+                        -- Move it far underground to hide any remnant shadows
+                        pcall(function() a:Call("K2_SetActorLocation", {X=0, Y=0, Z=-50000}, false, false) end)
+                        pcall(function() a:Call("K2_DestroyActor") end)
+                        destroyed = destroyed + 1
+                    end
+                end
+            end
+        end)
+    end
+    if destroyed > 0 then
+        xarcadeTotalDestroyed = xarcadeTotalDestroyed + destroyed
+        Log(TAG .. ": Destroyed " .. destroyed .. " XArcade promo actor(s) (total=" .. xarcadeTotalDestroyed .. ")")
+    end
+
+    -- Find and destroy the XArcade door arch sign StaticMeshActor.
+    -- StaticMeshActors are few (~hundreds) so checking their root SMC materials is safe.
+    -- We only call GetMaterial on the root StaticMeshComponent, not arbitrary components.
+    pcall(function()
+        local smas = FindAllOf("StaticMeshActor")
+        if not smas then return end
+        for _, sma in ipairs(smas) do
+            pcall(function()
+                if not is_live(sma) then return end
+                local smc = nil
+                pcall(function() smc = sma:Get("StaticMeshComponent") end)
+                if not smc then return end
+                -- Only check actors that have a loaded mesh
+                local mesh = nil
+                pcall(function() mesh = smc:Get("StaticMesh") end)
+                if not mesh then return end
+                local numMats = 0
+                pcall(function() numMats = smc:Call("GetNumMaterials") end)
+                if numMats == 0 then return end
+                for mi = 0, numMats - 1 do
+                    pcall(function()
+                        local mat = nil
+                        pcall(function() mat = smc:Call("GetMaterial", mi) end)
+                        if mat then
+                            local mn = ""
+                            pcall(function() mn = mat:GetName() end)
+                            if mn:lower():find("xarcade") then
+                                local apath = "?"
+                                local mpath = "?"
+                                pcall(function() apath = sma:GetPathName() end)
+                                pcall(function() mpath = mat:GetPathName() end)
+                                Log(TAG .. ": [XArcade sign] ACTOR=" .. apath)
+                                Log(TAG .. ": [XArcade sign] MAT[" .. mi .. "]=" .. mpath)
+                                pcall(function() sma:Call("SetActorHiddenInGame", true) end)
+                                pcall(function() sma:Call("SetActorEnableCollision", false) end)
+                                pcall(function() sma:Call("K2_DestroyActor") end)
+                                Log(TAG .. ": [XArcade sign] DESTROYED")
+                            end
+                        end
+                    end)
+                end
+            end)
+        end
+    end)
+
+    return destroyed
+end
+
+-- Repeating timer: keep checking for late-streamed XArcade actors for 90s after init
+local xarcadeCheckCount = 0
+local MAX_XARCADE_CHECKS = 15  -- 15 checks * 6s = 90s
+
+-- ============================================================================
+-- INIT: Poll every 3s until slots stabilize (v34: wait for FULL hub load)
+-- Hub has ~206 slots. We require 150+ AND 3 consecutive stable polls so all
+-- RestoreSlotEntryFromProfile calls finish before we scramble.
+-- ============================================================================
+local MAX_POLLS = 90
+local MIN_SLOTS = 150
+local READY_STABLE_POLLS = 3
 local initDone = false
 local pollCount = 0
 local maintRuns = 0
@@ -1100,7 +1448,7 @@ local lastMaintSlotCount = 0
 local stableReadyCount = 0
 local lastReadySlotCount = 0
 
-LoopAsync(5000, function()
+LoopAsync(3000, function()
     pollCount = pollCount + 1
 
     if initDone then return true end
@@ -1111,8 +1459,8 @@ LoopAsync(5000, function()
     end
 
     local slotCount = count_registered_slots()
-    if slotCount < 50 then
-        Log(TAG .. ": Poll #" .. pollCount .. " — slots " .. slotCount .. "/50")
+    if slotCount < MIN_SLOTS then
+        Log(TAG .. ": Poll #" .. pollCount .. " — slots " .. slotCount .. "/" .. MIN_SLOTS)
         return false
     end
 
@@ -1156,9 +1504,21 @@ LoopAsync(5000, function()
     -- Run hub slot scramble (with visual updates)
     pcall(scramble_all_slots)
 
+    -- Destroy XArcade promo actors — runs once now, then repeats on a timer
+    -- to catch late-loaded sublevel actors (LVL_Arcade_80s_Rooms_OPTI_DLC1)
+    pcall(destroy_xarcade_actors)
+
     initDone = true
     lastMaintSlotCount = slotCount
     Log(TAG .. ": === Init complete ===")
+
+    -- Start repeating XArcade destroy timer (catches late-streamed sublevel)
+    LoopAsync(6000, function()
+        xarcadeCheckCount = xarcadeCheckCount + 1
+        if xarcadeCheckCount > MAX_XARCADE_CHECKS then return true end
+        pcall(destroy_xarcade_actors)
+        return false
+    end)
 
     -- Schedule deferred flipper arm overrides (15s delay for tables to fully load)
     if #pendingFlipperOverrides > 0 then
@@ -1186,7 +1546,7 @@ pcall(function()
         pcall(scramble_all_slots)
         pcall(scramble_table_cosmetics)
         pcall(apply_pending_flipper_overrides)
-        return TAG .. " v27: sweep #" .. stats.sweeps
+        return TAG .. " v34: sweep #" .. stats.sweeps
             .. " ok=" .. stats.sweep_ok
             .. " empty=" .. stats.empty_filled
             .. " ball=" .. stats.table_ball
@@ -1198,7 +1558,7 @@ end)
 pcall(function()
     RegisterCommand("randomize_status", function()
         local slotCount = count_registered_slots()
-        local msg = TAG .. " v27: pool=" .. stats.pool_size
+        local msg = TAG .. " v34: pool=" .. stats.pool_size
             .. " slots=" .. slotCount
             .. " hook=" .. tostring(hookRegistered)
             .. " polls=" .. pollCount .. "/" .. MAX_POLLS
@@ -1248,5 +1608,43 @@ pcall(function()
     end)
 end)
 
-Log(TAG .. ": v28 loaded — hook=" .. tostring(hookRegistered)
-    .. " | Fixes: IP-matched table cosmetics, robust assignment fallback, per-shelf Gadget/Statue unique+replace")
+Log(TAG .. ": v42 loaded — hook=" .. tostring(hookRegistered)
+    .. " | Fixes: entry blacklist, XArcade repeating destroy, all-room floor/wall+preview, Silver Ball+XArcade blacklist")
+
+-- ============================================================================
+-- GLOBAL EXPORTS — callable by other mods (e.g. PFX_ModMenu)
+-- ============================================================================
+local function scramble_by_catid(catID)
+    if not poolReady then pcall(build_entry_pool) end
+    if not poolReady then return 0 end
+    local _, liveSlots = count_registered_slots()
+    if not liveSlots or #liveSlots == 0 then return 0 end
+    local done = 0
+    for _, slot in ipairs(liveSlots) do
+        pcall(function()
+            if not is_live(slot) then return end
+            local entry = nil
+            pcall(function() entry = slot:Get("m_slotEntry") end)
+            local cid = (entry and is_live(entry)) and get_category_id(entry) or infer_slot_category(slot)
+            if cid == catID then
+                if scramble_one_slot(slot, "manual") then done = done + 1 end
+            end
+        end)
+    end
+    return done
+end
+
+PFX_Rand = nil  -- will be set below
+_G.PFX_Rand = {
+    scramble_all    = scramble_all_slots,
+    scramble_tables = scramble_table_cosmetics,
+    scramble_cat    = scramble_by_catid,
+    -- category IDs
+    CAT_POSTER   = 3,
+    CAT_STATUE   = 4,
+    CAT_GADGET   = 5,
+    CAT_FLOOR    = 6,
+    CAT_WALL     = 7,
+    CAT_HUB      = 14,
+}
+Log(TAG .. ": PFX_Rand global exported")

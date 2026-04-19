@@ -621,7 +621,20 @@ namespace rebuilder
         if (!cls)
             return nullptr;
 
-        // Walk GUObjectArray to find the Default__ instance
+        // Fast path: read ClassDefaultObject directly from UClass struct.
+        // UE5 stores CDO at offset 0x110, UE4 at 0x108.
+        for (uint32_t off : {(uint32_t)0x110u, (uint32_t)0x108u})
+        {
+            ue::UObject *cdo = ue::read_field<ue::UObject *>(cls, off);
+            if (cdo && ue::is_valid_ptr(cdo))
+            {
+                std::string nm = reflection::get_short_name(cdo);
+                if (nm.find("Default__") == 0)
+                    return cdo;
+            }
+        }
+
+        // Fallback: Walk GUObjectArray to find the Default__ instance
         int32_t count = reflection::get_object_count();
         for (int32_t i = 0; i < count; i++)
         {

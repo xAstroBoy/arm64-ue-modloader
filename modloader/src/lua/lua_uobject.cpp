@@ -276,6 +276,8 @@ namespace lua_uobject
             if (item.fstring_allocs)
                 for (auto *p : *item.fstring_allocs)
                     delete[] p;
+            // Conversion buffers are tracked per-thread via ConvBufScope in call_ufunction.
+            // dispatch_gt_call runs on game thread — no conversion buffers to clean up here.
             return;
         }
 
@@ -288,6 +290,9 @@ namespace lua_uobject
         ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
         ue::write_field(item.func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
         g_in_call_ufunction = 0;
+
+        // Conversion buffers are tracked per-thread via ConvBufScope in call_ufunction.
+        // dispatch_gt_call runs on game thread — no conversion buffers to clean up here.
 
         int total = s_gt_call_total.fetch_add(1, std::memory_order_relaxed) + 1;
 
@@ -1461,8 +1466,23 @@ namespace lua_uobject
         // Track FText param offsets to destroy after ProcessEvent
         std::vector<uint8_t *> ftext_params;
 
+        // RAII scope for conversion buffer tracking — saves/restores on nesting
+        lua_ustruct::ConvBufScope conv_scope;
+
         // Fill in parameters from variadic args — ONLY properties with CPF_Parm
         // (skip Blueprint local variables which are also stored as FProperties)
+        // DIAGNOSTIC: log param details for Override functions
+        if (func_name.find("Override") != std::string::npos)
+        {
+            logger::log_info("CALL", "Marshal params for %s::%s: %zu params, %d lua args",
+                             class_name.c_str(), func_name.c_str(), rf->params.size(), (int)va.size());
+            for (size_t pi_idx = 0; pi_idx < rf->params.size(); pi_idx++)
+            {
+                const auto &pi = rf->params[pi_idx];
+                logger::log_info("CALL", "  param[%zu] '%s' type=%d offset=%d size=%d flags=0x%x",
+                                 pi_idx, pi.name.c_str(), (int)pi.type, pi.offset, pi.element_size, pi.flags);
+            }
+        }
         int arg_idx = 0;
         for (const auto &pi : rf->params)
         {
@@ -1741,6 +1761,77 @@ namespace lua_uobject
                 // else: leave zeroed — null delegate is safe for fire-and-forget calls
                 break;
             }
+            case reflection::PropType::SoftObjectProperty:
+            case reflection::PropType::SoftClassProperty:
+            {
+                // TSoftObjectPtr / TSoftClassPtr — auto-convert UObject* → FSoftObjectPath
+                if (arg.is<LuaUObject>())
+                {
+                    ue::UObject *obj = arg.as<LuaUObject &>().ptr;
+                    if (obj && ue::is_valid_ptr(obj) && pi.element_size >= 40 && symbols::FName_Init)
+                    {
+                        std::memset(param_ptr, 0, pi.element_size);
+
+                        std::string full_path = reflection::get_full_name(obj);
+                        if (!full_path.empty())
+                        {
+                            // Split at last '.' → package path + asset name
+                            size_t dot_pos = full_path.rfind('.');
+                            std::string pkg_path, asset_name;
+                            if (dot_pos != std::string::npos)
+                            {
+                                pkg_path = full_path.substr(0, dot_pos);
+                                asset_name = full_path.substr(dot_pos + 1);
+                            }
+                            else
+                            {
+                                pkg_path = full_path;
+                                asset_name = full_path;
+                            }
+
+                            ue::FName pkg_fname = {0, 0};
+                            ue::FName asset_fname = {0, 0};
+                            {
+                                std::u16string u16pkg(pkg_path.begin(), pkg_path.end());
+                                symbols::FName_Init(&pkg_fname, u16pkg.c_str(), 0);
+                            }
+                            {
+                                std::u16string u16asset(asset_name.begin(), asset_name.end());
+                                symbols::FName_Init(&asset_fname, u16asset.c_str(), 0);
+                            }
+
+                            // TPersistentObjectPtr layout:
+                            //   +0x00: TWeakObjectPtr {ObjectIndex(4), SerialNumber(4)}
+                            //   +0x08: FTopLevelAssetPath.PackageName FName (8)
+                            //   +0x10: FTopLevelAssetPath.AssetName FName (8)
+                            //   +0x18: FString SubPathString (16) — zeroed
+
+                            // Fill TWeakObjectPtr so TSoftObjectPtr::Get() can resolve
+                            int32_t obj_index = ue::uobj_get_internal_index(obj);
+                            int32_t obj_serial = reflection::get_object_serial_number(obj_index);
+                            std::memcpy(param_ptr + 0, &obj_index, 4);
+                            std::memcpy(param_ptr + 4, &obj_serial, 4);
+
+                            std::memcpy(param_ptr + 8, &pkg_fname, 8);
+                            std::memcpy(param_ptr + 16, &asset_fname, 8);
+
+                            logger::log_info("CALL", "Auto-converted UObject* → FSoftObjectPath for '%s': %s",
+                                             pi.name.c_str(), full_path.c_str());
+                        }
+                    }
+                }
+                else if (arg.is<lua_ustruct::LuaUStruct>())
+                {
+                    const lua_ustruct::LuaUStruct &src = arg.as<const lua_ustruct::LuaUStruct &>();
+                    if (src.data && src.size > 0)
+                    {
+                        int32_t copy_size = (src.size < pi.element_size) ? src.size : pi.element_size;
+                        std::memcpy(param_ptr, src.data, copy_size);
+                    }
+                }
+                // nil → zeroed (already zero from memset)
+                break;
+            }
             case reflection::PropType::MulticastDelegateProperty:
             case reflection::PropType::MulticastInlineDelegateProperty:
             case reflection::PropType::MulticastSparseDelegateProperty:
@@ -1807,6 +1898,7 @@ namespace lua_uobject
             g_in_call_ufunction = 0;
             for (auto *p : fstring_allocs)
                 delete[] p;
+            conv_scope.cleanup();
             return sol::nil;
         }
         auto pe_fn = pe_hook::get_original();
@@ -1822,6 +1914,22 @@ namespace lua_uobject
         // FString/FText cleanup manually above.
         ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
 
+        // DIAGNOSTIC: hex-dump params for Override functions to verify FSoftObjectPath encoding
+        if (func_name.find("Override") != std::string::npos && parms_size >= 16)
+        {
+            char hex[512];
+            int hlen = 0;
+            size_t dump_sz = params_buf.size() < 128 ? params_buf.size() : 128;
+            for (size_t b = 0; b < dump_sz && hlen < 500; b++)
+            {
+                hlen += snprintf(hex + hlen, 512 - hlen, "%02x", params_buf[b]);
+                if ((b & 7) == 7 && b + 1 < dump_sz)
+                    hlen += snprintf(hex + hlen, 512 - hlen, " ");
+            }
+            logger::log_info("CALL", "PE params[%zu] for %s::%s: %s",
+                             params_buf.size(), class_name.c_str(), func_name.c_str(), hex);
+        }
+
         pe_fn(obj, func, params);
 
         // Restore DestructorLink immediately after ProcessEvent returns.
@@ -1829,6 +1937,9 @@ namespace lua_uobject
         ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
 
         ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
+
+        // Clean up TArray conversion buffers (must happen AFTER PE, BEFORE params_buf dies)
+        conv_scope.cleanup();
         // NOTE: crash guard (g_in_call_ufunction) stays ON through return extraction
         // so that crashes in return value reading are also caught by siglongjmp.
 
@@ -1965,9 +2076,45 @@ namespace lua_uobject
                     return sol::make_object(lua, static_cast<int>(*reinterpret_cast<const int16_t *>(ret_ptr)));
                 return sol::make_object(lua, *reinterpret_cast<const int32_t *>(ret_ptr));
             }
+            case reflection::PropType::SoftObjectProperty:
+            case reflection::PropType::SoftClassProperty:
+            {
+                // TSoftObjectPtr layout:
+                //   +0x00: TWeakObjectPtr (8 bytes — ObjectIndex + SerialNumber)
+                //   +0x08: FTopLevelAssetPath.PackageName FName (8)
+                //   +0x10: FTopLevelAssetPath.AssetName FName (8)
+                //   +0x18: FString SubPathString (16)
+                if (rf->return_prop->element_size >= 40)
+                {
+                    // DIAG: dump return bytes
+                    {
+                        char hexbuf[256] = {};
+                        int hexlen = 0;
+                        int dump_sz = (rf->return_prop->element_size < 48) ? rf->return_prop->element_size : 48;
+                        for (int i = 0; i < dump_sz && hexlen < 240; i++)
+                            hexlen += snprintf(hexbuf + hexlen, 256 - hexlen, "%02x", ret_ptr[i]);
+                        logger::log_info("CALL", "SoftObj return[%d] hex: %s", rf->return_prop->element_size, hexbuf);
+                    }
+                    int32_t pkg_idx = *reinterpret_cast<const int32_t *>(ret_ptr + 8);
+                    int32_t asset_idx = *reinterpret_cast<const int32_t *>(ret_ptr + 16);
+                    if (pkg_idx != 0 || asset_idx != 0)
+                    {
+                        std::string pkg_name = reflection::fname_to_string(pkg_idx);
+                        std::string asset_name = reflection::fname_to_string(asset_idx);
+                        if (!pkg_name.empty() && !asset_name.empty())
+                        {
+                            return sol::make_object(lua, pkg_name + "." + asset_name);
+                        }
+                        else if (!pkg_name.empty())
+                        {
+                            return sol::make_object(lua, pkg_name);
+                        }
+                    }
+                }
+                return sol::nil;
+            }
             case reflection::PropType::ClassProperty:
             case reflection::PropType::WeakObjectProperty:
-            case reflection::PropType::SoftObjectProperty:
             case reflection::PropType::LazyObjectProperty:
             case reflection::PropType::InterfaceProperty:
             {
@@ -2279,6 +2426,63 @@ namespace lua_uobject
                 }
                 break;
             }
+            case reflection::PropType::SoftObjectProperty:
+            case reflection::PropType::SoftClassProperty:
+            {
+                if (arg.is<LuaUObject>())
+                {
+                    ue::UObject *obj_arg = arg.as<LuaUObject &>().ptr;
+                    if (obj_arg && ue::is_valid_ptr(obj_arg) && pi.element_size >= 40 && symbols::FName_Init)
+                    {
+                        std::memset(param_ptr, 0, pi.element_size);
+                        std::string full_path = reflection::get_full_name(obj_arg);
+                        if (!full_path.empty())
+                        {
+                            size_t dot_pos = full_path.rfind('.');
+                            std::string pkg_path, asset_name;
+                            if (dot_pos != std::string::npos)
+                            {
+                                pkg_path = full_path.substr(0, dot_pos);
+                                asset_name = full_path.substr(dot_pos + 1);
+                            }
+                            else
+                            {
+                                pkg_path = full_path;
+                                asset_name = full_path;
+                            }
+                            ue::FName pkg_fname = {0, 0};
+                            ue::FName asset_fname = {0, 0};
+                            {
+                                std::u16string u16pkg(pkg_path.begin(), pkg_path.end());
+                                symbols::FName_Init(&pkg_fname, u16pkg.c_str(), 0);
+                            }
+                            {
+                                std::u16string u16asset(asset_name.begin(), asset_name.end());
+                                symbols::FName_Init(&asset_fname, u16asset.c_str(), 0);
+                            }
+                            // TPersistentObjectPtr: WeakPtr(8) + PackageName(8) + AssetName(8) + SubPath(16)
+                            int32_t obj_index_bg = ue::uobj_get_internal_index(obj_arg);
+                            int32_t obj_serial_bg = reflection::get_object_serial_number(obj_index_bg);
+                            std::memcpy(param_ptr + 0, &obj_index_bg, 4);
+                            std::memcpy(param_ptr + 4, &obj_serial_bg, 4);
+                            std::memcpy(param_ptr + 8, &pkg_fname, 8);
+                            std::memcpy(param_ptr + 16, &asset_fname, 8);
+                            logger::log_info("CALLBG", "Auto-converted UObject* → FSoftObjectPath for '%s': %s",
+                                             pi.name.c_str(), full_path.c_str());
+                        }
+                    }
+                }
+                else if (arg.is<lua_ustruct::LuaUStruct>())
+                {
+                    const lua_ustruct::LuaUStruct &src = arg.as<const lua_ustruct::LuaUStruct &>();
+                    if (src.data && src.size > 0)
+                    {
+                        int32_t copy_size = (src.size < pi.element_size) ? src.size : pi.element_size;
+                        std::memcpy(param_ptr, src.data, copy_size);
+                    }
+                }
+                break;
+            }
             default:
                 if (arg.get_type() == sol::type::lightuserdata)
                     *reinterpret_cast<void **>(param_ptr) = arg.as<void *>();
@@ -2461,6 +2665,7 @@ namespace lua_uobject
                                   class_name.c_str(), func_name.c_str(), obj);
             }
             g_in_call_ufunction = 0;
+            // No ConvBufScope needed — call_ufunction_bg uses raw params, no Lua conversion
             return false;
         }
         auto pe_fn = pe_hook::get_original();
@@ -2472,6 +2677,7 @@ namespace lua_uobject
         pe_fn(obj, func, params_buf.data());
         ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
         ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
+        // No ConvBufScope needed — call_ufunction_bg uses raw params, no Lua conversion
         g_in_call_ufunction = 0;
         return true;
     }

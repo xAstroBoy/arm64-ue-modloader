@@ -27,6 +27,7 @@
 #include "modloader/config.h"
 #include "modloader/game_profile.h"
 #include "modloader/auto_offsets.h"
+#include "modloader/ue_memory.h"
 #include "modloader/safe_call.h"
 
 #include <chrono>
@@ -468,6 +469,9 @@ namespace init
             ue::apply_type_offsets(game_profile::offsets());
             logger::log_info("BOOT", "Type offsets updated after auto-discovery");
         }
+
+        // ── Step 6.6: Initialize UE memory allocator ────────────────────────
+        ue_memory::init();
 
         // ── Step 7: Resolve core symbols ────────────────────────────────────
         symbols::resolve_core_symbols();

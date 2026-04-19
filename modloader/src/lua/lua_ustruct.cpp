@@ -13,9 +13,80 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 
 namespace lua_ustruct
 {
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TArray conversion buffer tracking (thread-local, nesting-safe)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tracks calloc'd buffers written into ProcessEvent params so we can
+    // clean them up after PE returns (prevents leaks + engine corruption).
+    // Each ConvBufScope saves and restores the list, so nested call_ufunction
+    // invocations (PE → hook → tick → Lua → Call) each track their own buffers.
+    struct ConvBufEntry
+    {
+        uint8_t *tarray_header; // pointer to the TArray header in params (Data/Num/Max)
+        void *alloc_ptr;        // the calloc'd buffer we wrote as Data
+    };
+    static thread_local std::vector<ConvBufEntry> tl_conv_buffers;
+
+    // --- ConvBufScope implementation ---
+
+    ConvBufScope::ConvBufScope()
+    {
+        // Save current entries and start fresh for this nesting level
+        saved_ = new std::vector<ConvBufEntry>(std::move(tl_conv_buffers));
+        tl_conv_buffers.clear();
+    }
+
+    ConvBufScope::~ConvBufScope()
+    {
+        // If cleanup() wasn't called, free any remaining buffers to prevent leaks
+        for (auto &entry : tl_conv_buffers)
+        {
+            if (entry.alloc_ptr)
+            {
+                std::free(entry.alloc_ptr);
+                entry.alloc_ptr = nullptr;
+            }
+        }
+        // Restore outer level's entries
+        auto *saved = static_cast<std::vector<ConvBufEntry> *>(saved_);
+        tl_conv_buffers = std::move(*saved);
+        delete saved;
+    }
+
+    void ConvBufScope::cleanup()
+    {
+        for (auto &entry : tl_conv_buffers)
+        {
+            if (!entry.alloc_ptr)
+                continue;
+
+            // Check if the TArray Data pointer in params still points to our buffer
+            void *current_data = *reinterpret_cast<void **>(entry.tarray_header);
+            if (current_data == entry.alloc_ptr)
+            {
+                // BP didn't move it — zero the TArray header and free the buffer
+                std::memset(entry.tarray_header, 0, 16); // zero Data+Num+Max
+                std::free(entry.alloc_ptr);
+            }
+            else if (current_data != nullptr)
+            {
+                // BP moved/replaced the pointer — our buffer is orphaned, free it
+                std::free(entry.alloc_ptr);
+            }
+            else
+            {
+                // Data pointer is now null — BP zeroed it. Free our buffer.
+                std::free(entry.alloc_ptr);
+            }
+            entry.alloc_ptr = nullptr;
+        }
+        tl_conv_buffers.clear();
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // LuaUStruct lifecycle
@@ -639,13 +710,17 @@ namespace lua_ustruct
                                 symbols::FName_Init(&asset_fname, u16asset.c_str(), 0);
                             }
 
-                            // Write FTopLevelAssetPath at element start
-                            // PackageName FName at +0x00
-                            std::memcpy(elem + 0, &pkg_fname, 8);
-                            // AssetName FName at +0x08
-                            std::memcpy(elem + 8, &asset_fname, 8);
-                            // SubPathString (FString) at +0x10 = {nullptr, 0, 0} — already zeroed
-                            // FWeakObjectPtr at +0x20 = {0, 0} — already zeroed (will be resolved lazily)
+                            // TSoftObjectPtr layout: WeakPtr(8) + PackageName(8) + AssetName(8) + SubPath(16)
+                            // Fill TWeakObjectPtr at +0x00
+                            int32_t obj_idx = ue::uobj_get_internal_index(obj);
+                            int32_t obj_ser = reflection::get_object_serial_number(obj_idx);
+                            std::memcpy(elem + 0, &obj_idx, 4);
+                            std::memcpy(elem + 4, &obj_ser, 4);
+                            // PackageName FName at +0x08
+                            std::memcpy(elem + 8, &pkg_fname, 8);
+                            // AssetName FName at +0x10
+                            std::memcpy(elem + 16, &asset_fname, 8);
+                            // SubPathString (FString) at +0x18 = {nullptr, 0, 0} — already zeroed
                         }
 
                         // Write TArray header: {Data*, Num, Max}
@@ -653,10 +728,13 @@ namespace lua_ustruct
                         *reinterpret_cast<int32_t *>(ptr + 8) = num;
                         *reinterpret_cast<int32_t *>(ptr + 12) = num;
 
+                        // Track for post-PE cleanup
+                        tl_conv_buffers.push_back({ptr, new_data});
+
                         logger::log_info("TARRAY", "Converted TArray<UObject*>(%d) → TArray<SoftObj>(%d) "
-                                                   "for field '%s': %d elems, src_sz=%d dest_sz=%d",
+                                                   "for field '%s': %d elems, buf=%p (tracked for cleanup)",
                                          src_elem_size, dest_elem_size, fi.name.c_str(),
-                                         num, src_elem_size, dest_elem_size);
+                                         num, new_data);
                         return true;
                     }
 
@@ -681,9 +759,12 @@ namespace lua_ustruct
                             *reinterpret_cast<int32_t *>(ptr + 8) = num;
                             *reinterpret_cast<int32_t *>(ptr + 12) = num;
 
+                            // Track for post-PE cleanup
+                            tl_conv_buffers.push_back({ptr, new_data});
+
                             logger::log_warn("TARRAY", "TArray element size mismatch for '%s': "
-                                                       "src=%d dest=%d, zero-padded %d elems",
-                                             fi.name.c_str(), src_elem_size, dest_elem_size, num);
+                                                       "src=%d dest=%d, zero-padded %d elems, buf=%p (tracked)",
+                                             fi.name.c_str(), src_elem_size, dest_elem_size, num, new_data);
                             return true;
                         }
                     }
@@ -699,8 +780,9 @@ namespace lua_ustruct
         case reflection::PropType::SoftObjectProperty:
         case reflection::PropType::SoftClassProperty:
         {
-            // TSoftObjectPtr / TSoftClassPtr — shallow copy from another struct field
-            // These are typically FSoftObjectPath (FName + FString) — just memcpy the raw bytes
+            // TSoftObjectPtr / TSoftClassPtr
+            // Accept: LuaUStruct (raw copy), UObject* (auto-convert), nil (zero)
+
             if (value.is<LuaUStruct>())
             {
                 const LuaUStruct &src = value.as<const LuaUStruct &>();
@@ -711,6 +793,73 @@ namespace lua_ustruct
                     return true;
                 }
             }
+
+            // Auto-convert UObject* → FSoftObjectPath (same logic as TArray conversion)
+            if (value.is<lua_uobject::LuaUObject>())
+            {
+                const auto &luo = value.as<const lua_uobject::LuaUObject &>();
+                ue::UObject *obj = luo.ptr;
+                if (obj && ue::is_valid_ptr(obj) && fi.element_size >= 40 && symbols::FName_Init)
+                {
+                    // Zero out entire field first
+                    std::memset(ptr, 0, fi.element_size);
+
+                    // Build FSoftObjectPath from UObject's path
+                    std::string full_path = reflection::get_full_name(obj);
+                    if (!full_path.empty())
+                    {
+                        // Split at last '.' → package path + asset name
+                        size_t dot_pos = full_path.rfind('.');
+                        std::string pkg_path, asset_name;
+                        if (dot_pos != std::string::npos)
+                        {
+                            pkg_path = full_path.substr(0, dot_pos);
+                            asset_name = full_path.substr(dot_pos + 1);
+                        }
+                        else
+                        {
+                            pkg_path = full_path;
+                            asset_name = full_path;
+                        }
+
+                        // Convert to FNames
+                        ue::FName pkg_fname = {0, 0};
+                        ue::FName asset_fname = {0, 0};
+                        {
+                            std::u16string u16pkg(pkg_path.begin(), pkg_path.end());
+                            symbols::FName_Init(&pkg_fname, u16pkg.c_str(), 0);
+                        }
+                        {
+                            std::u16string u16asset(asset_name.begin(), asset_name.end());
+                            symbols::FName_Init(&asset_fname, u16asset.c_str(), 0);
+                        }
+
+                        // TPersistentObjectPtr layout:
+                        //   +0x00: TWeakObjectPtr {ObjectIndex(4), SerialNumber(4)}
+                        //   +0x08: FTopLevelAssetPath.PackageName FName (8)
+                        //   +0x10: FTopLevelAssetPath.AssetName FName (8)
+                        //   +0x18: FString SubPathString (16) — zeroed
+                        int32_t obj_idx_s = ue::uobj_get_internal_index(obj);
+                        int32_t obj_ser_s = reflection::get_object_serial_number(obj_idx_s);
+                        std::memcpy(ptr + 0, &obj_idx_s, 4);
+                        std::memcpy(ptr + 4, &obj_ser_s, 4);
+                        std::memcpy(ptr + 8, &pkg_fname, 8);
+                        std::memcpy(ptr + 16, &asset_fname, 8);
+
+                        logger::log_info("USTRUCT", "Auto-converted UObject* → FSoftObjectPath for '%s': %s",
+                                         fi.name.c_str(), full_path.c_str());
+                        return true;
+                    }
+                }
+                // Fallback: if object is valid but can't convert, try writing raw pointer
+                // (won't work for real soft refs, but avoids silent failure)
+                logger::log_warn("USTRUCT", "Cannot convert UObject* to FSoftObjectPath for '%s' "
+                                            "(elem_size=%d, FName_Init=%s)",
+                                 fi.name.c_str(), fi.element_size,
+                                 symbols::FName_Init ? "yes" : "no");
+                return false;
+            }
+
             // Also accept nil → zero out
             if (value == sol::nil)
             {

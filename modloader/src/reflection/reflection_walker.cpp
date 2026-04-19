@@ -723,6 +723,53 @@ namespace reflection
                         // Walk function parameters (properties of the UFunction itself)
                         fi.params = walk_properties(reinterpret_cast<const ue::UStruct *>(func), false);
 
+                        // ALWAYS log for functions with parms_size > 0
+                        if (fi.parms_size > 0)
+                        {
+                            logger::log_info("REFLECT", "UFunc '%s': parms_size=%d num_parms=%d walk_props=%zu",
+                                             fi.name.c_str(), fi.parms_size, fi.num_parms, fi.params.size());
+                        }
+
+                        // Diagnostic: if UFunction has params but walk_properties found none,
+                        // ChildProperties is likely NULL — try scanning nearby offsets
+                        if (fi.params.empty() && fi.num_parms > 0 && fi.parms_size > 0)
+                        {
+                            // ChildProperties might be at the wrong offset for this UE build.
+                            // Try scanning offsets near the configured one.
+                            uint32_t configured_off = ue::ustruct::CHILD_PROPERTIES_OFF();
+                            for (uint32_t scan_off = 0x38; scan_off <= 0x70; scan_off += 8)
+                            {
+                                if (scan_off == configured_off)
+                                    continue;
+                                ue::FField *candidate = ue::read_field<ue::FField *>(func, scan_off);
+                                if (candidate && is_readable_ptr(candidate))
+                                {
+                                    // Check if this looks like an FField by trying to classify it
+                                    std::string cname = get_ffield_class_name(candidate);
+                                    if (!cname.empty() && cname != "Unknown")
+                                    {
+                                        logger::log_warn("REFLECT",
+                                                         "UFunction '%s' has %d params but ChildProperties@0x%X is NULL. "
+                                                         "Found FField '%s' at offset 0x%X — CHILD_PROPERTIES_OFF may be wrong!",
+                                                         fi.name.c_str(), fi.num_parms, configured_off,
+                                                         cname.c_str(), scan_off);
+                                        // Try walking from this offset
+                                        uint32_t saved = ue::ustruct::CHILD_PROPERTIES_OFF();
+                                        ue::ustruct::CHILD_PROPERTIES_OFF() = scan_off;
+                                        fi.params = walk_properties(reinterpret_cast<const ue::UStruct *>(func), false);
+                                        ue::ustruct::CHILD_PROPERTIES_OFF() = saved;
+                                        if (!fi.params.empty())
+                                        {
+                                            logger::log_warn("REFLECT",
+                                                             "  Auto-corrected: found %zu params at offset 0x%X for '%s'",
+                                                             fi.params.size(), scan_off, fi.name.c_str());
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         // Find return property
                         for (auto &p : fi.params)
                         {
@@ -1346,6 +1393,32 @@ namespace reflection
     ue::UObject *get_object_by_index(int32_t index)
     {
         return get_object_at_index(index);
+    }
+
+    int32_t get_object_serial_number(int32_t internal_index)
+    {
+        if (s_guobject_array == 0 || internal_index < 0)
+            return 0;
+
+        uintptr_t embedded_start = s_guobject_array + ue::GUOBJECTARRAY_TO_OBJECTS;
+        uintptr_t obj_objects = ue::read_field<uintptr_t>(
+            reinterpret_cast<const void *>(embedded_start), 0);
+
+        if (!ue::is_valid_ptr(reinterpret_cast<const void *>(obj_objects)))
+            return 0;
+
+        int32_t chunk_idx = internal_index / static_cast<int32_t>(ue::FUOBJECTITEM_CHUNK_SIZE);
+        int32_t within_chunk = internal_index % static_cast<int32_t>(ue::FUOBJECTITEM_CHUNK_SIZE);
+
+        uintptr_t chunk_ptr = ue::read_field<uintptr_t>(
+            reinterpret_cast<const void *>(obj_objects), chunk_idx * 8);
+
+        if (!ue::is_valid_ptr(reinterpret_cast<const void *>(chunk_ptr)))
+            return 0;
+
+        // FUObjectItem layout: +0x00 UObject*(8), +0x08 Flags(4), +0x0C ClusterRootIndex(4), +0x10 SerialNumber(4)
+        uintptr_t item_addr = chunk_ptr + static_cast<uintptr_t>(within_chunk) * FUOBJECTITEM_SIZE;
+        return ue::read_field<int32_t>(reinterpret_cast<const void *>(item_addr), 0x10);
     }
 
 } // namespace reflection

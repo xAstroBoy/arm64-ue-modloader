@@ -53,6 +53,7 @@ set(MOD_SOURCES
     src/util/notification.cpp
     src/util/safe_call.cpp
     src/core/auto_offsets.cpp
+    src/core/ue_memory.cpp
     src/lua/lua_console.cpp
     src/lua/lua_cast.cpp
 )
