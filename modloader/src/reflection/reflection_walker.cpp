@@ -629,6 +629,7 @@ namespace reflection
                     pi.name = fname_to_string(name_idx);
                     pi.type = pt;
                     pi.raw = reinterpret_cast<ue::FProperty *>(const_cast<ue::FField *>(field));
+                    pi.array_dim = ue::fprop_get_array_dim(pi.raw);
                     pi.offset = ue::fprop_get_offset(pi.raw);
                     pi.element_size = ue::fprop_get_element_size(pi.raw);
                     pi.flags = ue::fprop_get_flags(pi.raw);
@@ -1362,13 +1363,13 @@ namespace reflection
         // Flags that indicate an object is not safe to use as a live instance:
         // loading (PrimaryDataAsset async), uninitialized, CDO, archetype, or being GC'd.
         static constexpr int32_t UNSAFE_FLAGS =
-            ue::RF_ClassDefaultObject     |
-            ue::RF_ArchetypeObject        |
-            ue::RF_NeedInitialization     |
-            ue::RF_NeedLoad               |
-            ue::RF_NeedPostLoad           |
+            ue::RF_ClassDefaultObject |
+            ue::RF_ArchetypeObject |
+            ue::RF_NeedInitialization |
+            ue::RF_NeedLoad |
+            ue::RF_NeedPostLoad |
             ue::RF_NeedPostLoadSubobjects |
-            ue::RF_BeginDestroyed         |
+            ue::RF_BeginDestroyed |
             ue::RF_FinishDestroyed;
 
         std::vector<ue::UObject *> result;

@@ -80,6 +80,7 @@ namespace game_profile
         // ── FProperty ──
         uint32_t FProp_element_size;
         uint32_t FProp_property_flags;
+        uint32_t FProp_array_dim;
         uint32_t FProp_offset_internal;
         uint32_t FProp_size;
 

@@ -56,7 +56,8 @@ namespace reflection
     {
         std::string name;
         PropType type;
-        int32_t offset; // from FProperty->Offset_Internal
+        int32_t array_dim; // FProperty::ArrayDim (static arrays > 1)
+        int32_t offset;    // from FProperty->Offset_Internal
         int32_t element_size;
         uint64_t flags;     // EPropertyFlags
         ue::FProperty *raw; // live pointer to FProperty

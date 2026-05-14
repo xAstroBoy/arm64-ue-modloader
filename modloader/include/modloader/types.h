@@ -246,6 +246,11 @@ namespace ue
             static uint32_t v = 0x40;
             return v;
         }
+        inline uint32_t &ARRAY_DIM_OFF()
+        {
+            static uint32_t v = 0x34;
+            return v;
+        }
         inline uint32_t &OFFSET_INTERNAL_OFF()
         {
             static uint32_t v = 0x4C;
@@ -580,6 +585,11 @@ namespace ue
         return read_field<uint64_t>(p, fprop::PROPERTY_FLAGS_OFF());
     }
 
+    inline int32_t fprop_get_array_dim(const FProperty *p)
+    {
+        return read_field<int32_t>(p, fprop::ARRAY_DIM_OFF());
+    }
+
     // UFunction accessors
     inline uint32_t ufunc_get_flags(const UFunction *f)
     {
@@ -673,6 +683,7 @@ namespace ue
         // FProperty
         fprop::ELEMENT_SIZE_OFF() = o.FProp_element_size;
         fprop::PROPERTY_FLAGS_OFF() = o.FProp_property_flags;
+        fprop::ARRAY_DIM_OFF() = o.FProp_array_dim;
         fprop::OFFSET_INTERNAL_OFF() = o.FProp_offset_internal;
         fprop::SIZE_OFF() = o.FProp_size;
         fprop::BOOL_FIELD_SIZE_OFF() = o.FProp_bool_field_size;

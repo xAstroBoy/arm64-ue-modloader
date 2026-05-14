@@ -1444,11 +1444,35 @@ namespace sdk_gen
                 payload.write_i32(name_to_idx[e.values[i].first]);
         }
 
-        // Helper: write a single property type recursively (matches Dumper-7 GeneratePropertyType)
-        std::function<void(const reflection::PropertyInfo &)> write_property_type;
-        write_property_type = [&](const reflection::PropertyInfo &prop)
+        auto safe_name_index = [&](const std::string &n) -> int32_t
         {
-            UsmapPropertyType utype = to_usmap_type(prop.type);
+            if (n.empty())
+                return 0;
+            auto it = name_to_idx.find(n);
+            return (it != name_to_idx.end()) ? it->second : 0;
+        };
+
+        auto short_name_of = [&](const ue::UObject *obj) -> std::string
+        {
+            if (!obj || !ue::is_valid_ptr(obj))
+                return "";
+            return reflection::get_short_name(obj);
+        };
+
+        // Helper: write a single property type recursively from live FProperty metadata
+        // (matches UE4SS/Dumper style and avoids name-based guessing for nested types).
+        std::function<void(const ue::FProperty *)> write_property_type_raw;
+        write_property_type_raw = [&](const ue::FProperty *raw_prop)
+        {
+            if (!raw_prop || !ue::is_valid_ptr(raw_prop))
+            {
+                payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
+                return;
+            }
+
+            reflection::PropType rtype = reflection::classify_property(
+                reinterpret_cast<const ue::FField *>(raw_prop));
+            UsmapPropertyType utype = to_usmap_type(rtype);
             payload.write_u8(static_cast<uint8_t>(utype));
 
             // EnumProperty: write underlying type (ByteProperty), then i32 enum name index
@@ -1456,8 +1480,17 @@ namespace sdk_gen
             {
                 // Underlying type is always ByteProperty
                 payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
-                // Enum class name
-                int32_t enum_idx = prop.inner_type_name.empty() ? 0 : name_to_idx[prop.inner_type_name];
+                // Enum class name (works for both FEnumProperty and enum-backed FByteProperty)
+                ue::UEnum *enum_obj = nullptr;
+                if (rtype == reflection::PropType::EnumProperty)
+                {
+                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::ENUM_PROP_ENUM_OFF());
+                }
+                else if (rtype == reflection::PropType::ByteProperty)
+                {
+                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::BYTE_PROP_ENUM_OFF());
+                }
+                int32_t enum_idx = safe_name_index(short_name_of(reinterpret_cast<const ue::UObject *>(enum_obj)));
                 payload.write_i32(enum_idx);
                 return;
             }
@@ -1465,7 +1498,8 @@ namespace sdk_gen
             // StructProperty: write i32 struct name index
             if (utype == UsmapPropertyType::StructProperty)
             {
-                int32_t inner_idx = prop.inner_type_name.empty() ? 0 : name_to_idx[prop.inner_type_name];
+                ue::UStruct *inner_struct = ue::read_field<ue::UStruct *>(raw_prop, ue::fprop::STRUCT_INNER_STRUCT_OFF());
+                int32_t inner_idx = safe_name_index(short_name_of(reinterpret_cast<const ue::UObject *>(inner_struct)));
                 payload.write_i32(inner_idx);
                 return;
             }
@@ -1486,73 +1520,83 @@ namespace sdk_gen
             // ArrayProperty/SetProperty: recursively write inner element type
             if (utype == UsmapPropertyType::ArrayProperty || utype == UsmapPropertyType::SetProperty)
             {
-                if (!prop.inner_type_name.empty())
-                {
-                    reflection::StructInfo *si = reflection::find_struct(prop.inner_type_name);
-                    if (si)
-                    {
-                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::StructProperty));
-                        payload.write_i32(name_to_idx[prop.inner_type_name]);
-                    }
-                    else
-                    {
-                        // ObjectProperty — NO extra data after type byte
-                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ObjectProperty));
-                    }
-                }
+                const ue::FProperty *inner = nullptr;
+                if (utype == UsmapPropertyType::ArrayProperty)
+                    inner = ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::ARRAY_INNER_OFF());
                 else
-                {
-                    payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
-                }
+                    inner = ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::SET_ELEMENT_PROP_OFF());
+                write_property_type_raw(inner);
                 return;
             }
 
             // MapProperty: recursively write key type + value type
             if (utype == UsmapPropertyType::MapProperty)
             {
-                // Key type
-                if (!prop.inner_type_name.empty())
-                {
-                    reflection::StructInfo *si = reflection::find_struct(prop.inner_type_name);
-                    if (si)
-                    {
-                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::StructProperty));
-                        payload.write_i32(name_to_idx[prop.inner_type_name]);
-                    }
-                    else
-                    {
-                        // ObjectProperty — NO extra data after type byte
-                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ObjectProperty));
-                    }
-                }
-                else
-                {
-                    payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
-                }
-                // Value type
-                if (!prop.inner_type_name2.empty())
-                {
-                    reflection::StructInfo *si = reflection::find_struct(prop.inner_type_name2);
-                    if (si)
-                    {
-                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::StructProperty));
-                        payload.write_i32(name_to_idx[prop.inner_type_name2]);
-                    }
-                    else
-                    {
-                        // ObjectProperty — NO extra data after type byte
-                        payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ObjectProperty));
-                    }
-                }
-                else
-                {
-                    payload.write_u8(static_cast<uint8_t>(UsmapPropertyType::ByteProperty));
-                }
+                const ue::FProperty *key_prop = ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_KEY_PROP_OFF());
+                const ue::FProperty *val_prop = ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_VALUE_PROP_OFF());
+                write_property_type_raw(key_prop);
+                write_property_type_raw(val_prop);
                 return;
             }
 
             // All other types (Bool, Int, Float, etc.): no extra data needed
         };
+
+        // Ensure all names referenced by recursively-written property types are present.
+        std::function<void(const ue::FProperty *)> collect_type_names_raw;
+        collect_type_names_raw = [&](const ue::FProperty *raw_prop)
+        {
+            if (!raw_prop || !ue::is_valid_ptr(raw_prop))
+                return;
+
+            reflection::PropType rtype = reflection::classify_property(
+                reinterpret_cast<const ue::FField *>(raw_prop));
+            UsmapPropertyType utype = to_usmap_type(rtype);
+
+            if (utype == UsmapPropertyType::EnumProperty)
+            {
+                ue::UEnum *enum_obj = nullptr;
+                if (rtype == reflection::PropType::EnumProperty)
+                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::ENUM_PROP_ENUM_OFF());
+                else if (rtype == reflection::PropType::ByteProperty)
+                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::BYTE_PROP_ENUM_OFF());
+                add_name(short_name_of(reinterpret_cast<const ue::UObject *>(enum_obj)));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::StructProperty)
+            {
+                ue::UStruct *inner_struct = ue::read_field<ue::UStruct *>(raw_prop, ue::fprop::STRUCT_INNER_STRUCT_OFF());
+                add_name(short_name_of(reinterpret_cast<const ue::UObject *>(inner_struct)));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::ArrayProperty)
+            {
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::ARRAY_INNER_OFF()));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::SetProperty)
+            {
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::SET_ELEMENT_PROP_OFF()));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::MapProperty)
+            {
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_KEY_PROP_OFF()));
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_VALUE_PROP_OFF()));
+                return;
+            }
+        };
+
+        for (const auto &s : structs)
+            for (const auto &p : s.properties)
+                collect_type_names_raw(p.raw);
+        for (const auto &c : classes)
+            for (const auto &p : c.properties)
+                collect_type_names_raw(p.raw);
 
         // Structs table: u32 count, then for each struct:
         //   i32 nameIdx, i32 superIdx (-1=none), u16 propCount, u16 serializablePropCount
@@ -1570,19 +1614,32 @@ namespace sdk_gen
                 payload.write_i32(name_to_idx[parent]);
             else
                 payload.write_i32(-1);
-            // PropertyCount = total property slots (sum of array dims)
-            uint16_t prop_count = static_cast<uint16_t>(props.size() > 65535 ? 65535 : props.size());
+            uint32_t total_slots = 0;
+            for (const auto &p : props)
+            {
+                uint32_t dim = (p.array_dim > 0) ? static_cast<uint32_t>(p.array_dim) : 1u;
+                total_slots += dim;
+            }
+
+            uint16_t prop_count = static_cast<uint16_t>(total_slots > 65535 ? 65535 : total_slots);
+            uint16_t serializable_count = static_cast<uint16_t>(props.size() > 65535 ? 65535 : props.size());
             payload.write_u16(prop_count);
-            // SerializablePropertyCount = number of property entries we write
-            payload.write_u16(prop_count);
+            payload.write_u16(serializable_count);
+
             // Properties
-            for (uint16_t i = 0; i < prop_count; i++)
+            uint32_t schema_index = 0;
+            for (uint16_t i = 0; i < serializable_count; i++)
             {
                 const auto &p = props[i];
-                payload.write_u16(i);                   // Schema index
-                payload.write_u8(1);                    // ArrayDim (1 = not a static array)
-                payload.write_i32(name_to_idx[p.name]); // Property name index
-                write_property_type(p);                 // Property type (recursive)
+                uint8_t array_dim = static_cast<uint8_t>(
+                    p.array_dim <= 0 ? 1 : (p.array_dim > 255 ? 255 : p.array_dim));
+
+                payload.write_u16(static_cast<uint16_t>(schema_index > 65535 ? 65535 : schema_index));
+                payload.write_u8(array_dim);
+                payload.write_i32(safe_name_index(p.name));
+                write_property_type_raw(p.raw);
+
+                schema_index += array_dim;
             }
         };
 

@@ -120,6 +120,7 @@ namespace game_profile
 
             o.FProp_element_size = fproperty_layout::ue5::ELEMENT_SIZE;
             o.FProp_property_flags = fproperty_layout::ue5::PROPERTY_FLAGS;
+            o.FProp_array_dim = fproperty_layout::ue5::ARRAY_DIM;
             o.FProp_offset_internal = fproperty_layout::ue5::OFFSET_INTERNAL;
             o.FProp_size = fproperty_layout::ue5::BASE_SIZE;
 
@@ -148,6 +149,7 @@ namespace game_profile
 
             o.FProp_element_size = fproperty_layout::ue4::ELEMENT_SIZE;
             o.FProp_property_flags = fproperty_layout::ue4::PROPERTY_FLAGS;
+            o.FProp_array_dim = fproperty_layout::ue4::ARRAY_DIM;
             o.FProp_offset_internal = fproperty_layout::ue4::OFFSET_INTERNAL;
             o.FProp_size = fproperty_layout::ue4::BASE_SIZE;
 
