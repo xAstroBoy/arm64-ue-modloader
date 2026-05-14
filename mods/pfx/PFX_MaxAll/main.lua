@@ -1,6 +1,20 @@
 -- ============================================================================
--- PFX_MaxAll v25 — Max All Progress + Unlock All + GRABBABLE Trophy Fix
+-- PFX_MaxAll v27 — Max All Progress + Unlock All + GRABBABLE Trophy Fix
 -- ============================================================================
+-- v27 TROPHY GRAB FIX:
+--   Root cause: GrabComponent::CanGrab() calls IsGrabDisabled() via
+--   IPFXGrabContextInterface on the trophy actor → dispatches to
+--   BP_Collectible_Trophy_Base_C:IsGrabDisabled() → returns true for holos.
+--   The v25/v26 hooks targeted IsHologramByCollectibleEntry (one layer deeper),
+--   but binary patch BINJA offset bias and native dispatch paths meant they
+--   could still be bypassed.
+--
+--   FIX: HOOK 0 hooks BP_Collectible_Trophy_Base_C:IsGrabDisabled directly
+--   at ProcessEvent level → writes ReturnValue=false + BLOCK. This is the
+--   EXACT function called by the grab system, with zero indirect paths.
+--   Also added a deferred GrabComponent IsLocked=false unlock 6s after the
+--   trophy respawn to ensure IsLocked never pre-empts the IsGrabDisabled check.
+--
 -- v25 ROOT CAUSE FIX:
 --   Binary analysis of exec thunk at 0x4E62E30 revealed the REAL impl of
 --   IsAchievementUnlocked is sub_4F6272C. It reads element[0x78] from the
@@ -26,7 +40,7 @@ local TAG = "PFX_MaxAll"
 local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
-Log(TAG .. ": Loading v26...")
+Log(TAG .. ": Loading v27...")
 
 -- ============================================================================
 -- STATE
@@ -49,6 +63,7 @@ local state = {
     achi_hook = false,
     restore_hook = false,
     change_hook = false,
+    grab_hook = false,
     trophy_initial_swaps = 0,
     trophy_hook_swaps = 0,
     trophy_respawned = 0,
@@ -270,7 +285,7 @@ local function swap_slot_to_physical(component, actor, physEntry)
     -- Deferred via LoopAsync(200ms) to avoid re-entrancy and let the game
     -- finish its current operation before we destroy/spawn actors.
     if actor and is_live(actor) then
-        LoopAsync(200, function()
+        ExecuteWithDelay(200, function()
             pcall(function()
                 if not is_live(actor) then return end
                 local csr = actor:Get("CollectibleSlotRoot")
@@ -281,7 +296,6 @@ local function swap_slot_to_physical(component, actor, physEntry)
                 pcall(function() csr:Call("DestroyPreviousCollectible") end)
                 pcall(function() csr:Call("SetupWithCollectibleEntry", physEntry) end)
             end)
-            return true  -- run once
         end)
     end
     return ok1
@@ -400,6 +414,40 @@ local function fix_all_trophies()
         .. " fail=" .. fail
         .. " total=" .. #slots)
 
+    -- Deferred GrabComponent unlock: trophy actors may not be spawned yet when
+    -- SetupWithCollectibleEntry is called (async spawn chain). Wait 6s for the
+    -- last actor to appear, then clear IsLocked on every GrabComponent so the
+    -- grab system can reach the IsGrabDisabled() check (HOOK 0 handles that).
+    ExecuteWithDelay(6000, function()
+        local unlocked = 0
+        pcall(function()
+            local actors = FindAllOf("BP_Collectible_Trophy_Base_C")
+            if not actors then return end
+            local gcClass = FindClass("GrabComponent_C")
+            for _, actor in ipairs(actors) do
+                pcall(function()
+                    if not is_live(actor) then return end
+                    if gcClass then
+                        local comps = actor:Call("K2_GetComponentsByClass", gcClass)
+                        if comps then
+                            for _, gc in ipairs(comps) do
+                                pcall(function()
+                                    gc:Set("IsLocked", false)
+                                    unlocked = unlocked + 1
+                                end)
+                            end
+                        end
+                    else
+                        -- Fallback: set IsPhysicsEnabled on the actor itself
+                        pcall(function() actor:Set("IsPhysicsEnabled", false) end)
+                    end
+                end)
+            end
+        end)
+        state.trophy_actors_spawned = unlocked
+        Log(TAG .. ": GrabComponent unlock: " .. unlocked .. " trophy grab components unlocked")
+    end)
+
     return dataSwapped + respawned
 end
 
@@ -421,13 +469,47 @@ end
 -- it won't get hologram treatment. The physical actors from initial spawn stay.
 -- ============================================================================
 local trophySweepStarted = false
+local trophyWatchdogStarted = false
+
+local perf = {
+    sweep_runs = 0,
+    sweep_ms_total = 0,
+    sweep_ms_max = 0,
+    watchdog_runs = 0,
+    watchdog_ms_total = 0,
+    watchdog_ms_max = 0,
+}
+
+local function in_table_gameplay()
+    local pt = nil
+    pcall(function() pt = FindFirstOf("GFO_PlayTable_C") end)
+    if not pt or not is_live(pt) then return false end
+
+    local paused = false
+    pcall(function() paused = pt:Call("IsPaused") end)
+
+    local tr = nil
+    pcall(function() tr = pt:Get("m_tableReference") end)
+    if tr and is_live(tr) then
+        local running = false
+        pcall(function() running = tr:Call("IsTableGameRunning") end)
+        if running == true and not paused then return true end
+    end
+
+    return false
+end
 
 local function start_trophy_sweep()
     if trophySweepStarted then return end
     trophySweepStarted = true
-    Log(TAG .. ": Starting background trophy sweep (data-only, every 2s)")
+    Log(TAG .. ": Starting background trophy sweep (data-only, every 8s, hub-only)")
 
-    LoopAsync(2000, function()
+    LoopAsync(8000, function()
+        if in_table_gameplay() then
+            return false
+        end
+
+        local t0 = os.clock()
         if not trophyMapReady then return false end  -- keep waiting
 
         local fixed = 0
@@ -458,10 +540,119 @@ local function start_trophy_sweep()
             end
         end)
 
+        local dt = (os.clock() - t0) * 1000.0
+        perf.sweep_runs = perf.sweep_runs + 1
+        perf.sweep_ms_total = perf.sweep_ms_total + dt
+        if dt > perf.sweep_ms_max then perf.sweep_ms_max = dt end
+
         if fixed > 0 then
             state.trophy_sweep_fixes = state.trophy_sweep_fixes + fixed
+            Log(TAG .. ": Trophy sweep fixed=" .. fixed .. " dt_ms=" .. string.format("%.2f", dt))
         end
         return false  -- keep polling forever
+    end)
+end
+
+-- ============================================================================
+-- TROPHY WATCHDOG — visibility/collision self-heal (every 1s)
+-- Fixes cases where grabbed trophies come back holo/hidden/invisible.
+-- Keeps slots visible, restores physical entries, and re-enables collision.
+-- ============================================================================
+local function heal_trophy_visibility_once()
+    if not trophyMapReady then return 0, 0 end
+
+    local healed = 0
+    local respawn = 0
+    pcall(function()
+        local tw = FindFirstOf("BP_Hub_TrophyWall_C_C")
+        if not tw then return end
+        local slots = tw:Get("TrophySlots")
+        if not slots then return end
+
+        for i = 1, #slots do
+            pcall(function()
+                local slot = slots[i]
+                if not slot or not is_live(slot) then return end
+
+                local csr = slot:Get("CollectibleSlotRoot")
+                if not csr then return end
+
+                -- Keep slot visible in wall UI
+                pcall(function() slot:Call("ShowSlot") end)
+
+                -- Keep entry physical (never holo)
+                local entry = csr:Get("m_slotEntry")
+                if entry and is_live(entry) then
+                    local en = entry:GetName()
+                    local phys = holoToPhysical[en]
+                    if phys then
+                        pcall(function() csr:Set("m_slotEntry", phys) end)
+                        entry = phys
+                    end
+                end
+
+                -- Validate spawned actor
+                local sa = nil
+                pcall(function() sa = csr:Get("SpawnedActor") end)
+                if not sa or not is_live(sa) then
+                    if entry and is_live(entry) then
+                        pcall(function() csr:Call("SetupWithCollectibleEntry", entry) end)
+                        respawn = respawn + 1
+                    end
+                    return
+                end
+
+                -- If holo actor slipped through, force respawn with physical entry
+                local cls = ""
+                pcall(function() cls = sa:GetClass():GetName() end)
+                if cls ~= "" and cls:match("Holo") and entry and is_live(entry) then
+                    pcall(function() csr:Call("DestroyPreviousCollectible") end)
+                    pcall(function() csr:Call("SetupWithCollectibleEntry", entry) end)
+                    respawn = respawn + 1
+                    return
+                end
+
+                -- Enforce actor visibility + collision for grab/interaction
+                pcall(function() sa:Call("SetActorHiddenInGame", false) end)
+                pcall(function() sa:Call("SetActorEnableCollision", true) end)
+                pcall(function() sa:Set("bHidden", false) end)
+
+                pcall(function()
+                    local gc = sa:Get("GrabComponent")
+                    if gc then gc:Set("IsLocked", false) end
+                end)
+
+                healed = healed + 1
+            end)
+        end
+    end)
+
+    return healed, respawn
+end
+
+local function start_trophy_watchdog()
+    if trophyWatchdogStarted then return end
+    trophyWatchdogStarted = true
+    Log(TAG .. ": Starting trophy watchdog (visibility/collision self-heal, 3s, hub-only)")
+
+    LoopAsync(3000, function()
+        if in_table_gameplay() then
+            return false
+        end
+
+        local t0 = os.clock()
+        local healed, respawn = heal_trophy_visibility_once()
+        local dt = (os.clock() - t0) * 1000.0
+
+        perf.watchdog_runs = perf.watchdog_runs + 1
+        perf.watchdog_ms_total = perf.watchdog_ms_total + dt
+        if dt > perf.watchdog_ms_max then perf.watchdog_ms_max = dt end
+
+        if respawn > 0 then
+            Log(TAG .. ": Trophy watchdog respawned=" .. respawn .. " healed=" .. healed
+                .. " dt_ms=" .. string.format("%.2f", dt))
+        end
+        return false
     end)
 end
 
@@ -1144,17 +1335,24 @@ local trophyVerifyRetries = 0
 local trophyVerifyDone = false
 local allDone = false
 local pollCount = 0
+local main_poll_handle = nil
 
-LoopAsync(5000, function()
-    Log(TAG .. ": DIAG: LoopAsync tick #" .. pollCount .. " — initDone=" .. tostring(initDone) .. " allDone=" .. tostring(allDone))
+main_poll_handle = LoopAsync(5000, function()
+    if pollCount < 10 or (pollCount % 6 == 0) then
+        Log(TAG .. ": DIAG: LoopAsync tick #" .. pollCount .. " — initDone=" .. tostring(initDone) .. " allDone=" .. tostring(allDone))
+    end
     pollCount = pollCount + 1
 
-    if allDone then return true end
+    if allDone then
+        if main_poll_handle then pcall(function() CancelDelayedAction(main_poll_handle) end) end
+        return false
+    end
 
     -- Poll limit only applies to initial wait phases (A + B + C), not championship batch
     if pollCount > MAX_POLLS and not trophyVerifyDone then
         Log(TAG .. ": GAVE UP after " .. MAX_POLLS .. " polls")
-        return true
+        if main_poll_handle then pcall(function() CancelDelayedAction(main_poll_handle) end) end
+        return false
     end
 
     -- Phase A: Run MaxAll once when game is ready
@@ -1273,6 +1471,7 @@ LoopAsync(5000, function()
             end
             -- Start background trophy sweep for ongoing grab/place protection
             pcall(start_trophy_sweep)
+            pcall(start_trophy_watchdog)
             if holoCount > 0 and physCount < 25 then
                 -- Some slots still have holos, retry respawn on those
                 Log(TAG .. ": Retrying respawn on remaining holo slots...")
@@ -1312,7 +1511,8 @@ LoopAsync(5000, function()
 
     allDone = true
     Log(TAG .. ": === All phases complete (v24) ===")
-    return true
+    if main_poll_handle then pcall(function() CancelDelayedAction(main_poll_handle) end) end
+    return false
 end)
 
 -- ============================================================================
@@ -1347,6 +1547,19 @@ pcall(function()
             tostring(initDone), tostring(trophyDataDone),
             state.champ_set, tostring(state.champ_done),
             #state.errors
+        )
+    end)
+end)
+
+pcall(function()
+    RegisterCommand("maxall_perf", function()
+        local sAvg = (perf.sweep_runs > 0) and (perf.sweep_ms_total / perf.sweep_runs) or 0
+        local wAvg = (perf.watchdog_runs > 0) and (perf.watchdog_ms_total / perf.watchdog_runs) or 0
+        return string.format(
+            "%s perf: sweep runs=%d avg=%.2fms max=%.2fms | watchdog runs=%d avg=%.2fms max=%.2fms",
+            TAG,
+            perf.sweep_runs, sAvg, perf.sweep_ms_max,
+            perf.watchdog_runs, wAvg, perf.watchdog_ms_max
         )
     end)
 end)
@@ -1402,6 +1615,13 @@ pcall(function()
         end
         return string.format("physical=%d (grab=%d) holo=%d noActor=%d total=%d map=%s",
             phys, withGrab, holo, noActor, #slots, tostring(trophyMapReady))
+    end)
+end)
+
+pcall(function()
+    RegisterCommand("maxall_trophy_heal", function()
+        local healed, respawn = heal_trophy_visibility_once()
+        return TAG .. ": trophy heal -> healed=" .. healed .. " respawn=" .. respawn
     end)
 end)
 

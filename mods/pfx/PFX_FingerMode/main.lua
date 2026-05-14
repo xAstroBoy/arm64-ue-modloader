@@ -1,6 +1,17 @@
--- PFX_FingerMode v3 — Sweep-Based Grab (ball collides while held!)
+-- PFX_FingerMode v4 — Sweep-Based Grab (ball collides while held!)
 --
--- ARCHITECTURE:
+-- v4 (BP-guided improvements):
+--   * GFO_PlayTable_C exposes GrabInputHandler: UIH_Grab_C* as a direct named
+--     property (confirmed via SDK class dump). Used for more reliable IH_Grab_C
+--     hook targeting and state sync.
+--   * Hook GFO_PlayTable_C:OnTableRestart__DelegateSignature to auto-release
+--     the ball and invalidate caches on table restart — prevents stale grab
+--     state carrying over after restart.
+--   * Hook PFXGameflowObject_PlayTable:OnGameStateChanged to detect game end
+--     and auto-release (complements existing PFX_Cheats integration).
+--   * get_play_table() now also tries GFO_PlayTable_C (blueprint class name)
+--     as primary, falling back to the C++ parent class name.
+--
 -- YUP writes ball transforms at ~90Hz with NO UE physics body.
 -- CollisionEnabled=0, IsSimulating=false. PhysicsHandle won't work.
 -- PauseGame() freezes YUP so it stops overwriting position.
@@ -14,7 +25,7 @@
 -- on the throw direction, so the ball keeps moving after release.
 --------------------------------------------------------------------------------
 local TAG = "PFX_FingerMode"
-Log(TAG .. ": Loading v3 (sweep-based collision)...")
+Log(TAG .. ": Loading v4 (sweep-based collision, restart hooks)...")
 
 --------------------------------------------------------------------------------
 -- State
@@ -29,6 +40,7 @@ local grab_dist_sq  = 900
 local throw_nudge   = 2.0     -- nudge multiplier on release
 local ball_z_offset = -3.0    -- offset below hand (ball center vs palm)
 local sweep_mode    = true    -- true=sweep (collision), false=teleport (through walls)
+local allow_pausegame_fallback = false  -- freeze fix: do NOT hard-pause game by default
 local vel_history   = {}      -- last N hand positions for velocity
 local vel_window    = 5       -- frames to average for throw velocity
 
@@ -67,18 +79,58 @@ end
 
 local function get_play_table()
     if is_live(cache.pt) then return cache.pt end
+    -- Try blueprint class name first (GFO_PlayTable_C exposes direct properties)
     pcall(function() cache.pt = FindFirstOf("GFO_PlayTable_C") end)
+    if not is_live(cache.pt) then
+        pcall(function() cache.pt = FindFirstOf("PFXGameflowObject_PlayTable") end)
+    end
     return cache.pt
+end
+
+local function is_table_gameplay_active()
+    local pt = get_play_table()
+    if not is_live(pt) then return false end
+
+    local paused = false
+    pcall(function() paused = pt:Call("IsPaused") end)
+    if paused then return false end
+
+    local tr = nil
+    pcall(function() tr = pt:Get("m_tableReference") end)
+    if tr and is_live(tr) then
+        local running = false
+        pcall(function() running = tr:Call("IsTableGameRunning") end)
+        return running == true
+    end
+
+    -- If table reference is unavailable, fall back to not-paused check.
+    return true
 end
 
 local function get_input_handler()
     if is_live(cache.ih) then return cache.ih end
-    pcall(function() cache.ih = FindFirstOf("PFXPlayTableInputHandler") end)
+    -- Direct property access: GFO_PlayTable_C.MainInputHandler (confirmed SDK)
+    -- MainInputHandler is IH_PlayTable_Main_C which has OnNudgeGesture for throw
+    local pt = get_play_table()
+    if pt then pcall(function() cache.ih = pt:Get("MainInputHandler") end) end
     if not is_live(cache.ih) then
-        local pt = get_play_table()
-        if pt then pcall(function() cache.ih = pt:Get("MainInputHandler") end) end
+        pcall(function() cache.ih = FindFirstOf("PFXPlayTableInputHandler") end)
+    end
+    if not is_live(cache.ih) then
+        pcall(function() cache.ih = FindFirstOf("IH_PlayTable_Main_C") end)
     end
     return cache.ih
+end
+
+-- Get the IH_Grab_C input handler from GFO_PlayTable_C.GrabInputHandler (direct prop)
+local function get_grab_input_handler()
+    if is_live(cache.gih) then return cache.gih end
+    local pt = get_play_table()
+    if pt then pcall(function() cache.gih = pt:Get("GrabInputHandler") end) end
+    if not is_live(cache.gih) then
+        pcall(function() cache.gih = FindFirstOf("IH_Grab_C") end)
+    end
+    return cache.gih
 end
 
 local function find_active_ball()
@@ -289,7 +341,7 @@ local function do_grab(hand)
         Log(TAG .. ": YUP already paused")
     end
 
-    if not was_paused and direct_paused ~= true then
+    if allow_pausegame_fallback and not was_paused and direct_paused ~= true then
         local pt = get_play_table()
         if pt then
             local already = false
@@ -301,6 +353,8 @@ local function do_grab(hand)
                 Log(TAG .. ": PauseGame — fallback freeze")
             end
         end
+    elseif not was_paused and direct_paused ~= true then
+        Log(TAG .. ": WARN: DirectSetPause unavailable; continuing without game pause fallback")
     end
 
     grabbed   = true
@@ -442,6 +496,7 @@ end
 --------------------------------------------------------------------------------
 local function check_auto_grab()
     if grabbed or not enabled then return end
+    if not is_table_gameplay_active() then return end
     local bp = get_ball_pos()
     if not bp then return end
 
@@ -479,6 +534,39 @@ local function start_loop()
         return false  -- continue
     end)
     Log(TAG .. ": Loop started (90Hz)")
+end
+
+--------------------------------------------------------------------------------
+-- Safety watchdog: prevent sticky paused state if release path is interrupted
+--------------------------------------------------------------------------------
+local function start_pause_safety_watchdog()
+    LoopAsync(1000, function()
+        -- Only restore pause states that FingerMode itself created.
+        -- Never force-resume game globally when FingerMode is disabled.
+        if was_paused and not grabbed then
+            if pause_mode == "yup" then
+                pcall(function() set_yup_pause(false) end)
+            elseif pause_mode == "game" then
+                local pt = get_play_table()
+                if pt then pcall(function() pt:Call("ResumeGame") end) end
+            end
+            was_paused = false
+            pause_mode = nil
+        end
+
+        -- Defensive cleanup when disabled, but only if we still own a pause.
+        if not enabled and was_paused then
+            if pause_mode == "yup" then
+                pcall(function() set_yup_pause(false) end)
+            elseif pause_mode == "game" then
+                local pt = get_play_table()
+                if pt then pcall(function() pt:Call("ResumeGame") end) end
+            end
+            was_paused = false
+            pause_mode = nil
+        end
+        return false
+    end)
 end
 
 --------------------------------------------------------------------------------
@@ -669,16 +757,70 @@ end) end)
 --------------------------------------------------------------------------------
 setup_hooks()
 
+-- ============================================================================
+-- TABLE RESTART / GAME END — auto-release + cache invalidate
+-- ============================================================================
+pcall(function()
+    RegisterHook("GFO_PlayTable_C:OnTableRestart__DelegateSignature", function()
+        Log(TAG .. ": OnTableRestart — releasing ball + invalidating cache")
+        if grabbed then do_release() end
+        invalidate()
+    end)
+    Log(TAG .. ": Hook: GFO_PlayTable_C:OnTableRestart")
+end)
+
+pcall(function()
+    RegisterHook("GFO_PlayTable_C:OnPauseStateChanged__DelegateSignature", function(self, funcPtr, parms)
+        local paused = 0
+        pcall(function() paused = ReadU8(parms) end)
+        if paused ~= 0 and grabbed then
+            Log(TAG .. ": PauseStateChanged(paused) — force release")
+            do_release()
+        end
+    end)
+    Log(TAG .. ": Hook: GFO_PlayTable_C:OnPauseStateChanged")
+end)
+
+pcall(function()
+    RegisterHook("IH_Grab_C:OnLoadingScreen_Event", function(self, funcPtr, parms)
+        local isActive = 0
+        pcall(function() isActive = ReadU8(parms) end)
+        if isActive ~= 0 and grabbed then
+            Log(TAG .. ": IH_Grab loading screen active — force release")
+            do_release()
+        end
+    end)
+    Log(TAG .. ": Hook: IH_Grab_C:OnLoadingScreen_Event")
+end)
+
+pcall(function()
+    RegisterHook("PFXGameflowObject_PlayTable:OnGameStateChanged",
+        function(self, funcPtr, parms)
+            local state = 0
+            pcall(function() state = ReadU8(parms) end)
+            -- state 3 = ball drained, state 4 = game over
+            if state == 3 or state == 4 then
+                if grabbed then
+                    Log(TAG .. ": GameState=" .. state .. " — auto-release")
+                    do_release()
+                end
+            end
+        end)
+    Log(TAG .. ": Hook: PFXGameflowObject_PlayTable:OnGameStateChanged (game-end release)")
+end)
+
 -- Global API for other mods (PFX_ModMenu, etc.)
 _G.PFX_FingerMode = {
-    enable  = function() enabled = true; start_loop() end,
-    disable = function() if grabbed then do_release() end; enabled = false end,
+    enable  = function() enabled = true; start_loop(); _G.PFX_FingerMode.enabled = enabled end,
+    disable = function() if grabbed then do_release() end; enabled = false; _G.PFX_FingerMode.enabled = enabled end,
     toggle  = function()
         enabled = not enabled
         if enabled then start_loop()
         elseif grabbed then do_release() end
+        _G.PFX_FingerMode.enabled = enabled
         return enabled
     end,
+    enabled     = enabled,
     is_enabled  = function() return enabled end,
     is_grabbed  = function() return grabbed end,
     grab        = do_grab,
@@ -688,6 +830,8 @@ _G.PFX_FingerMode = {
     get_hand_pos = get_hand_pos,
 }
 
-Log(TAG .. ": v3 loaded — sweep collision, grip hooks, PFX_Cheats integration")
+start_pause_safety_watchdog()
+
+Log(TAG .. ": v4 loaded — sweep collision, grip hooks, restart hooks, PFX_Cheats integration")
 Log(TAG .. ": bridge: finger_on/off, finger_grab/release, finger_sweep, finger_status")
 Log(TAG .. ": tuning: finger_dist, finger_nudge, finger_zoff, finger_force_nudge")
