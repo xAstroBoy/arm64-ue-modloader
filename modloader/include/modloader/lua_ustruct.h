@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "modloader/reflection_walker.h"
 #include <sol/sol.hpp>
 #include <cstdint>
 #include <string>
@@ -71,6 +72,11 @@ namespace lua_ustruct
     // Fill existing struct memory from a Lua table using reflection
     void fill_from_table(uint8_t *data, ue::UStruct *ustruct,
                          const sol::table &tbl);
+
+    // Write a single field from a Lua value (exposed for call-site use without
+    // needing to call fill_from_table which walks super-struct chain).
+    void write_field(uint8_t *struct_base, const reflection::PropertyInfo &fi,
+                     const sol::object &value);
 
     // ═══════════════════════════════════════════════════════════════════════
     // TArray conversion buffer management (nesting-safe)

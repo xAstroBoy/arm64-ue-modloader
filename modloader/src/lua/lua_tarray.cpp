@@ -1852,15 +1852,39 @@ namespace lua_tarray
                 logger::log_info("TMAP", "Add: appending at slot %d (num=%d, max=%d)", slot, array_num + 1, array_max);
             }
             else {
-                // Need to grow but buffer is UE-allocated (FMallocBinned2).
-                // NEVER replace UE's data pointer with libc malloc — UE will
-                // crash later when it tries to realloc/free via its own allocator.
-                // Caller should Clear() first to reclaim capacity, or accept the limit.
-                logger::log_error("TMAP", "Add: REFUSED — capacity full (num=%d, max=%d). "
-                                  "Clear() first or ensure enough capacity. "
-                                  "Growing UE-allocated TMap buffers with libc malloc causes delayed SIGSEGV.",
-                                  array_num, array_max);
-                return false;
+                // Grow the sparse array using UE's allocator (same strategy as TArray::Add).
+                // grow_buffer uses ue_memory::malloc/realloc so UE can safely manage the buffer.
+                int32_t new_max = (array_max < 4) ? 8 : array_max * 2;
+                void *new_data = grow_buffer(data, array_num, self.entry_stride, new_max);
+                if (!new_data) {
+                    logger::log_error("TMAP", "Add: grow failed (stride=%d new_max=%d num=%d max=%d)",
+                                      self.entry_stride, new_max, array_num, array_max);
+                    return false;
+                }
+                data = new_data;
+                *reinterpret_cast<void **>(sparse_base) = new_data;
+                *reinterpret_cast<int32_t *>(sparse_base + 12) = new_max;
+                // TBitArray inline storage covers 128 entries (16 InlineData bytes).
+                // If MaxBits is below new_max, initialize it to 128 (inline capacity).
+                if (*reinterpret_cast<int32_t *>(sparse_base + 44) < new_max && new_max <= 128)
+                    *reinterpret_cast<int32_t *>(sparse_base + 44) = 128;
+                slot = array_num;
+                *reinterpret_cast<int32_t *>(sparse_base + 8) = array_num + 1;
+                {
+                    int32_t word = slot / 32;
+                    int32_t bit  = slot % 32;
+                    if (word < 4) {
+                        uint32_t *bits = reinterpret_cast<uint32_t *>(sparse_base + 16);
+                        bits[word] |= (1u << bit);
+                    }
+                }
+                {
+                    int32_t num_bits = *reinterpret_cast<int32_t *>(sparse_base + 40);
+                    if (slot >= num_bits)
+                        *reinterpret_cast<int32_t *>(sparse_base + 40) = slot + 1;
+                }
+                logger::log_info("TMAP", "Add: grew sparse array to max=%d, using slot=%d (was num=%d max=%d)",
+                                 new_max, slot, array_num, array_max);
             }
 
             // Zero the slot and write key + value

@@ -11,6 +11,7 @@
 #include "modloader/pattern_scanner.h"
 #include "modloader/auto_offsets.h"
 #include "modloader/game_profile.h"
+#include "modloader/safe_call.h"
 #include <dlfcn.h>
 #include <link.h>
 #include <cstring>
@@ -27,9 +28,116 @@
 #include <cxxabi.h>
 #include <chrono>
 #include <utility>
+#include <array>
 
 namespace symbols
 {
+
+    static bool disallow_hardcoded_fallbacks();
+
+    static bool is_stp_fp_lr(uint32_t instr)
+    {
+        return (instr & 0x7FC07FFF) == 0x29807BFD ||
+               (instr & 0xFFE07FFF) == 0xA9807BFD;
+    }
+
+    static bool is_sub_sp_sp_imm(uint32_t instr)
+    {
+        if ((instr & 0xFFC003FF) != 0xD10003FF)
+            return false;
+        const uint32_t rd = instr & 0x1F;
+        const uint32_t rn = (instr >> 5) & 0x1F;
+        return rd == 31 && rn == 31;
+    }
+
+    static bool looks_like_function_entry(uintptr_t addr)
+    {
+        const uintptr_t text_s = reinterpret_cast<uintptr_t>(pattern::text_start());
+        const uintptr_t text_e = reinterpret_cast<uintptr_t>(pattern::text_end());
+        if (text_s == 0 || text_e == 0 || addr < text_s || addr + 16 > text_e)
+            return false;
+
+        if (!safe_call::probe_read(reinterpret_cast<void *>(addr), 16))
+            return false;
+
+        const uint32_t i0 = *reinterpret_cast<uint32_t *>(addr + 0);
+        const uint32_t i1 = *reinterpret_cast<uint32_t *>(addr + 4);
+        const uint32_t i2 = *reinterpret_cast<uint32_t *>(addr + 8);
+
+        // Common AArch64 prologues:
+        //   stp x29, x30, [sp, #-imm]!
+        //   sub sp, sp, #imm ; stp x29, x30, [sp, #imm]
+        //   paciasp/pacibsp ; stp x29, x30, ...
+        if (is_stp_fp_lr(i0))
+            return true;
+        if (is_sub_sp_sp_imm(i0) && (is_stp_fp_lr(i1) || is_stp_fp_lr(i2)))
+            return true;
+        if ((i0 == 0xD503233F || i0 == 0xD503237F) && is_stp_fp_lr(i1))
+            return true;
+        return false;
+    }
+
+    static uintptr_t find_nearest_function_start(uintptr_t addr, size_t max_back_bytes)
+    {
+        const uintptr_t text_s = reinterpret_cast<uintptr_t>(pattern::text_start());
+        const uintptr_t text_e = reinterpret_cast<uintptr_t>(pattern::text_end());
+        if (text_s == 0 || text_e == 0 || addr < text_s || addr >= text_e)
+            return 0;
+
+        size_t max_back = max_back_bytes;
+        if (addr - text_s < max_back)
+            max_back = static_cast<size_t>(addr - text_s);
+
+        for (size_t off = 0; off <= max_back; off += 4)
+        {
+            uintptr_t cand = addr - off;
+            if (looks_like_function_entry(cand))
+                return cand;
+        }
+        return 0;
+    }
+
+    static bool should_register_stable_global(const std::string &name)
+    {
+        if (!disallow_hardcoded_fallbacks())
+            return true;
+
+        // Pinball runs in dynamic-only mode. These core function symbols must
+        // come from live discovery/patterns, never from static profile offsets.
+        static const std::array<const char *, 6> kCoreBlocked = {
+            "ProcessEvent",
+            "StaticConstructObject_Internal",
+            "StaticFindObject",
+            "StaticLoadObject",
+            "FName::Init",
+            "GetTransientPackage",
+        };
+
+        for (const auto *blocked : kCoreBlocked)
+        {
+            if (name == blocked)
+                return false;
+        }
+        return true;
+    }
+
+    static bool validate_fallback_candidate(const std::string &name, uintptr_t candidate)
+    {
+        if (candidate == 0)
+            return false;
+
+        if (name == "ProcessEvent")
+        {
+            if (!looks_like_function_entry(candidate))
+            {
+                logger::log_warn("RESOLVE", "%s: rejected fallback candidate 0x%lX (not a plausible function entry)",
+                                 name.c_str(), candidate);
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     static bool disallow_hardcoded_fallbacks()
     {
@@ -1006,6 +1114,12 @@ namespace symbols
         {
             if (sg.offset != 0)
             {
+                if (!should_register_stable_global(sg.symbol_name))
+                {
+                    logger::log_warn("SYMBOL", "Stable fallback skipped in dynamic-only mode: %s @ +0x%lX",
+                                     sg.symbol_name.c_str(), sg.offset);
+                    continue;
+                }
                 register_fallback(sg.symbol_name, sg.offset);
                 registered_stable++;
                 logger::log_info("SYMBOL", "Stable global registered: %s @ +0x%lX",
@@ -1138,6 +1252,29 @@ namespace symbols
         }
         logger::log_warn("RESOLVE", "%s: ELF scan failed", name.c_str());
 
+        // Priority 2.5 (ProcessEvent only): prefer validated fallback candidate
+        // before pattern scan. Auto-offset discovery updates fallback offsets at
+        // runtime; these candidates are often more accurate than broad AOB hits.
+        if (name == "ProcessEvent" && !game_profile::is_pinball_fx())
+        {
+            auto fb_it = s_fallbacks.find(name);
+            if (fb_it != s_fallbacks.end())
+            {
+                uintptr_t candidate = s_lib_base + fb_it->second;
+                logger::log_info("RESOLVE", "%s: trying fallback candidate before pattern scan @ 0x%lX",
+                                 name.c_str(), static_cast<unsigned long>(candidate));
+                if (validate_fallback_candidate(name, candidate))
+                {
+                    result = reinterpret_cast<void *>(candidate);
+                    logger::log_info("RESOLVE", "%s: resolved via fallback candidate @ 0x%lX (preferred over pattern)",
+                                     name.c_str(), static_cast<unsigned long>(candidate));
+                    s_cache[name] = result;
+                    return result;
+                }
+                logger::log_warn("RESOLVE", "%s: fallback candidate rejected; continuing to pattern scan", name.c_str());
+            }
+        }
+
         // Priority 3: Pattern scan
         auto pat_it = s_patterns.find(name);
         if (pat_it != s_patterns.end())
@@ -1154,10 +1291,40 @@ namespace symbols
             }
             if (result)
             {
-                logger::log_info("RESOLVE", "%s: resolved via pattern scan @ 0x%lX",
-                                 name.c_str(), reinterpret_cast<uintptr_t>(result));
-                s_cache[name] = result;
-                return result;
+                if (name == "ProcessEvent")
+                {
+                    uintptr_t raw = reinterpret_cast<uintptr_t>(result);
+                    if (!looks_like_function_entry(raw))
+                    {
+                        uintptr_t start = find_nearest_function_start(raw, 0x2000);
+                        if (start != 0 && start != raw)
+                        {
+                            logger::log_warn("RESOLVE", "%s: AOB hit 0x%lX is not a function prologue; normalized to start 0x%lX",
+                                             name.c_str(),
+                                             static_cast<unsigned long>(raw),
+                                             static_cast<unsigned long>(start));
+                            result = reinterpret_cast<void *>(start);
+                        }
+                        else
+                        {
+                            logger::log_warn("RESOLVE", "%s: AOB hit 0x%lX does not look like a function entry and no nearby prologue found",
+                                             name.c_str(),
+                                             static_cast<unsigned long>(raw));
+                            // Never hook ProcessEvent at a non-prologue address.
+                            // Keep searching other resolution strategies instead.
+                            result = nullptr;
+                        }
+                    }
+                }
+
+                if (result)
+                {
+                    logger::log_info("RESOLVE", "%s: resolved via pattern scan @ 0x%lX",
+                                     name.c_str(), reinterpret_cast<uintptr_t>(result));
+                    s_cache[name] = result;
+                    return result;
+                }
+                logger::log_warn("RESOLVE", "%s: pattern hit rejected after prologue validation", name.c_str());
             }
             logger::log_warn("RESOLVE", "%s: pattern scan failed", name.c_str());
         }
@@ -1204,7 +1371,19 @@ namespace symbols
         auto fb_it = s_fallbacks.find(name);
         if (fb_it != s_fallbacks.end() && s_lib_base != 0 && fb_it->second != 0)
         {
-            result = reinterpret_cast<void *>(s_lib_base + fb_it->second);
+            uintptr_t candidate = s_lib_base + fb_it->second;
+            if (!validate_fallback_candidate(name, candidate))
+            {
+                logger::log_warn("RESOLVE", "%s: fallback candidate rejected; continuing without hardcoded fallback", name.c_str());
+            }
+            else
+            {
+                result = reinterpret_cast<void *>(candidate);
+            }
+        }
+
+        if (result)
+        {
             logger::log_warn("RESOLVE", "%s: all dynamic methods failed — using registered fallback offset 0x%lX => 0x%lX",
                              name.c_str(), fb_it->second, reinterpret_cast<uintptr_t>(result));
             logger::log_warn("RESOLVE", "Fallback offsets are less stable than direct dynamic resolution");

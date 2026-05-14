@@ -781,13 +781,10 @@ namespace lua_bindings
             // Call InitCheatManager via ProcessEvent (if UFunction exists)
             auto* init_func = pe_hook::resolve_func_path("CheatManager:InitCheatManager");
             if (init_func) {
-                auto original_pe = pe_hook::get_original();
-                if (!original_pe) original_pe = symbols::ProcessEvent;
-                if (original_pe) {
-                    logger::log_info("LUA", "EnableCheatsAsync: [BG] calling InitCheatManager...");
-                    original_pe(new_cm, init_func, nullptr);
-                    logger::log_info("LUA", "EnableCheatsAsync: [BG] InitCheatManager done!");
-                }
+                logger::log_info("LUA", "EnableCheatsAsync: [BG] dispatching InitCheatManager on game thread...");
+                pe_hook::invoke_game_thread_sync(new_cm, init_func, nullptr,
+                                                 "LUA", "EnableCheatsAsync.InitCheatManager", 8000);
+                logger::log_info("LUA", "EnableCheatsAsync: [BG] InitCheatManager dispatched");
             }
         }).detach();
 
@@ -868,26 +865,25 @@ namespace lua_bindings
             return false;
         }
 
-        // Get original ProcessEvent
-        auto original_pe = pe_hook::get_original();
-        if (!original_pe) original_pe = symbols::ProcessEvent;
-        if (!original_pe) {
-            logger::log_error("LUA", "CallAsync: ProcessEvent not resolved");
-            return false;
-        }
+        logger::log_info("LUA", "CallAsync: queueing %zu call(s) on game thread for %s @ %p",
+                         calls.size(), class_name.c_str(), (void *)obj);
 
-        logger::log_info("LUA", "CallAsync: spawning bg thread for %zu calls on %s @ %p",
-                         calls.size(), class_name.c_str(), (void*)obj);
-
-        // Spawn background thread
-        std::thread([obj, calls, original_pe, class_name]() {
-            for (auto& c : calls) {
-                logger::log_info("LUA", "CallAsync: [BG] %s:%s...", class_name.c_str(), c.name.c_str());
-                original_pe(obj, c.func, nullptr);
-                logger::log_info("LUA", "CallAsync: [BG] %s:%s done", class_name.c_str(), c.name.c_str());
+        pe_hook::queue_game_thread([obj, calls, class_name]() {
+            auto original_pe = pe_hook::get_original();
+            if (!original_pe)
+                original_pe = symbols::ProcessEvent;
+            if (!original_pe)
+            {
+                logger::log_error("LUA", "CallAsync: ProcessEvent not resolved on game thread");
+                return;
             }
-            logger::log_info("LUA", "CallAsync: [BG] all %zu calls complete", calls.size());
-        }).detach();
+            for (auto& c : calls) {
+                logger::log_info("LUA", "CallAsync: [GT] %s:%s...", class_name.c_str(), c.name.c_str());
+                original_pe(obj, c.func, nullptr);
+                logger::log_info("LUA", "CallAsync: [GT] %s:%s done", class_name.c_str(), c.name.c_str());
+            }
+            logger::log_info("LUA", "CallAsync: [GT] all %zu call(s) complete", calls.size());
+        });
 
         return true; });
 
@@ -1041,7 +1037,11 @@ namespace lua_bindings
 
         logger::log_info("LUA", "CreateWidget: calling WBL::Create for '%s' (world_ctx=%p, player=%p)",
                           cls_name_str.c_str(), world_ctx, player);
-        symbols::ProcessEvent(wbl_cdo, func, params_buf.data());
+        if (!pe_hook::invoke_game_thread_sync(wbl_cdo, func, params_buf.data(),
+                                              "LUA", "CreateWidget.WBL.Create", 8000)) {
+            logger::log_error("LUA", "CreateWidget: WBL::Create dispatch failed for '%s'", cls_name_str.c_str());
+            return sol::nil;
+        }
 
         // 8. Extract return value
         if (rf->return_prop && rf->return_prop->raw) {

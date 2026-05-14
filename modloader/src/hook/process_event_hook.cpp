@@ -16,10 +16,22 @@
 #include <unordered_map>
 #include <shared_mutex>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
 #include <cstring>
+#include <sys/prctl.h>
 
 namespace pe_hook
 {
+
+    static bool is_game_thread_name()
+    {
+        char tname[64] = {};
+        if (prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(tname), 0, 0, 0) != 0)
+            return false;
+        return std::strcmp(tname, "GameThread") == 0;
+    }
 
     // ═══ Defense-in-depth path normalization ════════════════════════════════
     // Strips /Script/Module.ClassName:FuncName → ClassName:FuncName
@@ -205,12 +217,31 @@ namespace pe_hook
         pe_trace::record(self, func);
 
         // Capture game thread ID on first call (UE4 always calls ProcessEvent on game thread)
+        static std::atomic<bool> s_game_thread_captured{false};
+        bool named_game_thread = is_game_thread_name();
+        if (!s_game_thread_captured.load(std::memory_order_relaxed) && named_game_thread)
         {
-            static std::atomic<bool> s_game_thread_captured{false};
-            if (!s_game_thread_captured.exchange(true, std::memory_order_relaxed))
-            {
-                lua_ue4ss_globals::set_game_thread_id();
-            }
+            lua_ue4ss_globals::set_game_thread_id();
+            s_game_thread_captured.store(true, std::memory_order_relaxed);
+            logger::log_info("HOOK", "Captured Lua game thread from ProcessEvent thread name: GameThread");
+        }
+
+        // ProcessEvent can fire on non-game worker threads in some engine phases.
+        // Lua VM, delayed actions, and hook callbacks are game-thread-only.
+        // Bypass all hook side effects off-game-thread to avoid cross-thread Lua access.
+        bool safe_for_lua = false;
+        if (s_game_thread_captured.load(std::memory_order_relaxed))
+        {
+            safe_for_lua = lua_ue4ss_globals::is_game_thread();
+        }
+        else
+        {
+            safe_for_lua = named_game_thread;
+        }
+        if (!safe_for_lua)
+        {
+            s_original(self, func, parms);
+            return;
         }
 
         // ── Deferred GWorld resolution via GUObjectArray ─────────────────────
@@ -702,10 +733,89 @@ namespace pe_hook
         return s_original;
     }
 
+    bool is_game_thread()
+    {
+        return lua_ue4ss_globals::is_game_thread();
+    }
+
     void queue_game_thread(std::function<void()> fn)
     {
         std::lock_guard<std::mutex> lock(s_game_thread_mutex);
         s_game_thread_queue.push_back(std::move(fn));
+    }
+
+    bool invoke_game_thread_sync(ue::UObject *self,
+                                 ue::UFunction *func,
+                                 void *parms,
+                                 const char *tag,
+                                 const char *op_name,
+                                 int timeout_ms)
+    {
+        auto pe_fn = get_original();
+        if (!pe_fn)
+            pe_fn = symbols::ProcessEvent;
+        if (!pe_fn)
+        {
+            logger::log_warn(tag ? tag : "PE", "%s: ProcessEvent not available", op_name ? op_name : "ProcessEvent");
+            return false;
+        }
+
+        if (lua_ue4ss_globals::is_game_thread())
+        {
+            pe_fn(self, func, parms);
+            return true;
+        }
+
+        struct SyncCtx
+        {
+            std::mutex mtx;
+            std::condition_variable cv;
+            std::atomic<bool> done{false};
+            std::atomic<bool> cancelled{false};
+            bool ok = false;
+        };
+
+        auto ctx = std::make_shared<SyncCtx>();
+        queue_game_thread([ctx, self, func, parms]()
+                          {
+            if (ctx->cancelled.load(std::memory_order_acquire))
+                return;
+
+            auto fn = get_original();
+            if (!fn)
+                fn = symbols::ProcessEvent;
+            if (fn)
+            {
+                fn(self, func, parms);
+                ctx->ok = true;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(ctx->mtx);
+                ctx->done.store(true, std::memory_order_release);
+            }
+            ctx->cv.notify_one(); });
+
+        const int wait_ms = (timeout_ms <= 0) ? 8000 : timeout_ms;
+        {
+            std::unique_lock<std::mutex> lk(ctx->mtx);
+            if (!ctx->cv.wait_for(lk, std::chrono::milliseconds(wait_ms), [&]()
+                                  { return ctx->done.load(); }))
+            {
+                ctx->cancelled.store(true, std::memory_order_release);
+                logger::log_error(tag ? tag : "PE", "%s: timed out waiting for game-thread dispatch (%d ms)",
+                                  op_name ? op_name : "ProcessEvent", wait_ms);
+                return false;
+            }
+        }
+
+        if (!ctx->ok)
+        {
+            logger::log_warn(tag ? tag : "PE", "%s: game-thread dispatch failed", op_name ? op_name : "ProcessEvent");
+            return false;
+        }
+
+        return true;
     }
 
 } // namespace pe_hook

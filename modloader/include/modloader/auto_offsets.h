@@ -17,7 +17,7 @@
 //   - GUObjectArray pointer
 //   - ProcessEvent function
 //   - FUObjectItem size (0x14 for UE4, 0x18 for UE5)
-//   - FField owner type (8 bytes UE5, 16 bytes UE4 FFieldVariant)
+//   - FField owner type (8-byte UE5 tagged FFieldVariant, 16-byte UE4 FFieldVariant)
 //   - UObject::ProcessEvent vtable index
 //   - StaticFindObject / StaticLoadObject / StaticLoadClass
 //   - FName::Init function
@@ -66,7 +66,7 @@ namespace auto_offsets
 
         // Structural offsets (0 = unknown / use defaults)
         uint32_t fuobjectitem_size;    // 0x14 (UE4) or 0x18 (UE5)
-        uint32_t ffield_owner_size;    // 8 (UE5 raw ptr) or 16 (UE4 FFieldVariant)
+        uint32_t ffield_owner_size;    // 8 (UE5 tagged FFieldVariant) or 16 (UE4 FFieldVariant)
         uint32_t uobject_name_offset;  // typically 0x18
         uint32_t uobject_class_offset; // typically 0x10
         uint32_t uobject_outer_offset; // typically 0x20
@@ -131,7 +131,7 @@ namespace auto_offsets
     // Returns 0x14 (UE4) or 0x18 (UE5) or 0 if unknown
     uint32_t probe_fuobjectitem_size(uintptr_t guobjectarray);
 
-    // Probe FField owner size (8 vs 16) by checking field chain integrity
+    // Probe FField owner size (8-byte tagged variant vs 16-byte variant)
     uint32_t probe_ffield_owner_size();
 
     // ═══ Apply discoveries to game profile ══════════════════════════════════

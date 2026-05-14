@@ -1,0 +1,19 @@
+<lint-module
+    format="1"
+    dir="C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app"
+    name=":app"
+    type="APP"
+    maven="UEQuestModLoader-LSPosed:app:"
+    agpVersion="8.2.0"
+    buildFolder="build"
+    bootClassPath="C:\Android\android-sdk\platforms\android-34\android.jar;C:\Android\android-sdk\build-tools\34.0.0\core-lambda-stubs.jar"
+    javaSourceLevel="11"
+    compileTarget="android-34"
+    neverShrinking="true">
+  <lintOptions
+      abortOnError="true"
+      absolutePaths="true"
+      checkReleaseBuilds="true"
+      explainIssues="true"/>
+  <variant name="release"/>
+</lint-module>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.pfxmodloader.lsposed"
+    android:versionCode="1"
+    android:versionName="1.0" >
+
+    <uses-sdk
+        android:minSdkVersion="29"
+        android:targetSdkVersion="34" />
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="false"
+        android:label="UE Quest ModLoader (LSPosed)" >
+
+        <!-- Marks this APK as an Xposed/LSPosed module -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Loads libmodloader.so into RE4 VR and Pinball FX VR — no smali patching required" />
+
+        <!-- Minimum Xposed API version (82 = Xposed 3.0+, works with LSPosed) -->
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+    </application>
+
+</manifest>

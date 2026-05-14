@@ -1,0 +1,7 @@
+com.pfxmodloader.lsposed.app-pngs-0 C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\build\generated\res\pngs\release
+com.pfxmodloader.lsposed.app-resValues-1 C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\build\generated\res\resValues\release
+com.pfxmodloader.lsposed.app-packageReleaseResources-2 C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\build\intermediates\incremental\release\packageReleaseResources\merged.dir
+com.pfxmodloader.lsposed.app-packageReleaseResources-3 C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\build\intermediates\incremental\release\packageReleaseResources\stripped.dir
+com.pfxmodloader.lsposed.app-merged_res-4 C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\build\intermediates\merged_res\release
+com.pfxmodloader.lsposed.app-main-5 C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\res
+com.pfxmodloader.lsposed.app-release-6 C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\release\res

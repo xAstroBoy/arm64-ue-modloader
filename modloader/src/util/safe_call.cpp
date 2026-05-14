@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <exception>
 #include <stdexcept>
+#include <inttypes.h>
 
 namespace safe_call
 {
@@ -45,6 +46,7 @@ namespace safe_call
     static std::atomic<uint64_t> s_total_recoveries{0};
     static std::atomic<uint64_t> s_exception_count{0};
     static std::atomic<uint64_t> s_signal_count{0};
+    static std::atomic<uint64_t> s_probe_signal_recoveries{0};
     static thread_local std::string t_last_context;
 
     // ═══ Initialization ═════════════════════════════════════════════════════
@@ -111,10 +113,27 @@ namespace safe_call
             s_signal_count.fetch_add(1, std::memory_order_relaxed);
             t_last_context = context;
 
-            logger::log_error("SAFECALL",
-                              "SIGNAL RECOVERY: %s (sig=%d, fault=0x%lX) — recovered",
-                              context.c_str(), result.signal,
-                              static_cast<unsigned long>(result.fault_addr));
+            const bool probe_context = (context == "probe_read" || context == "safe_memcpy");
+            if (probe_context)
+            {
+                uint64_t n = s_probe_signal_recoveries.fetch_add(1, std::memory_order_relaxed) + 1;
+                // Probe failures are expected during heuristic scans. Log every 200th
+                // recovery to keep diagnostics without flooding logcat/UEModLoader.log.
+                if (n == 1 || (n % 200) == 0)
+                {
+                    logger::log_warn("SAFECALL",
+                                     "Probe signal recoveries=%" PRIu64 " (latest: sig=%d fault=0x%lX)",
+                                     n, result.signal,
+                                     static_cast<unsigned long>(result.fault_addr));
+                }
+            }
+            else
+            {
+                logger::log_error("SAFECALL",
+                                  "SIGNAL RECOVERY: %s (sig=%d, fault=0x%lX) — recovered",
+                                  context.c_str(), result.signal,
+                                  static_cast<unsigned long>(result.fault_addr));
+            }
 
             return result;
         }

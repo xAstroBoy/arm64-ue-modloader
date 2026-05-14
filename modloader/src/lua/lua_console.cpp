@@ -33,6 +33,11 @@
 namespace lua_console
 {
 
+    static bool invoke_console_pe(ue::UObject *obj, ue::UFunction *func, void *parms, const char *op_name)
+    {
+        return pe_hook::invoke_game_thread_sync(obj, func, parms, "CONSOLE", op_name, 8000);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Internal: Find PlayerController
     // ═══════════════════════════════════════════════════════════════════════
@@ -151,12 +156,8 @@ namespace lua_console
         auto *init_func = pe_hook::resolve_func_path("CheatManager:InitCheatManager");
         if (init_func)
         {
-            auto pe = pe_hook::get_original();
-            if (!pe)
-                pe = symbols::ProcessEvent;
-            if (pe)
+            if (invoke_console_pe(new_cm, init_func, nullptr, "InitCheatManager"))
             {
-                pe(new_cm, init_func, nullptr);
                 logger::log_info("CONSOLE", "InitCheatManager called");
             }
         }
@@ -206,12 +207,6 @@ namespace lua_console
         }
 
         // Build parameters for ConsoleCommand(FString Command, bool bWriteToLog)
-        auto pe = pe_hook::get_original();
-        if (!pe)
-            pe = symbols::ProcessEvent;
-        if (!pe)
-            return "";
-
         // Get the parms size from UFunction
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
         if (parms_size == 0)
@@ -239,15 +234,9 @@ namespace lua_console
         // Write FString to parms buffer at offset 0
         std::memcpy(parms.data(), &cmd_str, sizeof(FString));
 
-        // Call via ProcessEvent
-        auto result = safe_call::execute([&]()
-                                         { pe(pc, func, parms.data()); },
-                                         "ConsoleCommand(" + command + ")");
-
-        if (!result.ok)
+        if (!invoke_console_pe(pc, func, parms.data(), "ConsoleCommand"))
         {
-            logger::log_warn("CONSOLE", "ConsoleCommand(%s) crashed: %s",
-                             command.c_str(), result.error_msg.c_str());
+            logger::log_warn("CONSOLE", "ConsoleCommand(%s) dispatch failed", command.c_str());
             return "";
         }
 
@@ -282,23 +271,12 @@ namespace lua_console
             return false;
         }
 
-        auto pe = pe_hook::get_original();
-        if (!pe)
-            pe = symbols::ProcessEvent;
-        if (!pe)
-            return false;
-
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
         std::vector<uint8_t> parms(parms_size > 0 ? parms_size : 16, 0);
 
-        auto result = safe_call::execute([&]()
-                                         { pe(cm, func, parms.data()); },
-                                         "Cheat:" + func_name);
-
-        if (!result.ok)
+        if (!invoke_console_pe(cm, func, parms.data(), "CheatCall"))
         {
-            logger::log_warn("CONSOLE", "Cheat %s crashed: %s",
-                             func_name.c_str(), result.error_msg.c_str());
+            logger::log_warn("CONSOLE", "Cheat %s dispatch failed", func_name.c_str());
             return false;
         }
 
@@ -329,24 +307,14 @@ namespace lua_console
             return false;
         }
 
-        auto pe = pe_hook::get_original();
-        if (!pe)
-            pe = symbols::ProcessEvent;
-        if (!pe)
-            return false;
-
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
         std::vector<uint8_t> parms(parms_size > 0 ? parms_size : 16, 0);
         std::memcpy(parms.data(), &value, sizeof(float));
 
-        auto result = safe_call::execute([&]()
-                                         { pe(cm, func, parms.data()); },
-                                         "Cheat:" + func_name);
-
-        if (!result.ok)
+        if (!invoke_console_pe(cm, func, parms.data(), "CheatCallFloat"))
         {
-            logger::log_warn("CONSOLE", "Cheat %s(%.2f) crashed: %s",
-                             func_name.c_str(), value, result.error_msg.c_str());
+            logger::log_warn("CONSOLE", "Cheat %s(%.2f) dispatch failed",
+                             func_name.c_str(), value);
             return false;
         }
 
@@ -374,12 +342,6 @@ namespace lua_console
         if (!func)
             return false;
 
-        auto pe = pe_hook::get_original();
-        if (!pe)
-            pe = symbols::ProcessEvent;
-        if (!pe)
-            return false;
-
         // Build FString parameter
         std::u16string u16str(str_arg.begin(), str_arg.end());
         u16str.push_back(u'\0');
@@ -400,14 +362,10 @@ namespace lua_console
         std::vector<uint8_t> parms(parms_size > 0 ? parms_size : 64, 0);
         std::memcpy(parms.data(), &fs, sizeof(FString));
 
-        auto result = safe_call::execute([&]()
-                                         { pe(cm, func, parms.data()); },
-                                         "Cheat:" + func_name + "(" + str_arg + ")");
-
-        if (!result.ok)
+        if (!invoke_console_pe(cm, func, parms.data(), "CheatCallString"))
         {
-            logger::log_warn("CONSOLE", "Cheat %s(%s) crashed: %s",
-                             func_name.c_str(), str_arg.c_str(), result.error_msg.c_str());
+            logger::log_warn("CONSOLE", "Cheat %s(%s) dispatch failed",
+                             func_name.c_str(), str_arg.c_str());
             return false;
         }
 
@@ -711,11 +669,9 @@ namespace lua_console
             fs.max = fs.num;
             std::memcpy(parms.data(), &fs, sizeof(FStr));
 
-            auto pe = pe_hook::get_original();
-            if (!pe) pe = symbols::ProcessEvent;
-            if (!pe) return "ERROR: ProcessEvent not available";
-
-            pe(pc, func, parms.data());
+            if (!invoke_console_pe(pc, func, parms.data(), "ExecConsoleCommand")) {
+                return "ERROR: ProcessEvent dispatch failed";
+            }
             logger::log_info("CONSOLE", "ExecConsoleCommand: '%s'", cmd_string.c_str());
 
             // Try to read return value (FString result at return_offset)
@@ -891,11 +847,9 @@ namespace lua_console
             fs.max = fs.num;
             std::memcpy(parms.data(), &fs, sizeof(FStr));
 
-            auto pe = pe_hook::get_original();
-            if (!pe) pe = symbols::ProcessEvent;
-            if (!pe) return "ERROR: no ProcessEvent";
-
-            pe(pc, func, parms.data());
+            if (!invoke_console_pe(pc, func, parms.data(), "GetCVar")) {
+                return "ERROR: ProcessEvent dispatch failed";
+            }
             return "OK (value written to log)"; });
 
         // SetCVar — set a CVar's value by name
@@ -920,11 +874,9 @@ namespace lua_console
             fs.max = fs.num;
             std::memcpy(parms.data(), &fs, sizeof(FStr));
 
-            auto pe = pe_hook::get_original();
-            if (!pe) pe = symbols::ProcessEvent;
-            if (!pe) return false;
-
-            pe(pc, func, parms.data());
+            if (!invoke_console_pe(pc, func, parms.data(), "SetCVar")) {
+                return false;
+            }
             logger::log_info("CONSOLE", "SetCVar: %s = %s", cvar_name.c_str(), value.c_str());
             return true; });
 

@@ -746,9 +746,8 @@ namespace lua_cast
                 fs.max = fs.num;
                 std::memcpy(parms.data(), &fs, sizeof(FString));
 
-                auto pe = pe_hook::get_original();
-                if (!pe) pe = symbols::ProcessEvent;
-                if (pe) pe(pc, cc_func, parms.data());
+                pe_hook::invoke_game_thread_sync(pc, cc_func, parms.data(),
+                                                 "SPAWN", "SpawnActor.Summon", 8000);
 
                 logger::log_info("SPAWN", "Summoned: %s", class_name.c_str());
                 return sol::nil; // Summon doesn't return the actor reference
@@ -777,11 +776,10 @@ namespace lua_cast
                 return false;
             }
 
-            auto pe = pe_hook::get_original();
-            if (!pe) pe = symbols::ProcessEvent;
-            if (!pe) return false;
-
-            pe(obj, func, nullptr);
+            if (!pe_hook::invoke_game_thread_sync(obj, func, nullptr,
+                                                  "SPAWN", "DestroyActor.K2_DestroyActor", 8000)) {
+                return false;
+            }
             logger::log_info("SPAWN", "Destroyed actor @ %p", (void*)obj);
             return true; });
 

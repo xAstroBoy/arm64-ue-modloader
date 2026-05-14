@@ -668,6 +668,31 @@ impl DbReader {
             })
     }
 
+    /// Find the function whose start address is ≤ addr (the function that contains addr).
+    /// Uses binary search — the function index is sorted by canonical address.
+    fn lookup_containing_func(&self, addr: u64) -> Option<FuncRecord> {
+        let base = self.header.func_index_offset as usize;
+        let count = self.header.func_count as usize;
+        if count == 0 { return None; }
+
+        let mut lo = 0usize;
+        let mut hi = count;
+
+        // Binary search: largest index where rec_addr <= addr
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            let rec_off = base + mid * FUNC_RECORD_SIZE;
+            if rec_off + 8 > self.mmap.len() { break; }
+            let rec_addr = read_u64(&self.mmap[rec_off..]);
+            if rec_addr <= addr { lo = mid; } else { hi = mid; }
+        }
+
+        let rec_off = base + lo * FUNC_RECORD_SIZE;
+        if rec_off + FUNC_RECORD_SIZE > self.mmap.len() { return None; }
+        let r = parse_func_record(&self.mmap[rec_off..]);
+        if r.addr <= addr { Some(r) } else { None }
+    }
+
     fn read_blob(&self, br: &BlobRef) -> &str {
         if br.len == 0 { return ""; }
         let s = br.offset as usize;
@@ -1986,6 +2011,83 @@ fn cmd_aob_port_with_symbols(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// cmd_aobscan — AOB pattern scanner against raw binary, with DB-backed function lookup
+// ─────────────────────────────────────────────────────────────────────────────
+fn cmd_aobscan(db: Option<&DbReader>, bin: &Path, pattern: &str, max: usize, aliases: &AliasMap) {
+    let t = Instant::now();
+
+    let tokens = match parse_pattern_tokens(pattern) {
+        Some(t) => t,
+        None => {
+            eprintln!("Invalid AOB pattern: '{}'\nExpected hex bytes separated by spaces, ?? for wildcards.", pattern);
+            return;
+        }
+    };
+
+    if tokens.is_empty() {
+        eprintln!("Empty pattern.");
+        return;
+    }
+
+    let (concrete, ratio) = pattern_concrete_stats(&tokens);
+    if concrete == 0 {
+        eprintln!("All-wildcard pattern — refusing to scan.");
+        return;
+    }
+
+    let file = match File::open(bin) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Cannot open '{}': {}", bin.display(), e);
+            return;
+        }
+    };
+    let mmap = match unsafe { Mmap::map(&file) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Cannot mmap '{}': {}", bin.display(), e);
+            return;
+        }
+    };
+
+    println!("AOB scan:  {}", pattern);
+    println!("Binary:    {} ({:.1} MB)", bin.display(), mmap.len() as f64 / 1_048_576.0);
+    println!("Pattern:   {} bytes, {} concrete ({:.0}%)\n",
+        tokens.len(), concrete, ratio * 100.0);
+
+    let limit = if max == 0 { usize::MAX } else { max };
+    let offsets = pattern_hit_offsets(&mmap, &tokens, limit);
+
+    println!("Hits: {}", offsets.len());
+    for (i, &off) in offsets.iter().enumerate() {
+        let func_info = db
+            .and_then(|d| d.lookup_containing_func(off as u64))
+            .map(|r| {
+                let name = aliases.fmt_addr(r.addr);
+                let delta = off as u64 - r.addr;
+                if delta == 0 {
+                    format!("{} (function start)", name)
+                } else {
+                    format!("{} +0x{:X}", name, delta)
+                }
+            })
+            .unwrap_or_else(|| "<not in DB>".to_string());
+
+        println!("  [{:>3}]  0x{:08X}  →  {}", i + 1, off, func_info);
+    }
+
+    if offsets.is_empty() {
+        println!("  No matches found.");
+        println!("\nHints:");
+        println!("  • ARM64 ADRP/B/BL instructions have PC-relative immediates — use ?? for those bytes");
+        println!("  • Pattern may be from a different binary version");
+        println!("  • Try shorter pattern or add more ?? wildcards for branch bytes");
+    }
+
+    println!("\nCompleted in {:.3}s", t.elapsed().as_secs_f64());
+}
+
 fn cmd_aob_generate(
     bin: &Path,
     address: &str,
@@ -2621,6 +2723,17 @@ enum Cmd {
         /// Emit ready-to-paste C++ rows
         #[arg(long, default_value_t = false)]
         cpp: bool,
+    },
+    /// Scan raw binary for an AOB byte pattern (with ?? wildcards) — reports address + containing function
+    Aobscan {
+        /// Hex byte pattern with ?? wildcards, e.g. "FF 03 01 D1 ?? ?? FD 43 00 91"
+        pattern: String,
+        /// Binary to scan (auto-detected from .bdmp dir if omitted: libUnreal.so / libUE4.so)
+        #[arg(long)]
+        bin: Option<PathBuf>,
+        /// Maximum hits to report (0 = all)
+        #[arg(short, long, default_value = "0")]
+        max: usize,
     },
 }
 
@@ -3337,6 +3450,42 @@ fn main() {
         return;
     }
 
+    // ── aobscan: scan raw binary for pattern, look up containing function in DB ──
+    if let Cmd::Aobscan { ref pattern, ref bin, max } = cli.cmd {
+        let bin_path: PathBuf = match bin {
+            Some(p) => p.clone(),
+            None => {
+                // Auto-detect: look for the binary next to the .bdmp file
+                let db_dir = cli.db.as_ref()
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let candidates = ["libUnreal.so", "libUE4.so", "libUnreal.so.bak"];
+                let found = candidates.iter().find_map(|name| {
+                    let p = db_dir.join(name);
+                    if p.exists() { Some(p) } else { None }
+                });
+                match found {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("No binary found next to .bdmp file.");
+                        eprintln!("Tried: libUnreal.so, libUE4.so in: {}", cli.db.as_ref()
+                            .and_then(|p| p.parent()).map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<current dir>".to_string()));
+                        eprintln!("Use --bin <path/to/libUnreal.so>");
+                        return;
+                    }
+                }
+            }
+        };
+        // Optionally load DB for function lookup (not required)
+        let db_path = cli.db.as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("bindump.bdmp"));
+        let db = DbReader::open(&db_path);
+        cmd_aobscan(db.as_ref(), &bin_path, pattern, max, &aliases);
+        return;
+    }
+
     let be = detect_backend(&cli);
 
     match cli.cmd {
@@ -3362,7 +3511,7 @@ fn main() {
                 println!("'{}' not found as address or alias name", query);
             }
         }
-        Cmd::Aob { .. } | Cmd::AobVerify { .. } | Cmd::AobBatch { .. } | Cmd::AobDbBatch { .. } | Cmd::AobPort { .. } | Cmd::AobPortDb { .. } => unreachable!(),
+        Cmd::Aob { .. } | Cmd::AobVerify { .. } | Cmd::AobBatch { .. } | Cmd::AobDbBatch { .. } | Cmd::AobPort { .. } | Cmd::AobPortDb { .. } | Cmd::Aobscan { .. } => unreachable!(),
         Cmd::Info => cmd_info(&be),
         Cmd::Func { ref address, extract } => {
             let resolved = resolve_addr_or_alias(address, &aliases);

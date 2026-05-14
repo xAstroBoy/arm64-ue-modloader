@@ -226,10 +226,12 @@ namespace game_profile
         p.package_name = "com.zenstudios.PFXVRQuest";
         p.display_name = "Pinball FX VR";
         p.engine_lib_name = "libUnreal.so";
-        p.engine_version = "UE5";
+        p.engine_version = "UE5 (bootstrap: 5.3 assumption)";
         p.detected_engine_version = EngineVersion::UE5_3;
 
         // Build offsets from engine_versions.h constants (derived from UE source)
+        // Bootstrap assumption only — auto-offset discovery may confirm or override it
+        // later from binary markers (e.g. UE5_3_2_MetaFork).
         p.offsets = build_offsets_for_version(EngineVersion::UE5_3);
 
         // ── Pinball FX VR specific overrides (verified on live binary) ──
@@ -242,55 +244,65 @@ namespace game_profile
         // Data globals (GNames, GUObjectArray, GEngine) are NOT here — they are runtime VAs
         // not derivable from file offsets; handled by auto_offsets::find_g*() scanners.
         // Offsets verified via: aob-port old=pfx_old_offsets_confirmed_v2.txt new=Pinball FX New Dump
+        // ── Stable global offsets — CONFIRMED on new binary (Pinball FX New Dump, May 2026) ──
+        // Always applied regardless of disallow_hardcoded_fallbacks(). Used as Priority 4
+        // fallback after dlsym / ELF / pattern / auto-discovery all fail.
+        // Data globals (GNames, GUObjectArray, GEngine) are NOT here — they are runtime VAs
+        // not derivable from file offsets; handled by auto_offsets::find_g*() scanners.
+        //
+        // NOTE: All offsets here are p_vaddr values (= file_offset + 0x1000 for RX segment).
+        // The ELF PT_LOAD for the .text segment has p_vaddr = file_offset + 0x1000.
+        // s_lib_base = dlpi_addr (min_p_vaddr=0), so runtime_VA = s_lib_base + p_vaddr.
+        // Patterns (higher priority) always override these; these are correctness fallbacks only.
         p.stable_global_offsets = {
-            // Core UE engine functions
-            {"ProcessEvent", 0x16854DC},
-            {"StaticConstructObject_Internal", 0x169DFDC},
-            {"StaticFindObject", 0x14F6004},
-            {"StaticLoadObject", 0x169A630},
-            {"FName::Init", 0x14A41F0},
-            {"GetTransientPackage", 0x16151A0},
-            // PFX store / achievements
-            {"PFXStoreManager::IsTableOwned", 0x4EF048C},
-            {"PFXAchievementsManager::IsAchievementUnlocked", 0x4E7CC74},
-            {"PFXAchievementsManager::IsHologram", 0x4E7C87C},
-            {"PFXAchievementsManager::GetTrophy", 0x4E7CBC4},
-            {"PFXAchievementsManager::SetTrophyBeenSeen", 0x4E7CA14},
+            // Core UE engine functions (p_vaddr = file_offset + 0x1000)
+            {"ProcessEvent", 0x167E4DC},                   // file: 0x167D4DC (verified via old→new caller/callee port)
+            {"StaticConstructObject_Internal", 0x169EFDC}, // file: 0x169DFDC
+            {"StaticFindObject", 0x14F7004},               // file: 0x14F6004
+            {"StaticLoadObject", 0x169B630},               // file: 0x169A630
+            {"FName::Init", 0x14B41F0},                    // file: 0x14A41F0
+            {"GetTransientPackage", 0x16161A0},            // file: 0x16151A0
+            // PFX store / achievements (p_vaddr = file_offset + 0x1000)
+            {"PFXStoreManager::IsTableOwned", 0x4EF148C},                 // file: 0x4EF048C
+            {"PFXAchievementsManager::IsAchievementUnlocked", 0x4E7DC74}, // file: 0x4E7CC74
+            {"PFXAchievementsManager::IsHologram", 0x4E7D87C},            // file: 0x4E7C87C
+            {"PFXAchievementsManager::GetTrophy", 0x4E7DBC4},             // file: 0x4E7CBC4
+            {"PFXAchievementsManager::SetTrophyBeenSeen", 0x4E7DA14},     // file: 0x4E7CA14
             // PFX collectibles
-            {"PFXCollectiblesManager::UnlockEntry", 0x4E981FC},
-            {"PFXCollectibleEntry::SetUnlocked", 0x4E91C24},
+            {"PFXCollectiblesManager::UnlockEntry", 0x4E991FC}, // file: 0x4E981FC
+            {"PFXCollectibleEntry::SetUnlocked", 0x4E92C24},    // file: 0x4E91C24
             // YUP component system
-            {"YUP_AddPropertyToComponent", 0x478FBB0},
-            {"YUP_RegisterPropertyBinding", 0x47A20EC},
-            {"YUP_RegisterActionBinding", 0x47A2248},
-            {"YUP_ResetComponent", 0x478F120},
-            {"YUP_PendulumBall_Detach", 0x48A39CC},
-            {"YUP_BallInformator_GetSingleton", 0x48BA280},
-            {"YUP_BallInformator_GetSpeed", 0x48BA5F8},
+            {"YUP_AddPropertyToComponent", 0x4790BB0},      // file: 0x478FBB0
+            {"YUP_RegisterPropertyBinding", 0x47A30EC},     // file: 0x47A20EC
+            {"YUP_RegisterActionBinding", 0x47A3248},       // file: 0x47A2248
+            {"YUP_ResetComponent", 0x4790120},              // file: 0x478F120
+            {"YUP_PendulumBall_Detach", 0x48A49CC},         // file: 0x48A39CC
+            {"YUP_BallInformator_GetSingleton", 0x48BB280}, // file: 0x48BA280
+            {"YUP_BallInformator_GetSpeed", 0x48BB5F8},     // file: 0x48BA5F8
             // YUP table debug
-            {"YUP_TableDebug_SetPause", 0x49315A8},
-            {"YUP_TableDebug_SetGodMode", 0x49315B8},
-            {"YUP_TableDebug_PauseToggle", 0x49315C8},
-            {"YUP_TableDebug_ToggleGodMode", 0x49315EC},
-            {"YUP_TableDebug_SetSpeed", 0x4931600},
-            {"YUP_TableDebug_DumpAction", 0x4931538},
-            {"YUP_TableDebug_DebugLoad", 0x4931628},
+            {"YUP_TableDebug_SetPause", 0x49325A8},      // file: 0x49315A8
+            {"YUP_TableDebug_SetGodMode", 0x49325B8},    // file: 0x49315B8
+            {"YUP_TableDebug_PauseToggle", 0x49325C8},   // file: 0x49315C8
+            {"YUP_TableDebug_ToggleGodMode", 0x49325EC}, // file: 0x49315EC
+            {"YUP_TableDebug_SetSpeed", 0x4932600},      // file: 0x4931600
+            {"YUP_TableDebug_DumpAction", 0x4932538},    // file: 0x4931538
+            {"YUP_TableDebug_DebugLoad", 0x4932628},     // file: 0x4931628
             // PFX save / award system
-            {"PFX_SaveManager_SetSingleton", 0x4EEDAD0},
-            {"PFX_SaveManager_ClearSingleton", 0x4EEDAE0},
-            {"PFX_SaveManager_MutexLock", 0x4F72544},
-            {"PFX_SaveManager_MutexUnlock", 0x4F72550},
-            {"PFX_CheatManager_GetSingleton", 0x4C6164C},
-            {"PFX_AwardUnlockTable", 0x4F6BD0C},
-            {"PFX_AwardLockTable", 0x4F6C0BC},
-            {"PFX_AwardUnlockAll", 0x4F5D4A0},
-            {"PFX_AwardLockAll", 0x4F5D574},
-            {"PFX_UnLockAllTables", 0x4F5DAAC},
-            {"PFX_SaveManager_HashLookup", 0x4F6E0D8},
-            // AES / PAK
-            {"AES_set_decrypt_key", 0x6273DC0},
-            {"AES_set_encrypt_key", 0x6273BA0},
-            {"FAES_DecryptData", 0x1402EE4},
+            {"PFX_SaveManager_SetSingleton", 0x4EEEAD0},   // file: 0x4EEDAD0
+            {"PFX_SaveManager_ClearSingleton", 0x4EEEAE0}, // file: 0x4EEDAE0
+            {"PFX_SaveManager_MutexLock", 0x4F73544},      // file: 0x4F72544
+            {"PFX_SaveManager_MutexUnlock", 0x4F73550},    // file: 0x4F72550
+            {"PFX_CheatManager_GetSingleton", 0x4C6264C},  // file: 0x4C6164C
+            {"PFX_AwardUnlockTable", 0x4F6CD0C},           // file: 0x4F6BD0C
+            {"PFX_AwardLockTable", 0x4F6D0BC},             // file: 0x4F6C0BC
+            {"PFX_AwardUnlockAll", 0x4F5E4A0},             // file: 0x4F5D4A0
+            {"PFX_AwardLockAll", 0x4F5E574},               // file: 0x4F5D574
+            {"PFX_UnLockAllTables", 0x4F5EAAC},            // file: 0x4F5DAAC
+            {"PFX_SaveManager_HashLookup", 0x4F6F0D8},     // file: 0x4F6E0D8
+            // AES / PAK (also in RX segment)
+            {"AES_set_decrypt_key", 0x6274DC0}, // file: 0x6273DC0
+            {"AES_set_encrypt_key", 0x6274BA0}, // file: 0x6273BA0
+            {"FAES_DecryptData", 0x1403EE4},    // file: 0x1402EE4
         };
 
         // ── Fallback offsets ──
@@ -380,7 +392,7 @@ namespace game_profile
         p.pattern_signatures = {
             // ══ Core UE engine functions ═══════════════════════════════════════
             {"ProcessEvent",
-             "FF 03 01 D1 FD 7B 01 A9 FD 43 00 91 F6 57 02 A9 F4 4F 03 A9 55 D0 3B D5 F3 03 02 AA A8 16 40 F9 E2 03 00 91 E8 07 00 F9 20 A0 41 A9 09 25 00 91 14 01 40 F9 FF 03 00 F9",
+             "FD 7B BA A9 FC 0B 00 F9 FD 03 00 91 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FF 03 03 D1 58 D0 3B D5",
              -1, 0},
             {"StaticConstructObject_Internal",
              "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? F8 03 14 AA 1F 03 00 F1 62 06 40 F9",
@@ -587,8 +599,8 @@ namespace game_profile
         if (ue5_handle)
         {
             p.engine_lib_name = "libUnreal.so";
-            p.engine_version = "UE5 (auto-detected)";
-            p.detected_engine_version = EngineVersion::UE5_4; // default UE5 assumption
+            p.engine_version = "UE5 (bootstrap: unknown minor)";
+            p.detected_engine_version = EngineVersion::UNKNOWN;
             p.offsets = build_offsets_for_version(EngineVersion::UE5_4);
             dlclose(ue5_handle);
 
@@ -598,8 +610,8 @@ namespace game_profile
         else if (ue4_handle)
         {
             p.engine_lib_name = "libUE4.so";
-            p.engine_version = "UE4 (auto-detected)";
-            p.detected_engine_version = EngineVersion::UE4_27; // default UE4 assumption
+            p.engine_version = "UE4 (bootstrap: unknown minor)";
+            p.detected_engine_version = EngineVersion::UNKNOWN;
             p.offsets = build_offsets_for_version(EngineVersion::UE4_27);
             dlclose(ue4_handle);
 

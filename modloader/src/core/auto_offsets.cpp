@@ -33,6 +33,35 @@
 
 namespace auto_offsets
 {
+    static const char *version_to_string(engine_versions::EngineVersion v)
+    {
+        using namespace engine_versions;
+        switch (v)
+        {
+        case EngineVersion::UE4_25:
+            return "UE4.25";
+        case EngineVersion::UE4_26:
+            return "UE4.26";
+        case EngineVersion::UE4_27:
+            return "UE4.27";
+        case EngineVersion::UE5_0:
+            return "UE5.0";
+        case EngineVersion::UE5_1:
+            return "UE5.1";
+        case EngineVersion::UE5_2:
+            return "UE5.2";
+        case EngineVersion::UE5_3:
+            return "UE5.3";
+        case EngineVersion::UE5_4:
+            return "UE5.4";
+        case EngineVersion::UE5_5:
+            return "UE5.5";
+        case EngineVersion::UE5_6:
+            return "UE5.6";
+        default:
+            return "UNKNOWN";
+        }
+    }
 
     static bool s_initialized = false;
 
@@ -750,6 +779,70 @@ namespace auto_offsets
         return func_start;
     }
 
+    // Find function near an EXACT null-terminated C-string match.
+    // This avoids substring collisions such as "ProcessEvent" matching
+    // "processEvents" / "ProcessEvents1..N".
+    static uintptr_t find_func_near_exact_string(const char *needle, const char *name,
+                                                 std::vector<std::string> &log)
+    {
+        if (!needle || !needle[0])
+            return 0;
+
+        auto all = pattern::find_string_all(needle);
+        if (all.empty())
+        {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s: exact string '%s' not found", name, needle);
+            log.push_back(msg);
+            return 0;
+        }
+
+        size_t needle_len = strlen(needle);
+        uintptr_t chosen = 0;
+        for (void *addr : all)
+        {
+            uintptr_t p = reinterpret_cast<uintptr_t>(addr);
+            if (!safe_call::probe_read(reinterpret_cast<void *>(p + needle_len), 1))
+                continue;
+
+            const uint8_t next = *reinterpret_cast<uint8_t *>(p + needle_len);
+            if (next == 0)
+            {
+                chosen = p;
+                break;
+            }
+        }
+
+        if (chosen == 0)
+        {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "%s: only substring matches found for '%s' (no exact NUL-terminated token)",
+                     name, needle);
+            log.push_back(msg);
+            return 0;
+        }
+
+        auto refs = find_adrp_refs_to(chosen);
+        if (refs.empty())
+        {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s: no xrefs to exact '%s'", name, needle);
+            log.push_back(msg);
+            return 0;
+        }
+
+        uintptr_t func_start = find_function_start(refs[0]);
+        if (func_start != 0)
+        {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s: function at 0x%lX (from exact string '%s' xref at 0x%lX)",
+                     name, static_cast<unsigned long>(func_start), needle,
+                     static_cast<unsigned long>(refs[0]));
+            log.push_back(msg);
+        }
+        return func_start;
+    }
+
     // ═══ INITIALIZATION ═════════════════════════════════════════════════════
 
     void init()
@@ -999,8 +1092,9 @@ namespace auto_offsets
         if (result)
             goto done;
 
-        // Strategy 4: Look for the string "ProcessEvent" itself
-        result = find_func_near_string("ProcessEvent", "ProcessEvent(literal)", log);
+        // Strategy 4: Look for EXACT token "ProcessEvent" (NUL-terminated)
+        // to avoid false positives like processEvents/ProcessEventsN.
+        result = find_func_near_exact_string("ProcessEvent", "ProcessEvent(literal-exact)", log);
         if (result)
             goto done;
 
@@ -1223,14 +1317,14 @@ namespace auto_offsets
     uint32_t probe_ffield_owner_size()
     {
         // FField owner is either:
-        //   UE4: FFieldVariant (16 bytes — union { UField*, FField* } + bool bIsUObject)
-        //   UE5: UField* (8 bytes — always a raw pointer, no variant)
+        //   UE4: FFieldVariant (16 bytes)
+        //   UE5: compact tagged FFieldVariant (8 bytes)
         //
         // We can detect this from the engine version
         auto ver = detect_engine_version();
         if (ver >= engine_versions::EngineVersion::UE5_0)
         {
-            logger::log_info("AUTOOFF", "FField owner size = 8 (UE5 raw pointer)");
+            logger::log_info("AUTOOFF", "FField owner size = 8 (UE5 tagged FFieldVariant)");
             return 8;
         }
         else if (ver != engine_versions::EngineVersion::UNKNOWN)
@@ -1390,17 +1484,30 @@ namespace auto_offsets
     {
         auto &profile = game_profile::mutable_profile();
 
-        // Only apply version if not already detected
-        if (profile.detected_engine_version == engine_versions::EngineVersion::UNKNOWN &&
-            result.detected_version != engine_versions::EngineVersion::UNKNOWN)
+        // Apply binary-detected engine version if it is known and either:
+        //   1) profile had no exact version yet, or
+        //   2) profile was using a bootstrap assumption that differs.
+        if (result.detected_version != engine_versions::EngineVersion::UNKNOWN &&
+            profile.detected_engine_version != result.detected_version)
         {
+            auto old_version = profile.detected_engine_version;
             profile.detected_engine_version = result.detected_version;
-            logger::log_info("AUTOOFF", "Applied detected engine version to profile");
+            profile.engine_version = std::string(version_to_string(result.detected_version)) + " (binary-detected)";
+            logger::log_info("AUTOOFF", "Applied binary engine version to profile: %s -> %s [%s]",
+                             version_to_string(old_version),
+                             version_to_string(result.detected_version),
+                             result.version_string.empty() ? "no marker string" : result.version_string.c_str());
 
             // Rebuild offsets for the detected version
             profile.offsets = game_profile::build_offsets_for_version(result.detected_version);
             ue::apply_type_offsets(profile.offsets);
-            logger::log_info("AUTOOFF", "Rebuilt type offsets for detected engine version");
+            logger::log_info("AUTOOFF", "Rebuilt type offsets for binary-detected engine version");
+        }
+        else if (result.detected_version != engine_versions::EngineVersion::UNKNOWN)
+        {
+            logger::log_info("AUTOOFF", "Binary engine version matches bootstrap profile: %s [%s]",
+                             version_to_string(result.detected_version),
+                             result.version_string.empty() ? "no marker string" : result.version_string.c_str());
         }
 
         // Apply discovered pointers as offsets relative to the already-resolved

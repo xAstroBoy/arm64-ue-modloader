@@ -557,8 +557,20 @@ namespace init
         logger::log_info("BOOT", "Pattern scanner initialized");
 
         // ── Step 6.1: Initialize AES extractor ─────────────────────────────
-        aes_extractor::init();
-        logger::log_info("BOOT", "AES extractor initialized");
+        // Pinball FX VR stability: skip AES extractor bootstrap at startup.
+        // The extractor performs broad string/memory scanning and installs crypto
+        // hooks during early load, which has correlated with startup instability
+        // in async-loading windows. It can still be used later via bridge commands
+        // (aes_scan/aes_*), but we avoid doing this work on the critical boot path.
+        if (game_profile::is_pinball_fx())
+        {
+            logger::log_warn("BOOT", "AES extractor startup init SKIPPED for Pinball FX VR (stability gate)");
+        }
+        else
+        {
+            aes_extractor::init();
+            logger::log_info("BOOT", "AES extractor initialized");
+        }
 
         // ── Step 6.5: Run dynamic offset discovery ──────────────────────────
         // Auto-discovers GNames, GUObjectArray, ProcessEvent, FUObjectItem size,
@@ -573,6 +585,11 @@ namespace init
 
             // Apply discoveries to the game profile (only fills gaps)
             auto_offsets::apply_to_profile(discovery);
+
+            logger::log_info("BOOT", "Final engine version after binary detection: %s (enum=%u, marker=%s)",
+                             game_profile::profile().engine_version.c_str(),
+                             static_cast<unsigned>(game_profile::engine_version_enum()),
+                             discovery.version_string.empty() ? "<none>" : discovery.version_string.c_str());
 
             // Re-apply type offsets if auto-discovery changed them
             ue::apply_type_offsets(game_profile::offsets());

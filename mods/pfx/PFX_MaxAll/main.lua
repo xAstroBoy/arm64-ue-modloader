@@ -925,28 +925,27 @@ local function sync_championship()
 end
 
 -- ============================================================================
--- PHASE 6b: CHAMPIONSHIP BATCH — Direct TMap writes only (no ProcessEvent)
--- SetMatchProgress crashes (fault_addr=0x38) because GameplayTag struct
--- cannot be serialized for ProcessEvent on this build.  Phase 5 already
--- writes progress=3 + Score=999999999 on existing save entries via ForEach.
--- This phase ensures every match from the runtime ChampionshipData also
--- exists in the save profile TMap, creating missing entries if needed.
+-- PHASE 6b: CHAMPIONSHIP BATCH — SetMatchProgress for EVERY match in every league
+--
+-- SDK: PFXChampionshipManager:SetMatchProgress(
+--        iMatchID  GameplayTag {TagName=FName},
+--        iProgress int32,
+--        iScore    int64,
+--        iHigherScoreBetter boolean,
+--        iSaveProfile       boolean)
+--
+-- League hierarchy (from SDK):
+--   ChampionshipData.LeagueList → PFXChampionshipLeague[]
+--     league.ID           = GameplayTag (pass to SetLeagueLastSeenMapLevelToCurrent)
+--     league.RoundList    = TMap<EPFXChampionshipRoundType, PFXChampionshipRound>
+--       round.MatchList   = TArray<PFXChampionshipMatch>
+--         match.ID        = GameplayTag (pass to SetMatchProgress)
 -- ============================================================================
 local function run_championship_batch()
-    -- 1. Get save profile maps
-    local sm = find_live("BP_SaveManager_C", "PFXSaveManager")
-    if not sm then Log(TAG .. ": SaveManager not found for champ batch"); return end
-    local profile = nil
-    pcall(function() profile = sm:Get("m_profile") end)
-    if not profile then Log(TAG .. ": No m_profile for champ batch"); return end
-    local cp = nil
-    pcall(function() cp = profile.ChampionshipProgress end)
-    if not cp then Log(TAG .. ": No ChampionshipProgress in profile"); return end
-    local leagueMap = nil
-    pcall(function() leagueMap = cp.LeagueProgress end)
-    if not leagueMap then Log(TAG .. ": No LeagueProgress TMap"); return end
+    -- Direct TMap write approach — bypasses SetMatchProgress entirely.
+    -- SetMatchProgress fires UI delegates that crash when called before
+    -- all widgets are loaded. Writing directly to save data is safe.
 
-    -- 2. Get runtime championship data
     local chm = find_live("BP_ChampionshipManager_C", "PFXChampionshipManager")
     if not chm then Log(TAG .. ": CHM not found for batch"); return end
     local cd = nil
@@ -954,60 +953,127 @@ local function run_championship_batch()
     if not cd then Log(TAG .. ": No ChampionshipData for batch"); return end
     local leagues = nil
     pcall(function() leagues = cd:Get("LeagueList") end)
-    if not leagues then Log(TAG .. ": No LeagueList for batch"); return end
+    if not leagues or #leagues == 0 then Log(TAG .. ": No LeagueList for batch"); return end
 
-    -- 3. Walk every league → round → match.
-    --    For each match, call SetMatchProgress via ProcessEvent with Clone'd GameplayTag.
-    local total_set = 0
-    local total_fail = 0
-    local total_leagues = 0
-    for li = 1, #leagues do
-        local lg = leagues[li]
-        if not lg then goto cl end
+    -- Get save data
+    local sm = find_live("BP_SaveManager_C", "PFXSaveManager")
+    if not sm then Log(TAG .. ": No SaveManager for batch"); return end
+    local profile = nil
+    pcall(function() profile = sm:Get("m_profile") end)
+    if not profile then Log(TAG .. ": No profile for batch"); return end
+    local cp = profile.ChampionshipProgress
+    if not cp then Log(TAG .. ": No ChampionshipProgress for batch"); return end
+    local leagueProgressMap = cp.LeagueProgress
+    if not leagueProgressMap then Log(TAG .. ": No LeagueProgress TMap"); return end
+
+    -- Pre-build: TagName string → LeagueProgress LuaUStruct
+    -- TMap key is FGameplayTag (struct with FName TagName).
+    -- lKey.TagName returns the FName as a plain Lua string via fname_to_string.
+    local leagueProgressByTag = {}
+    local lpCount = 0
+    leagueProgressMap:ForEach(function(lKey, lVal)
         pcall(function()
-            total_leagues = total_leagues + 1
+            local tagName = lKey.TagName  -- string, e.g. "Championship.League.Pro"
+            if tagName and tagName ~= "" then
+                leagueProgressByTag[tagName] = lVal
+                lpCount = lpCount + 1
+            end
+        end)
+    end)
+    Log(TAG .. ": Batch: " .. lpCount .. " league save entries indexed")
 
-            -- Ensure all league entries have LastSeenLeagueMapLevel = 99
+    local total_matches = 0
+    local added_matches = 0
+    local fail_matches  = 0
+    local no_lp_count   = 0  -- matches whose league had no save entry
+
+    for _, league in ipairs(leagues) do
+        if not is_live(league) then goto next_league end
+
+        -- Get league ID (FGameplayTag) for lookup and for SetLeagueLastSeenMapLevelToCurrent
+        local leagueID = nil
+        pcall(function() leagueID = league:Get("ID") end)
+
+        -- Update league last-seen map level (this call is safe — no delegate storms)
+        if leagueID then
+            pcall(function() chm:Call("SetLeagueLastSeenMapLevelToCurrent", leagueID) end)
+        end
+
+        -- Find the corresponding LeagueProgress entry in save data
+        local lVal = nil
+        if leagueID then
             pcall(function()
-                leagueMap:ForEach(function(lKey, lVal)
-                    pcall(function() lVal.LastSeenLeagueMapLevel = 99 end)
-                end)
+                local tagName = leagueID.TagName
+                if tagName then lVal = leagueProgressByTag[tagName] end
             end)
+        end
+        if lVal then
+            pcall(function() lVal.LastSeenLeagueMapLevel = 99 end)
+        end
 
-            local rounds = lg:Get("RoundList")
-            if not rounds then return end
-            rounds:ForEach(function(k, v)
+        -- Iterate all rounds → all matches
+        local roundMap = nil
+        pcall(function() roundMap = league:Get("RoundList") end)
+        if not roundMap then goto next_league end
+
+        roundMap:ForEach(function(_, round)
+            if not is_live(round) then return end
+            local matchList = nil
+            pcall(function() matchList = round:Get("MatchList") end)
+            if not matchList or #matchList == 0 then return end
+
+            for _, match in ipairs(matchList) do
+                if not is_live(match) then goto next_match end
+                local matchID = nil
+                pcall(function() matchID = match:Get("ID") end)
+                if not matchID then goto next_match end
+                total_matches = total_matches + 1
+
+                if lVal then
+                    -- Direct TMap write: {Score=int64, progress=int32}
+                    -- TMap::Add grows via UE allocator when needed (empty TMap supported).
+                    local ok = pcall(function()
+                        local mmap = lVal.MatchProgress
+                        if mmap then
+                            mmap:Add(matchID, {Score = 999999999, progress = 3})
+                            added_matches = added_matches + 1
+                        end
+                    end)
+                    if not ok then fail_matches = fail_matches + 1 end
+                else
+                    no_lp_count = no_lp_count + 1
+                end
+                ::next_match::
+            end
+        end)
+
+        ::next_league::
+    end
+
+    -- Also sweep existing MatchProgress entries to guarantee max values
+    -- (covers entries already in the TMap before our Add calls)
+    leagueProgressMap:ForEach(function(_, lVal)
+        pcall(function()
+            lVal.LastSeenLeagueMapLevel = 99
+            local mmap = lVal.MatchProgress
+            if not mmap then return end
+            mmap:ForEach(function(_, mVal)
                 pcall(function()
-                    local ml = v:Get("MatchList")
-                    if not ml then return end
-                    for mi = 1, #ml do
-                        pcall(function()
-                            local m = ml[mi]
-                            if not m then return end
-                            local tag = m:Get("ID")
-                            if not tag then return end
-                            -- Clone the GameplayTag to get an owning copy for ProcessEvent
-                            local cloned = tag:Clone()
-                            local ok, err = pcall(function()
-                                chm:Call("SetMatchProgress", cloned, 3, 999999999, true, false)
-                            end)
-                            if ok then
-                                total_set = total_set + 1
-                            else
-                                total_fail = total_fail + 1
-                            end
-                        end)
-                    end
+                    mVal.progress = 3
+                    mVal.Score    = 999999999
                 end)
             end)
         end)
-        ::cl::
-    end
+    end)
 
-    state.champ_set = total_set
-    state.champ_done = true
-    Log(TAG .. ": Championship batch: " .. total_set .. " matches set via SetMatchProgress, "
-        .. total_fail .. " failed, " .. total_leagues .. " leagues")
+    pcall(function() chm:Call("SetLastSeenTotalTrophyGainedToCurrent") end)
+
+    state.champ_set   = added_matches
+    state.champ_total = #leagues
+    state.champ_done  = true
+    Log(TAG .. ": Championship batch: " .. total_matches .. " matches found, "
+        .. added_matches .. " added, " .. fail_matches .. " failed, "
+        .. no_lp_count .. " no-save-entry, " .. #leagues .. " leagues")
 end
 
 -- ============================================================================

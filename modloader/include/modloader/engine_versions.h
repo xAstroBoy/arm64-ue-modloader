@@ -13,8 +13,8 @@
 //   FNamePool (block-based allocator) is used from UE4.23 onward.
 // • FProperty (FField-based) exists from UE4.25 onward. UProperty (UObject-based)
 //   was removed in UE5. Both coexist in UE4.25/4.27.
-// • UE5 uses compact 8-byte FFieldVariant (tagged pointer) vs UE4's 16-byte
-//   FFieldVariant, shifting all FField/FProperty offsets by -8.
+// • UE5 uses compact 8-byte FFieldVariant (tagged union/pointer) vs UE4's
+//   16-byte FFieldVariant, shifting FField/FProperty header offsets by -8.
 // • ProcessEvent vtable index differs between UE4 and UE5 due to added/removed
 //   virtual functions. Must be resolved per-game via pattern scanning.
 // • FUObjectItem gained a RefCount field in UE5.x (0x18→0x18 or 0x14→0x18
@@ -41,7 +41,7 @@ namespace engine_versions
         UE5_1 = 510, // oculus-5.1 branch
         UE5_2 = 520, // oculus-5.2 branch
         UE5_3 = 530, // oculus-5.3 branch
-        UE5_4 = 540, // Pinball FX VR (com.zenstudios.PFXVRQuest)
+        UE5_4 = 540,
         UE5_5 = 550, // oculus-5.5 branch
         UE5_6 = 560, // oculus-5.6 branch (latest)
 
@@ -545,16 +545,20 @@ namespace engine_versions
         }
 
         // ── UE5 extension offsets (base = 0x70) ──
+        // Verified against local Quest UE source snapshot:
+        //   CoreUObject/Public/UObject/UnrealType.h
+        // FBoolProperty and FInterfaceProperty place their first subclass field
+        // immediately after the FProperty base at +0x70.
         namespace ue5
         {
             constexpr uint32_t BASE = fproperty_layout::ue5::BASE_SIZE;
-            constexpr uint32_t BOOL_FIELD_SIZE = BASE + 8;     // 0x78 (confirmed on PFX VR)
-            constexpr uint32_t BOOL_BYTE_OFFSET = BASE + 9;    // 0x79
-            constexpr uint32_t BOOL_BYTE_MASK = BASE + 10;     // 0x7A
-            constexpr uint32_t BOOL_FIELD_MASK = BASE + 11;    // 0x7B
+            constexpr uint32_t BOOL_FIELD_SIZE = BASE + 0;     // 0x70
+            constexpr uint32_t BOOL_BYTE_OFFSET = BASE + 1;    // 0x71
+            constexpr uint32_t BOOL_BYTE_MASK = BASE + 2;      // 0x72
+            constexpr uint32_t BOOL_FIELD_MASK = BASE + 3;     // 0x73
             constexpr uint32_t OBJ_PROPERTY_CLASS = BASE + 0;  // 0x70
             constexpr uint32_t CLASS_META_CLASS = BASE + 8;    // 0x78
-            constexpr uint32_t INTERFACE_CLASS = BASE + 8;     // 0x78
+            constexpr uint32_t INTERFACE_CLASS = BASE + 0;     // 0x70
             constexpr uint32_t ARRAY_INNER = BASE + 8;         // 0x78 (ArrayFlags at +0)
             constexpr uint32_t MAP_KEY_PROP = BASE + 0;        // 0x70
             constexpr uint32_t MAP_VALUE_PROP = BASE + 8;      // 0x78

@@ -73,18 +73,18 @@ local function clear_button_icon(btn)
     -- Also hide the NotificationMark image if present
     pcall(function()
         local nm = btn:Get("NotificationMark")
-        if nm then nm:Call("SetVisibility", 1) end  -- 1 = Collapsed
+        if nm then nm:Set("Visibility", 1) end  -- 1 = Collapsed
     end)
 end
 
 -- ============================================================================
 -- STATE
 -- ============================================================================
-local ball_save_on   = true
-local log_states_on  = true
-local panel_built    = false
-local last_settings  = nil
-local action_buttons = {}
+local ball_save_on    = true
+local log_states_on   = true
+local panel_built     = false          -- true once at least one panel has been built
+local built_instances = {}             -- [widget_obj] = true — per-instance built flag
+local action_buttons  = {}             -- [idx] = btn (last-built instance wins; ToolTip fallback covers the rest)
 local click_stats = {
     default_hook_hits = 0,
     base_hook_hits    = 0,
@@ -437,63 +437,26 @@ end
 -- BUILD THE MOD PANEL
 -- Called when user clicks the Legal/MODS nav button — panel is definitely live.
 -- ============================================================================
-local function find_big_settings()
-    local all = nil
-    pcall(function() all = FindAllOf("WBP_WristMenuSettings_C") end)
-    if not all then return nil end
-    for _, w in ipairs(all) do
-        if is_live(w) then
-            local ok, ds = pcall(function() return w:Call("GetDesiredSize") end)
-            if ok and ds then
-                local ok2, x = pcall(function() return ds.X end)
-                if ok2 and type(x) == "number" and x > 500 then return w end
-            end
-        end
-    end
-    return nil
-end
 
-local function build_mod_panel(target_settings)
-    V("build_mod_panel target_settings=%s", tostring(target_settings))
-    local big = target_settings
-    if not is_live(big) then
-        big = find_big_settings()
-    end
-    if not is_live(big) then
-        Log(TAG .. ": build_mod_panel: no big settings widget — open Settings first")
-        return
-    end
+-- Build the mod panel on a single widget instance.
+local function build_mod_panel_on(w)
+    if not is_live(w) then return false end
+    if built_instances[w] then return true end  -- already built on this instance
 
-    if panel_built and last_settings == big then
-        Log(TAG .. ": panel already built for this instance")
-        return
-    end
+    local root = widget_root(w)
+    if not root then return false end
 
-    last_settings  = big
-    panel_built    = false
-    action_buttons = {}
-
-    local root = widget_root(big)
-    if not root then Log(TAG .. ": no root widget"); return end
-
-    -- Rename nav button
     local lb = find_named(root, "WBP_Button_Legal")
-    if is_live(lb) then
-        set_button_text(lb, "MODS")
-        Log(TAG .. ": WBP_Button_Legal -> MODS")
-    end
+    if is_live(lb) then set_button_text(lb, "MODS") end
 
-    -- Clear LegalLineContainer (33 copyright RichTextBlocks)
     local llc = find_named(root, "LegalLineContainer")
-    if not is_live(llc) then Log(TAG .. ": LegalLineContainer not found"); return end
+    if not is_live(llc) then return false end
     pcall(function() llc:Call("ClearChildren") end)
-    Log(TAG .. ": LLC cleared")
 
     local pc = nil
     pcall(function() pc = FindFirstOf("BP_PlayerController_C") end)
-    if not pc then Log(TAG .. ": no PlayerController"); return end
+    if not pc then return false end
 
-    -- Header (non-interactive)
     local hdr = nil
     pcall(function() hdr = CreateWidget("WBP_Button_Default_C", pc) end)
     if is_live(hdr) then
@@ -503,7 +466,6 @@ local function build_mod_panel(target_settings)
         pcall(function() hdr:Set("ToolTipText", "[M:header]") end)
     end
 
-    -- Action buttons
     for idx, _ in ipairs(ACTIONS) do
         local btn = nil
         pcall(function() btn = CreateWidget("WBP_Button_Default_C", pc) end)
@@ -512,17 +474,45 @@ local function build_mod_panel(target_settings)
             set_button_text(btn, get_action_label(idx))
             clear_button_icon(btn)
             pcall(function() btn:Set("ToolTipText", make_tip(idx)) end)
-            action_buttons[idx] = btn
-            Log(TAG .. ": [" .. idx .. "] " .. get_action_label(idx))
-        else
-            Log(TAG .. ": CreateWidget failed for action " .. idx)
+            action_buttons[idx] = btn  -- last instance wins; ToolTip fallback covers the rest
         end
     end
 
+    built_instances[w] = true
     panel_built = true
     local final = 0
     pcall(function() final = llc:Call("GetChildrenCount") end)
-    Log(TAG .. ": panel built — " .. final .. " items in LLC")
+    local nm = ""
+    pcall(function() nm = w:GetName() end)
+    Log(TAG .. ": panel built on " .. nm .. " — " .. final .. " items")
+    return true
+end
+
+-- Build on ALL live settings instances that have a LegalLineContainer.
+-- The LLC check is the real guard against uninitialized template instances.
+local function build_mod_panel(target_settings)
+    V("build_mod_panel")
+    local all = nil
+    pcall(function() all = FindAllOf("WBP_WristMenuSettings_C") end)
+    if not all then all = {} end
+
+    local built_count = 0
+    for _, w in ipairs(all) do
+        if not is_live(w) then goto cont end
+        -- Only build on instances that have LegalLineContainer wired up
+        local root = widget_root(w)
+        if not root then goto cont end
+        local llc = find_named(root, "LegalLineContainer")
+        if is_live(llc) then
+            if build_mod_panel_on(w) then built_count = built_count + 1 end
+        end
+        ::cont::
+    end
+
+    -- Fallback: try the explicitly clicked instance regardless
+    if built_count == 0 and is_live(target_settings) then
+        build_mod_panel_on(target_settings)
+    end
 end
 
 -- ============================================================================
@@ -531,11 +521,12 @@ end
 -- Construct fires on zero-size instances first; desiredSize not ready yet.
 -- ============================================================================
 pcall(function()
-    RegisterHook("WBP_WristMenuSettings_C:Construct", function(_ctx)
+    RegisterHook("WBP_WristMenuSettings_C:Construct", function(ctx)
         V("WBP_WristMenuSettings_C:Construct hook fired")
-        panel_built    = false
-        last_settings  = nil
-        action_buttons = {}
+        -- Mark this new instance as unbuilt so it gets a fresh panel when clicked.
+        -- Do NOT reset global panel_built/action_buttons — other live instances still work.
+        local self_obj = extract_click_object(ctx)
+        if self_obj then built_instances[self_obj] = nil end
         pcall(rename_legal_button_all)
     end)
     Log(TAG .. ": WBP_WristMenuSettings_C:Construct hook registered")
@@ -697,12 +688,13 @@ end)
 pcall(function()
     RegisterCommand("modmenu_rebuild", function()
         V("modmenu_rebuild command fired")
-        panel_built    = false
-        last_settings  = nil
-        action_buttons = {}
+        panel_built     = false
+        built_instances = {}
+        action_buttons  = {}
         pcall(build_mod_panel)
-        local big = find_big_settings()
-        return big and (TAG .. ": rebuilt on " .. big:GetName()) or TAG .. ": open Settings first"
+        local count = 0
+        for _ in pairs(built_instances) do count = count + 1 end
+        return count > 0 and (TAG .. ": rebuilt on " .. count .. " instance(s)") or TAG .. ": open Settings first"
     end)
 end)
 

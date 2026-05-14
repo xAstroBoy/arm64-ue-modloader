@@ -10,7 +10,9 @@
 #include "modloader/process_event_hook.h"
 #include "modloader/lua_tarray.h"
 #include "modloader/lua_ustruct.h"
+#include "modloader/lua_ue4ss_globals.h"
 #include "modloader/lua_types.h"
+#include "modloader/safe_call.h"
 #include "modloader/symbols.h"
 #include "modloader/logger.h"
 #include "modloader/types.h"
@@ -21,10 +23,19 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <condition_variable>
 #include <unordered_map>
+#include <dlfcn.h>
+#include <unwind.h>
 
 namespace lua_uobject
 {
+    static bool call_ufunction_bg(sol::state_view lua, ue::UObject *obj,
+                                  const std::string &func_name, sol::variadic_args va);
+    static bool call_ufunction_bg_raw(ue::UObject *obj,
+                                      const std::string &func_name,
+                                      void *raw_params, int params_len);
+
     // ═══ ProcessEvent Crash Guard ══════════════════════════════════════════
     // When Call()/CallBg() invokes ProcessEvent and the target UFunction
     // crashes (SIGSEGV/SIGBUS — e.g. dangling pointer inside the function,
@@ -34,6 +45,54 @@ namespace lua_uobject
     thread_local volatile int g_in_call_ufunction = 0;
     thread_local sigjmp_buf g_call_ufunction_jmp;
     thread_local volatile uintptr_t g_call_ufunction_fault_addr = 0;
+
+    // Nested ProcessEvent crash-guard support.
+    // A single global thread-local jmp_buf is not sufficient when ProcessEvent
+    // re-enters (hook callbacks / queued game-thread work invoking Call/CallRaw).
+    // Nested setjmp would overwrite the outer frame, causing later longjmp to
+    // jump into stale stack state.
+    struct ScopedPeCrashGuard
+    {
+        int prev_depth = 0;
+        bool had_prev = false;
+        sigjmp_buf prev_jmp;
+        bool armed = false;
+
+        ScopedPeCrashGuard()
+        {
+            prev_depth = static_cast<int>(g_in_call_ufunction);
+            had_prev = prev_depth > 0;
+            if (had_prev)
+            {
+                std::memcpy(&prev_jmp, &g_call_ufunction_jmp, sizeof(sigjmp_buf));
+            }
+            g_in_call_ufunction = prev_depth + 1;
+            g_call_ufunction_fault_addr = 0;
+        }
+
+        int checkpoint()
+        {
+            armed = true;
+            return sigsetjmp(g_call_ufunction_jmp, 1);
+        }
+
+        void restore()
+        {
+            if (!armed)
+                return;
+            if (had_prev)
+            {
+                std::memcpy(&g_call_ufunction_jmp, &prev_jmp, sizeof(sigjmp_buf));
+            }
+            g_in_call_ufunction = prev_depth;
+            armed = false;
+        }
+
+        ~ScopedPeCrashGuard()
+        {
+            restore();
+        }
+    };
 
     // GUObjectArray round-trip validation.
     // Reads InternalIndex via an UNTAGGED (MTE tag=0) pointer — ARM MTE excludes
@@ -48,16 +107,16 @@ namespace lua_uobject
     // caused by calling SetBrandNewUnlock on PFXCollectibleCategoryData objects that
     // extend PrimaryDataAsset and have RF_NeedPostLoad set — their C++ fields are garbage.
     static constexpr int32_t UNSAFE_OBJECT_FLAGS =
-        ue::RF_ClassDefaultObject       |  // 0x0010 CDO — never has real data
-        ue::RF_ArchetypeObject          |  // 0x0020 archetype — template, not instance
-        ue::RF_NeedInitialization       |  // 0x0200 constructor not run yet
-        ue::RF_NeedLoad                 |  // 0x0400 still being deserialized
-        ue::RF_NeedPostLoad             |  // 0x1000 PostLoad() not called yet
-        ue::RF_NeedPostLoadSubobjects   |  // 0x2000 sub-object post-load pending
-        ue::RF_BeginDestroyed           |  // 0x8000 ConditionalBeginDestroy() called
-        ue::RF_FinishDestroyed;            // 0x10000 FinishDestroy() called
+        ue::RF_ClassDefaultObject |     // 0x0010 CDO — never has real data
+        ue::RF_ArchetypeObject |        // 0x0020 archetype — template, not instance
+        ue::RF_NeedInitialization |     // 0x0200 constructor not run yet
+        ue::RF_NeedLoad |               // 0x0400 still being deserialized
+        ue::RF_NeedPostLoad |           // 0x1000 PostLoad() not called yet
+        ue::RF_NeedPostLoadSubobjects | // 0x2000 sub-object post-load pending
+        ue::RF_BeginDestroyed |         // 0x8000 ConditionalBeginDestroy() called
+        ue::RF_FinishDestroyed;         // 0x10000 FinishDestroy() called
 
-    static bool is_live_in_guobjectarray(ue::UObject *obj)
+    static bool guobjectarray_slot_matches(ue::UObject *obj, bool reject_unsafe_flags)
     {
         if (!obj)
             return false;
@@ -73,7 +132,7 @@ namespace lua_uobject
         // in GUObjectArray but their C++ fields are not ready for native function calls.
         int32_t obj_flags = 0;
         __builtin_memcpy(&obj_flags, reinterpret_cast<const void *>(raw + ue::uobj::OBJECT_FLAGS), sizeof(obj_flags));
-        if (obj_flags & UNSAFE_OBJECT_FLAGS)
+        if (reject_unsafe_flags && (obj_flags & UNSAFE_OBJECT_FLAGS))
             return false;
         // Read InternalIndex at offset 0x0C via the untagged address
         int32_t idx = 0;
@@ -91,6 +150,16 @@ namespace lua_uobject
         // object at the same VA but different MTE tag is detected as different
         uintptr_t slot_raw = reinterpret_cast<uintptr_t>(slot_obj) & 0x00FFFFFFFFFFFFFFULL;
         return slot_raw == raw;
+    }
+
+    static bool is_live_in_guobjectarray(ue::UObject *obj)
+    {
+        return guobjectarray_slot_matches(obj, true);
+    }
+
+    static bool is_present_in_guobjectarray(ue::UObject *obj)
+    {
+        return guobjectarray_slot_matches(obj, false);
     }
 
     // Diagnostic version: logs WHY the check failed (called from ObjectProperty reader)
@@ -154,6 +223,17 @@ namespace lua_uobject
     //
     // This approach works because: (1) ProcessEvent runs on game thread where it's safe,
     // (2) throttled drain ensures responsive game thread.
+    struct ParamDiagEntry
+    {
+        std::string name;
+        reflection::PropType type = reflection::PropType::Unknown;
+        int32_t offset = 0;
+        int32_t element_size = 0;
+        uint64_t flags = 0;
+        uint8_t bool_byte_offset = 0;
+        uint8_t bool_byte_mask = 0;
+    };
+
     struct GtCallItem
     {
         ue::UObject *obj;
@@ -163,10 +243,23 @@ namespace lua_uobject
         std::string class_name;
         std::string func_name;
         std::vector<size_t> array_param_offsets; // offsets of TArray params to zero after PE
+        std::vector<ParamDiagEntry> param_meta;
     };
 
     static std::atomic<int> s_gt_call_total{0};
     static std::atomic<int> s_gt_call_queued{0};
+
+    // ═══ Strict ProcessEvent invoker (always game thread) ══════════════════
+    // If called from a non-game thread, queue to game thread and wait for completion.
+    // This is required for UE ProcessEvent safety (Blueprint VM / UObject graph access).
+    static bool invoke_processevent_game_thread_sync(ue::UObject *self,
+                                                     ue::UFunction *func,
+                                                     void *params,
+                                                     const char *tag,
+                                                     const char *op_name)
+    {
+        return pe_hook::invoke_game_thread_sync(self, func, params, tag, op_name, 8000);
+    }
 
     static std::string hex_dump(const uint8_t *data, size_t len, size_t max_len = 32)
     {
@@ -178,6 +271,560 @@ namespace lua_uobject
             result += buf;
         }
         return result;
+    }
+
+    struct PeCrashContext
+    {
+        bool active = false;
+        std::string callsite;
+        std::string class_name;
+        std::string func_name;
+        uintptr_t obj_addr = 0;
+        uintptr_t func_addr = 0;
+        uintptr_t params_addr = 0;
+        uintptr_t native_func_ptr = 0;
+        uintptr_t destructor_link = 0;
+        uint32_t func_flags = 0;
+        uint16_t parms_size = 0;
+        uint8_t num_parms = 0;
+        int32_t obj_flags = 0;
+        int32_t obj_index = -1;
+        bool obj_live = false;
+        std::vector<uint8_t> params_snapshot;
+        std::vector<ParamDiagEntry> param_meta;
+    };
+
+    thread_local PeCrashContext g_pe_crash_context;
+
+    static std::vector<ParamDiagEntry> build_param_diag_entries(const std::vector<reflection::PropertyInfo> &params)
+    {
+        std::vector<ParamDiagEntry> result;
+        result.reserve(params.size());
+        for (const auto &pi : params)
+        {
+            if (!(pi.flags & ue::CPF_Parm) || (pi.flags & ue::CPF_ReturnParm))
+                continue;
+            ParamDiagEntry entry;
+            entry.name = pi.name;
+            entry.type = pi.type;
+            entry.offset = pi.offset;
+            entry.element_size = pi.element_size;
+            entry.flags = pi.flags;
+            entry.bool_byte_offset = pi.bool_byte_offset;
+            entry.bool_byte_mask = pi.bool_byte_mask;
+            result.push_back(std::move(entry));
+        }
+        return result;
+    }
+
+    static std::string describe_module_address(uintptr_t addr)
+    {
+        char buf[768];
+        if (addr == 0)
+        {
+            snprintf(buf, sizeof(buf), "0x0");
+            return std::string(buf);
+        }
+
+        Dl_info info = {};
+        if (dladdr(reinterpret_cast<void *>(addr), &info) && info.dli_fname)
+        {
+            const char *lib = info.dli_fname;
+            if (const char *slash = strrchr(lib, '/'))
+                lib = slash + 1;
+            uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+            uintptr_t lib_off = (addr >= base) ? (addr - base) : 0;
+            if (info.dli_sname && info.dli_saddr)
+            {
+                uintptr_t sym = reinterpret_cast<uintptr_t>(info.dli_saddr);
+                uintptr_t sym_off = (addr >= sym) ? (addr - sym) : 0;
+                snprintf(buf, sizeof(buf), "0x%llx (%s+0x%llx, %s+0x%llx)",
+                         (unsigned long long)addr,
+                         lib, (unsigned long long)lib_off,
+                         info.dli_sname, (unsigned long long)sym_off);
+            }
+            else
+            {
+                snprintf(buf, sizeof(buf), "0x%llx (%s+0x%llx)",
+                         (unsigned long long)addr,
+                         lib, (unsigned long long)lib_off);
+            }
+            return std::string(buf);
+        }
+
+        snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)addr);
+        return std::string(buf);
+    }
+
+    struct LocalBacktraceState
+    {
+        void **frames = nullptr;
+        int max_depth = 0;
+        int count = 0;
+    };
+
+    static _Unwind_Reason_Code local_unwind_callback(struct _Unwind_Context *context, void *arg)
+    {
+        auto *state = static_cast<LocalBacktraceState *>(arg);
+        uintptr_t pc = _Unwind_GetIP(context);
+        if (pc != 0)
+        {
+            if (state->count < state->max_depth)
+            {
+                state->frames[state->count] = reinterpret_cast<void *>(pc);
+                state->count++;
+            }
+            else
+            {
+                return _URC_END_OF_STACK;
+            }
+        }
+        return _URC_NO_REASON;
+    }
+
+    static int capture_local_backtrace(void **frames, int max_depth)
+    {
+        LocalBacktraceState state;
+        state.frames = frames;
+        state.max_depth = max_depth;
+        state.count = 0;
+        _Unwind_Backtrace(local_unwind_callback, &state);
+        return state.count;
+    }
+
+    static void log_native_stacktrace(const char *tag, int max_frames = 48)
+    {
+        if (max_frames <= 0)
+            return;
+
+        std::vector<void *> frames(static_cast<size_t>(max_frames), nullptr);
+        int depth = capture_local_backtrace(frames.data(), max_frames);
+        logger::log_error(tag, "  native_stacktrace depth=%d", depth);
+        for (int i = 0; i < depth; ++i)
+        {
+            uintptr_t pc = reinterpret_cast<uintptr_t>(frames[static_cast<size_t>(i)]);
+            logger::log_error(tag, "    #%02d %s", i, describe_module_address(pc).c_str());
+        }
+    }
+
+    static std::vector<uint8_t> capture_params_now(uintptr_t params_addr, size_t size)
+    {
+        std::vector<uint8_t> out;
+        if (params_addr < 0x10000 || size == 0)
+            return out;
+        if (!ue::is_mapped_ptr(reinterpret_cast<const void *>(params_addr)))
+            return out;
+
+        out.resize(size, 0);
+        if (!safe_call::safe_memcpy(out.data(), reinterpret_cast<const void *>(params_addr), size))
+        {
+            out.clear();
+            return out;
+        }
+        return out;
+    }
+
+    static void log_param_diff(const char *tag,
+                               const std::vector<uint8_t> &before,
+                               const std::vector<uint8_t> &after,
+                               size_t max_changes = 64)
+    {
+        if (before.empty() || after.empty())
+            return;
+
+        size_t n = std::min(before.size(), after.size());
+        size_t changed = 0;
+        std::string first_changes;
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (before[i] == after[i])
+                continue;
+            changed++;
+            if (changed <= max_changes)
+            {
+                char line[64];
+                snprintf(line, sizeof(line), "[%zu:%02X->%02X] ", i, before[i], after[i]);
+                first_changes += line;
+            }
+        }
+
+        logger::log_error(tag, "  params_diff changed=%zu/%zu", changed, n);
+        if (!first_changes.empty())
+            logger::log_error(tag, "  params_diff_first=%s", first_changes.c_str());
+    }
+
+    static std::string describe_uobject_brief(ue::UObject *obj)
+    {
+        char buf[1024];
+        if (!obj)
+        {
+            snprintf(buf, sizeof(buf), "null");
+            return std::string(buf);
+        }
+        if (!ue::is_valid_ptr(obj))
+        {
+            snprintf(buf, sizeof(buf), "%p invalid-range", obj);
+            return std::string(buf);
+        }
+        if (!ue::is_mapped_ptr(obj))
+        {
+            snprintf(buf, sizeof(buf), "%p unmapped", obj);
+            return std::string(buf);
+        }
+
+        std::string name = reflection::get_short_name(obj);
+        std::string full_name = reflection::get_full_name(obj);
+        ue::UClass *cls = ue::uobj_get_class(obj);
+        std::string class_name = (cls && ue::is_valid_ptr(cls) && ue::is_mapped_ptr(cls))
+                                     ? reflection::get_short_name(reinterpret_cast<const ue::UObject *>(cls))
+                                     : std::string("?");
+        int32_t flags = ue::uobj_get_flags(obj);
+        int32_t idx = ue::uobj_get_internal_index(obj);
+        bool live = is_live_in_guobjectarray(obj);
+        snprintf(buf, sizeof(buf), "%p name='%s' full='%s' class='%s' flags=0x%X idx=%d live=%d",
+                 obj,
+                 name.c_str(),
+                 full_name.c_str(),
+                 class_name.c_str(),
+                 (unsigned)flags,
+                 idx,
+                 live ? 1 : 0);
+        return std::string(buf);
+    }
+
+    static std::string build_outer_chain(ue::UObject *obj, int max_depth = 8)
+    {
+        if (!obj || !ue::is_valid_ptr(obj) || !ue::is_mapped_ptr(obj))
+            return "";
+
+        std::string chain;
+        ue::UObject *current = obj;
+        for (int depth = 0; current && depth < max_depth; ++depth)
+        {
+            if (!ue::is_valid_ptr(current) || !ue::is_mapped_ptr(current))
+                break;
+            std::string part = reflection::get_short_name(current);
+            if (part.empty())
+                break;
+            if (!chain.empty())
+                chain += " <- ";
+            chain += part;
+            current = ue::uobj_get_outer(current);
+        }
+        return chain;
+    }
+
+    static std::string classify_fault_origin(const PeCrashContext &ctx, uintptr_t fault)
+    {
+        char buf[768];
+        if (fault == 0)
+        {
+            snprintf(buf, sizeof(buf), "fault_addr=0x0 (likely null dereference inside target)");
+            return std::string(buf);
+        }
+        if (fault < 0x10000)
+        {
+            snprintf(buf, sizeof(buf), "fault_addr=0x%llx (NULL + 0x%llx field dereference)",
+                     (unsigned long long)fault,
+                     (unsigned long long)fault);
+            return std::string(buf);
+        }
+
+        uintptr_t obj_raw = ctx.obj_addr & 0x00FFFFFFFFFFFFFFULL;
+        uintptr_t func_raw = ctx.func_addr & 0x00FFFFFFFFFFFFFFULL;
+        uintptr_t params_raw = ctx.params_addr & 0x00FFFFFFFFFFFFFFULL;
+        uintptr_t fault_raw = fault & 0x00FFFFFFFFFFFFFFULL;
+
+        if (obj_raw && fault_raw >= obj_raw && fault_raw < obj_raw + 0x4000)
+        {
+            snprintf(buf, sizeof(buf), "fault inside target UObject at +0x%llx (%s)",
+                     (unsigned long long)(fault_raw - obj_raw),
+                     describe_module_address(fault).c_str());
+            return std::string(buf);
+        }
+        if (func_raw && fault_raw >= func_raw && fault_raw < func_raw + 0x400)
+        {
+            snprintf(buf, sizeof(buf), "fault inside UFunction metadata at +0x%llx (%s)",
+                     (unsigned long long)(fault_raw - func_raw),
+                     describe_module_address(fault).c_str());
+            return std::string(buf);
+        }
+        if (params_raw && ctx.parms_size > 0 && fault_raw >= params_raw && fault_raw < params_raw + ctx.parms_size)
+        {
+            snprintf(buf, sizeof(buf), "fault inside ProcessEvent params buffer at +0x%llx (%s)",
+                     (unsigned long long)(fault_raw - params_raw),
+                     describe_module_address(fault).c_str());
+            return std::string(buf);
+        }
+
+        snprintf(buf, sizeof(buf), "fault outside obj/func/params region (%s)",
+                 describe_module_address(fault).c_str());
+        return std::string(buf);
+    }
+
+    static std::string capture_memory_window(uintptr_t addr, size_t before = 16, size_t total = 64)
+    {
+        if (addr < 0x10000)
+            return "";
+
+        uintptr_t start = (addr > before) ? (addr - before) : addr;
+        if (!ue::is_mapped_ptr(reinterpret_cast<const void *>(start)))
+            return "";
+
+        std::vector<uint8_t> tmp(total, 0);
+        if (!safe_call::safe_memcpy(tmp.data(), reinterpret_cast<const void *>(start), total))
+            return "";
+
+        std::string out = describe_module_address(start);
+        out += ": ";
+        out += hex_dump(tmp.data(), tmp.size(), tmp.size());
+        return out;
+    }
+
+    static std::string summarize_param_snapshot(const ParamDiagEntry &entry, const std::vector<uint8_t> &snapshot)
+    {
+        char prefix[256];
+        snprintf(prefix, sizeof(prefix), "%s off=0x%X elem=%d flags=0x%llX type=%d",
+                 entry.name.c_str(),
+                 (unsigned)entry.offset,
+                 entry.element_size,
+                 (unsigned long long)entry.flags,
+                 static_cast<int>(entry.type));
+
+        if (entry.offset < 0 || static_cast<size_t>(entry.offset) >= snapshot.size())
+        {
+            return std::string(prefix) + " <out of captured range>";
+        }
+
+        const uint8_t *ptr = snapshot.data() + entry.offset;
+        size_t avail = snapshot.size() - static_cast<size_t>(entry.offset);
+        char value[768];
+        value[0] = 0;
+
+        switch (entry.type)
+        {
+        case reflection::PropType::BoolProperty:
+        {
+            bool v = false;
+            if (entry.bool_byte_mask && avail > entry.bool_byte_offset)
+                v = (ptr[entry.bool_byte_offset] & entry.bool_byte_mask) != 0;
+            else if (avail >= 1)
+                v = ptr[0] != 0;
+            snprintf(value, sizeof(value), "= %s raw=[%s]", v ? "true" : "false", hex_dump(ptr, std::min<size_t>(avail, 8), 8).c_str());
+            break;
+        }
+        case reflection::PropType::IntProperty:
+            if (avail >= 4)
+                snprintf(value, sizeof(value), "= %d", *reinterpret_cast<const int32_t *>(ptr));
+            break;
+        case reflection::PropType::UInt32Property:
+            if (avail >= 4)
+                snprintf(value, sizeof(value), "= %u", *reinterpret_cast<const uint32_t *>(ptr));
+            break;
+        case reflection::PropType::Int64Property:
+            if (avail >= 8)
+                snprintf(value, sizeof(value), "= %lld", (long long)*reinterpret_cast<const int64_t *>(ptr));
+            break;
+        case reflection::PropType::UInt64Property:
+            if (avail >= 8)
+                snprintf(value, sizeof(value), "= %llu", (unsigned long long)*reinterpret_cast<const uint64_t *>(ptr));
+            break;
+        case reflection::PropType::Int16Property:
+            if (avail >= 2)
+                snprintf(value, sizeof(value), "= %d", (int)*reinterpret_cast<const int16_t *>(ptr));
+            break;
+        case reflection::PropType::UInt16Property:
+            if (avail >= 2)
+                snprintf(value, sizeof(value), "= %u", (unsigned)*reinterpret_cast<const uint16_t *>(ptr));
+            break;
+        case reflection::PropType::Int8Property:
+            if (avail >= 1)
+                snprintf(value, sizeof(value), "= %d", (int)*reinterpret_cast<const int8_t *>(ptr));
+            break;
+        case reflection::PropType::ByteProperty:
+            if (avail >= 1)
+                snprintf(value, sizeof(value), "= %u", (unsigned)*reinterpret_cast<const uint8_t *>(ptr));
+            break;
+        case reflection::PropType::FloatProperty:
+            if (avail >= 4)
+                snprintf(value, sizeof(value), "= %.6f", *reinterpret_cast<const float *>(ptr));
+            break;
+        case reflection::PropType::DoubleProperty:
+            if (avail >= 8)
+                snprintf(value, sizeof(value), "= %.6f", *reinterpret_cast<const double *>(ptr));
+            break;
+        case reflection::PropType::EnumProperty:
+            if (entry.element_size == 1 && avail >= 1)
+                snprintf(value, sizeof(value), "= %u", (unsigned)ptr[0]);
+            else if (entry.element_size == 2 && avail >= 2)
+                snprintf(value, sizeof(value), "= %d", (int)*reinterpret_cast<const int16_t *>(ptr));
+            else if (avail >= 4)
+                snprintf(value, sizeof(value), "= %d", *reinterpret_cast<const int32_t *>(ptr));
+            break;
+        case reflection::PropType::NameProperty:
+            if (avail >= 8)
+            {
+                int32_t idx = *reinterpret_cast<const int32_t *>(ptr);
+                int32_t num = *reinterpret_cast<const int32_t *>(ptr + 4);
+                snprintf(value, sizeof(value), "= FName('%s', %d)", reflection::fname_to_string(idx).c_str(), num);
+            }
+            break;
+        case reflection::PropType::ObjectProperty:
+        case reflection::PropType::WeakObjectProperty:
+        case reflection::PropType::LazyObjectProperty:
+        case reflection::PropType::InterfaceProperty:
+        case reflection::PropType::ClassProperty:
+            if (avail >= sizeof(void *))
+            {
+                ue::UObject *arg_obj = *reinterpret_cast<ue::UObject *const *>(ptr);
+                snprintf(value, sizeof(value), "= %s", describe_uobject_brief(arg_obj).c_str());
+            }
+            break;
+        case reflection::PropType::StrProperty:
+            if (avail >= 16)
+                snprintf(value, sizeof(value), "= FString('%s')", fstring_to_utf8(ptr).c_str());
+            break;
+        default:
+            break;
+        }
+
+        if (value[0] == 0)
+        {
+            snprintf(value, sizeof(value), "raw=[%s]", hex_dump(ptr, std::min<size_t>(avail, 32), 32).c_str());
+        }
+
+        return std::string(prefix) + " " + value;
+    }
+
+    static void prepare_pe_crash_context(const char *callsite,
+                                         ue::UObject *obj,
+                                         ue::UFunction *func,
+                                         const std::string &class_name,
+                                         const std::string &func_name,
+                                         const void *params,
+                                         size_t params_size,
+                                         const std::vector<ParamDiagEntry> *param_meta)
+    {
+        g_pe_crash_context = {};
+        g_pe_crash_context.active = true;
+        g_pe_crash_context.callsite = callsite ? callsite : "";
+        g_pe_crash_context.class_name = class_name;
+        g_pe_crash_context.func_name = func_name;
+        g_pe_crash_context.obj_addr = reinterpret_cast<uintptr_t>(obj);
+        g_pe_crash_context.func_addr = reinterpret_cast<uintptr_t>(func);
+        g_pe_crash_context.params_addr = reinterpret_cast<uintptr_t>(params);
+        g_pe_crash_context.parms_size = static_cast<uint16_t>(params_size);
+        g_pe_crash_context.func_flags = func ? ue::ufunc_get_flags(func) : 0;
+        g_pe_crash_context.num_parms = func ? ue::ufunc_get_num_parms(func) : 0;
+        g_pe_crash_context.native_func_ptr = func ? reinterpret_cast<uintptr_t>(ue::ufunc_get_func_ptr(func)) : 0;
+        g_pe_crash_context.destructor_link = func ? reinterpret_cast<uintptr_t>(ue::read_field<void *>(func, ue::ustruct::DESTRUCTOR_LINK_OFF())) : 0;
+        g_pe_crash_context.obj_flags = obj ? ue::uobj_get_flags(obj) : 0;
+        g_pe_crash_context.obj_index = obj ? ue::uobj_get_internal_index(obj) : -1;
+        g_pe_crash_context.obj_live = obj ? is_live_in_guobjectarray(obj) : false;
+        if (params && params_size > 0)
+        {
+            size_t snap_size = std::min<size_t>(params_size, 256);
+            const uint8_t *raw = reinterpret_cast<const uint8_t *>(params);
+            g_pe_crash_context.params_snapshot.assign(raw, raw + snap_size);
+        }
+        if (param_meta)
+            g_pe_crash_context.param_meta = *param_meta;
+    }
+
+    static void log_prepared_pe_crash(const char *tag, int signal, uintptr_t fault_addr)
+    {
+        const auto &ctx = g_pe_crash_context;
+        logger::log_error(tag, "=== ProcessEvent fault origin dump BEGIN ===");
+        if (!ctx.active)
+        {
+            logger::log_error(tag, "  no prepared ProcessEvent context");
+            logger::log_error(tag, "=== ProcessEvent fault origin dump END ===");
+            return;
+        }
+
+        ue::UObject *obj = reinterpret_cast<ue::UObject *>(ctx.obj_addr);
+        ue::UObject *func_obj = reinterpret_cast<ue::UObject *>(ctx.func_addr);
+        logger::log_error(tag, "  callsite=%s signal=%d class=%s func=%s",
+                          ctx.callsite.c_str(), signal,
+                          ctx.class_name.c_str(), ctx.func_name.c_str());
+        logger::log_error(tag, "  fault=%s",
+                          classify_fault_origin(ctx, fault_addr).c_str());
+        logger::log_error(tag, "  object=%s",
+                          describe_uobject_brief(obj).c_str());
+        logger::log_error(tag, "  object_outer_chain=%s",
+                          build_outer_chain(obj).c_str());
+        logger::log_error(tag, "  function=%s",
+                          describe_uobject_brief(func_obj).c_str());
+        logger::log_error(tag,
+                          "  function_flags=0x%X native=%d parms_size=%u num_parms=%u destructor_link=%s native_func=%s",
+                          (unsigned)ctx.func_flags,
+                          (ctx.func_flags & ue::FUNC_Native) ? 1 : 0,
+                          (unsigned)ctx.parms_size,
+                          (unsigned)ctx.num_parms,
+                          describe_module_address(ctx.destructor_link).c_str(),
+                          describe_module_address(ctx.native_func_ptr).c_str());
+        logger::log_error(tag, "  function_outer_chain=%s",
+                          build_outer_chain(func_obj).c_str());
+        logger::log_error(tag, "  params_addr=%s",
+                          describe_module_address(ctx.params_addr).c_str());
+
+        if (!ctx.params_snapshot.empty())
+        {
+            logger::log_error(tag, "  params_before[%zu]=[%s]",
+                              ctx.params_snapshot.size(),
+                              hex_dump(ctx.params_snapshot.data(), ctx.params_snapshot.size(), ctx.params_snapshot.size()).c_str());
+        }
+
+        std::vector<uint8_t> params_after;
+        if (ctx.params_addr && !ctx.params_snapshot.empty())
+        {
+            params_after = capture_params_now(ctx.params_addr, ctx.params_snapshot.size());
+            if (!params_after.empty())
+            {
+                logger::log_error(tag, "  params_after[%zu]=[%s]",
+                                  params_after.size(),
+                                  hex_dump(params_after.data(), params_after.size(), params_after.size()).c_str());
+                log_param_diff(tag, ctx.params_snapshot, params_after);
+            }
+            else
+            {
+                logger::log_error(tag, "  params_after=<unavailable>");
+            }
+        }
+
+        for (size_t i = 0; i < ctx.param_meta.size() && i < 32; ++i)
+        {
+            logger::log_error(tag, "  param[%zu] %s",
+                              i,
+                              summarize_param_snapshot(ctx.param_meta[i], ctx.params_snapshot).c_str());
+        }
+
+        std::string params_window = capture_memory_window(ctx.params_addr, 0, 64);
+        if (!params_window.empty())
+            logger::log_error(tag, "  params_window_now=%s", params_window.c_str());
+
+        std::string obj_window = capture_memory_window(ctx.obj_addr, 0, 64);
+        if (!obj_window.empty())
+            logger::log_error(tag, "  object_window=%s", obj_window.c_str());
+
+        std::string func_window = capture_memory_window(ctx.func_addr, 0, 64);
+        if (!func_window.empty())
+            logger::log_error(tag, "  function_window=%s", func_window.c_str());
+
+        std::string fault_window = capture_memory_window(fault_addr);
+        if (!fault_window.empty())
+        {
+            logger::log_error(tag, "  fault_window=%s", fault_window.c_str());
+        }
+        if (ctx.native_func_ptr)
+        {
+            std::string native_window = capture_memory_window(ctx.native_func_ptr, 0, 32);
+            if (!native_window.empty())
+                logger::log_error(tag, "  native_func_window=%s", native_window.c_str());
+        }
+        log_native_stacktrace(tag);
+        logger::log_error(tag, "=== ProcessEvent fault origin dump END ===");
     }
 
     static size_t marshaled_min_size(const reflection::PropertyInfo &pi)
@@ -205,8 +852,12 @@ namespace lua_uobject
         case reflection::PropType::IntProperty:
         case reflection::PropType::UInt32Property:
         case reflection::PropType::FloatProperty:
-        case reflection::PropType::EnumProperty:
             return std::max(clamp_elem(), static_cast<size_t>(4));
+
+        case reflection::PropType::EnumProperty:
+            // Enum underlying storage can be uint8/int16/int32 depending on blueprint/native declaration.
+            // Respect reflected element_size here; forcing 4 bytes produces false OOB errors for uint8 enums.
+            return clamp_elem();
 
         case reflection::PropType::Int64Property:
         case reflection::PropType::UInt64Property:
@@ -274,6 +925,161 @@ namespace lua_uobject
         return true;
     }
 
+    static bool is_object_reference_type(reflection::PropType type)
+    {
+        switch (type)
+        {
+        case reflection::PropType::ObjectProperty:
+        case reflection::PropType::WeakObjectProperty:
+        case reflection::PropType::LazyObjectProperty:
+        case reflection::PropType::InterfaceProperty:
+        case reflection::PropType::ClassProperty:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    struct CachedObjectRefField
+    {
+        std::string name;
+        int32_t offset = 0;
+        reflection::PropType type = reflection::PropType::Unknown;
+    };
+
+    static const std::vector<CachedObjectRefField> &get_cached_object_ref_fields(const rebuilder::RebuiltClass *rc)
+    {
+        static const std::vector<CachedObjectRefField> kEmpty;
+        static std::mutex s_cache_mutex;
+        static std::unordered_map<std::string, std::vector<CachedObjectRefField>> s_cache;
+
+        if (!rc)
+            return kEmpty;
+
+        {
+            std::lock_guard<std::mutex> lock(s_cache_mutex);
+            auto it = s_cache.find(rc->name);
+            if (it != s_cache.end())
+                return it->second;
+        }
+
+        std::vector<CachedObjectRefField> fields;
+        fields.reserve(rc->all_properties.size());
+        for (const auto &prop : rc->all_properties)
+        {
+            if (!is_object_reference_type(prop.type) || prop.offset < 0)
+                continue;
+            fields.push_back({prop.name, prop.offset, prop.type});
+        }
+
+        std::lock_guard<std::mutex> lock(s_cache_mutex);
+        auto [it, inserted] = s_cache.emplace(rc->name, std::move(fields));
+        (void)inserted;
+        return it->second;
+    }
+
+    static bool validate_referenced_uobject(const char *tag,
+                                            const char *source_kind,
+                                            const std::string &source_name,
+                                            const std::string &class_name,
+                                            const std::string &func_name,
+                                            ue::UObject *ref)
+    {
+        if (!ref)
+            return true;
+
+        if (!ue::is_valid_ptr(ref) || !ue::is_mapped_ptr(ref) || !ue::is_valid_uobject(ref) || !is_present_in_guobjectarray(ref))
+        {
+            logger::log_warn(tag,
+                             "Detected dangling UObject reference before %s::%s in %s '%s' => %p (continuing call)",
+                             class_name.c_str(), func_name.c_str(), source_kind, source_name.c_str(), ref);
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool has_dangling_object_property_refs(const char *tag,
+                                                  ue::UObject *obj,
+                                                  const rebuilder::RebuiltClass *rc,
+                                                  const std::string &class_name,
+                                                  const std::string &func_name)
+    {
+        if (!obj || !rc)
+            return false;
+
+        const auto &fields = get_cached_object_ref_fields(rc);
+        if (fields.empty())
+            return false;
+
+        const uint8_t *base = reinterpret_cast<const uint8_t *>(obj);
+        const int32_t class_size = rc->properties_size;
+
+        bool found_anomaly = false;
+        for (const auto &field : fields)
+        {
+            if (class_size > 0 && (field.offset < 0 || field.offset + static_cast<int32_t>(sizeof(void *)) > class_size))
+                continue;
+
+            const void *slot = base + field.offset;
+            if (!ue::is_mapped_ptr(slot))
+            {
+                logger::log_warn(tag,
+                                 "Detected unmapped object field slot before %s::%s for '%s' at offset 0x%X on %p (continuing call)",
+                                 class_name.c_str(), func_name.c_str(), field.name.c_str(),
+                                 static_cast<unsigned>(field.offset), obj);
+                found_anomaly = true;
+                continue;
+            }
+
+            ue::UObject *ref = nullptr;
+            std::memcpy(&ref, slot, sizeof(ref));
+            if (!validate_referenced_uobject(tag, "property", field.name, class_name, func_name, ref))
+                found_anomaly = true;
+        }
+
+        return found_anomaly;
+    }
+
+    static bool has_dangling_marshaled_object_params(const char *tag,
+                                                     const std::string &class_name,
+                                                     const std::string &func_name,
+                                                     const std::vector<uint8_t> &params,
+                                                     uint16_t parms_size,
+                                                     const std::vector<ParamDiagEntry> &param_meta)
+    {
+        if (params.empty() || param_meta.empty())
+            return false;
+
+        bool found_anomaly = false;
+        const size_t limit = std::min(static_cast<size_t>(parms_size), params.size());
+        for (const auto &entry : param_meta)
+        {
+            if (!is_object_reference_type(entry.type))
+                continue;
+            if (entry.offset < 0)
+                continue;
+
+            const size_t start = static_cast<size_t>(entry.offset);
+            if (start > limit || sizeof(void *) > (limit - start))
+            {
+                logger::log_warn(tag,
+                                 "Detected object param range anomaly before %s::%s for '%s' (offset=0x%X parms=%u, continuing call)",
+                                 class_name.c_str(), func_name.c_str(), entry.name.c_str(),
+                                 static_cast<unsigned>(entry.offset), static_cast<unsigned>(parms_size));
+                found_anomaly = true;
+                continue;
+            }
+
+            ue::UObject *ref = nullptr;
+            std::memcpy(&ref, params.data() + start, sizeof(ref));
+            if (!validate_referenced_uobject(tag, "param", entry.name, class_name, func_name, ref))
+                found_anomaly = true;
+        }
+
+        return found_anomaly;
+    }
+
     static void dispatch_gt_call(GtCallItem item)
     {
         // This runs ON the game thread (called from pe_hook queue drain)
@@ -286,9 +1092,9 @@ namespace lua_uobject
             pe_fn = symbols::ProcessEvent;
         if (!pe_fn)
         {
-            if (item.fstring_allocs)
-                for (auto *p : *item.fstring_allocs)
-                    delete[] p;
+            // Intentionally leak temporary FString param buffers.
+            // ProcessEvent may destroy FString params internally via UE allocator;
+            // deleting them here can double-free / allocator-mismatch and corrupt heap.
             return;
         }
 
@@ -298,18 +1104,12 @@ namespace lua_uobject
         {
             logger::log_warn("CALLBG", "[GT] Dropping call %s::%s — invalid/stale object %p",
                              item.class_name.c_str(), item.func_name.c_str(), item.obj);
-            if (item.fstring_allocs)
-                for (auto *p : *item.fstring_allocs)
-                    delete[] p;
             return;
         }
         if (!item.func || !ue::is_mapped_ptr(item.func) || !ue::is_valid_ptr(item.func))
         {
             logger::log_warn("CALLBG", "[GT] Dropping call %s::%s — invalid function %p",
                              item.class_name.c_str(), item.func_name.c_str(), item.func);
-            if (item.fstring_allocs)
-                for (auto *p : *item.fstring_allocs)
-                    delete[] p;
             return;
         }
 
@@ -318,39 +1118,59 @@ namespace lua_uobject
         // Save FunctionFlags — ProcessEvent modifies them internally
         uint32_t saved_func_flags = ue::ufunc_get_flags(item.func);
 
-        // Save DestructorLink — null it before PE to prevent DestroyValue
-        // from freeing shallow-copied TArray Data pointers in struct params.
+        if ((saved_func_flags & ue::FUNC_Native) != 0)
+        {
+            auto *rc = rebuilder::rebuild(item.class_name);
+            (void)has_dangling_object_property_refs("CALLBG", item.obj, rc, item.class_name, item.func_name);
+        }
+        if (item.params)
+        {
+            (void)has_dangling_marshaled_object_params("CALLBG", item.class_name, item.func_name,
+                                                       *item.params,
+                                                       ue::ufunc_get_parms_size(item.func),
+                                                       item.param_meta);
+        }
+
+        // Save DestructorLink — can be nulled for non-native calls that marshal
+        // array params, to avoid DestroyValue freeing shallow-copied array data.
         void *saved_dtor_link = ue::read_field<void *>(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF());
 
-        // Null DestructorLink only for non-native Blueprint functions (same race guard as Call()).
+        // Null DestructorLink only for non-native Blueprint functions that carry
+        // array params (same race guard as Call()).
         static constexpr uint32_t FUNC_Native_GT = 0x00000400;
         const bool is_native_gt = (saved_func_flags & FUNC_Native_GT) != 0;
+        const bool has_array_params = !item.array_param_offsets.empty();
+
+        prepare_pe_crash_context("CallBgDispatch", item.obj, item.func,
+                                 item.class_name, item.func_name,
+                                 params_ptr,
+                                 item.params ? item.params->size() : 0,
+                                 &item.param_meta);
 
         // Crash guard — if ProcessEvent crashes, recover instead of killing game
-        g_in_call_ufunction = 1;
-        int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
+        ScopedPeCrashGuard pe_guard;
+        int pe_crash_sig = pe_guard.checkpoint();
         if (pe_crash_sig != 0)
         {
             ue::write_field(item.func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
             // Only restore DestructorLink if we mutated it (non-native functions only)
-            if (!is_native_gt)
+            if (!is_native_gt && has_array_params)
                 ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
             uintptr_t fault = g_call_ufunction_fault_addr;
             logger::log_error("CALLBG", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p — recovered, skipping",
                               pe_crash_sig, (unsigned long)fault,
                               item.class_name.c_str(), item.func_name.c_str(), item.obj);
-            g_in_call_ufunction = 0;
-            // Still clean up allocations
-            if (item.fstring_allocs)
-                for (auto *p : *item.fstring_allocs)
-                    delete[] p;
+            log_prepared_pe_crash("CALLBG", pe_crash_sig, fault);
+            pe_guard.restore();
+            // Intentionally leak temporary FString param buffers.
+            // ProcessEvent may already have consumed/freed them via UE internals.
             // Conversion buffers are tracked per-thread via ConvBufScope in call_ufunction.
             // dispatch_gt_call runs on game thread — no conversion buffers to clean up here.
             return;
         }
 
         // Null DestructorLink only for non-native Blueprint functions (race guard applied above)
-        if (!is_native_gt)
+        if (!is_native_gt && has_array_params)
         {
             ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
         }
@@ -358,12 +1178,12 @@ namespace lua_uobject
         pe_fn(item.obj, item.func, params_ptr);
 
         // Restore DestructorLink + FunctionFlags (only if we mutated them)
-        if (!is_native_gt)
+        if (!is_native_gt && has_array_params)
         {
             ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
         }
         ue::write_field(item.func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
-        g_in_call_ufunction = 0;
+        pe_guard.restore();
 
         // Conversion buffers are tracked per-thread via ConvBufScope in call_ufunction.
         // dispatch_gt_call runs on game thread — no conversion buffers to clean up here.
@@ -390,12 +1210,9 @@ namespace lua_uobject
                              remaining > 0 ? remaining : 0);
         }
 
-        // Clean up FString heap allocs
-        if (item.fstring_allocs)
-        {
-            for (auto *p : *item.fstring_allocs)
-                delete[] p;
-        }
+        // Intentionally leak temporary FString param buffers.
+        // ProcessEvent may free FString params internally; explicit delete[] here can
+        // double-free or cross allocator boundaries and corrupt heap.
     }
 
     static void enqueue_gt_call(GtCallItem &&item)
@@ -533,8 +1350,9 @@ namespace lua_uobject
             return ""; // empty/null FText — return empty string
         }
 
-        // Call ProcessEvent — Conv_TextToString returns FString in the params buffer
-        symbols::ProcessEvent(s_cdo, s_func, params_buf.data());
+        // Call ProcessEvent on game thread — Conv_TextToString returns FString in params buffer
+        if (!invoke_processevent_game_thread_sync(s_cdo, s_func, params_buf.data(), "FTEXT", "Conv_TextToString"))
+            return "";
 
         // Read the return FString from the params buffer at offset 24
         // param[1] is ReturnValue: StrProperty, offset=24, size=16
@@ -650,8 +1468,6 @@ namespace lua_uobject
 
         // Allocate and zero the params buffer
         std::vector<uint8_t> params_buf(s_parms_size, 0);
-        logger::log_info("FTEXT", "DIAG: params_buf allocated, size=%d, ptr=%p",
-                         (int)s_parms_size, params_buf.data());
 
         // Fill the FString input param: { char16_t* Data, int32 Num, int32 Max }
         size_t wlen = str.size() + 1;
@@ -660,38 +1476,20 @@ namespace lua_uobject
             wbuf[i] = static_cast<char16_t>(static_cast<unsigned char>(str[i]));
         wbuf[str.size()] = 0;
 
-        logger::log_info("FTEXT", "DIAG: FString ready, wbuf=%p, wlen=%d, str='%s'",
-                         wbuf, (int)wlen, str.c_str());
-
         FStrRaw *fstr = reinterpret_cast<FStrRaw *>(params_buf.data() + s_str_param_offset);
         fstr->data = wbuf;
         fstr->num = static_cast<int32_t>(wlen);
         fstr->max = static_cast<int32_t>(wlen);
 
-        logger::log_info("FTEXT", "DIAG: FStrRaw set at offset %d: data=%p num=%d max=%d",
-                         s_str_param_offset, fstr->data, fstr->num, fstr->max);
-        logger::log_info("FTEXT", "DIAG: CDO=%p, func=%p, params=%p, about to call ProcessEvent",
-                         s_cdo, s_func, params_buf.data());
-
-        // Call Conv_StringToText via ProcessEvent
-        auto original_pe = pe_hook::get_original();
-        if (original_pe)
+        // Call Conv_StringToText via ProcessEvent (strict game-thread dispatch)
+        if (!invoke_processevent_game_thread_sync(s_cdo, s_func, params_buf.data(), "FTEXT", "Conv_StringToText"))
         {
-            logger::log_info("FTEXT", "DIAG: Using ORIGINAL ProcessEvent (bypass hook) at %p", (void *)original_pe);
-            original_pe(s_cdo, s_func, params_buf.data());
+            logger::log_warn("FTEXT", "Conv_StringToText call failed (game-thread dispatch)");
+            return false;
         }
-        else
-        {
-            logger::log_info("FTEXT", "DIAG: Using HOOKED ProcessEvent at %p", (void *)symbols::ProcessEvent);
-            symbols::ProcessEvent(s_cdo, s_func, params_buf.data());
-        }
-
-        logger::log_info("FTEXT", "DIAG: ProcessEvent RETURNED (no crash), copying FText from offset %d", s_ret_offset);
 
         // Copy the 24-byte FText return value to the output buffer
         std::memcpy(out_ftext, params_buf.data() + s_ret_offset, 24);
-
-        logger::log_info("FTEXT", "DIAG: FText copied to out_ftext=%p, done!", out_ftext);
 
         // DO NOT delete[] wbuf — ProcessEvent may have already freed the FString
         // data via FMemory::Free. Accept a small leak for safety.
@@ -1457,7 +2255,6 @@ namespace lua_uobject
                     return false;
                 }
             }
-            logger::log_info("UOBJ", "Wrote FText '%s' = \"%s\"", prop.name.c_str(), str.c_str());
             return true;
         }
 
@@ -1468,6 +2265,23 @@ namespace lua_uobject
     }
 
     // ═══ ProcessEvent call helper ═══════════════════════════════════════════
+    static bool function_has_return_or_out_params(const rebuilder::RebuiltFunction *rf)
+    {
+        if (!rf)
+            return false;
+
+        if (rf->return_prop != nullptr)
+            return true;
+
+        for (const auto &pi : rf->params)
+        {
+            if ((pi.flags & ue::CPF_OutParm) && !(pi.flags & ue::CPF_ReturnParm))
+                return true;
+        }
+
+        return false;
+    }
+
     static sol::object call_ufunction(sol::state_view lua, ue::UObject *obj,
                                       const std::string &func_name, sol::variadic_args va)
     {
@@ -1509,17 +2323,37 @@ namespace lua_uobject
             return sol::nil;
         }
 
+        if (!lua_ue4ss_globals::is_game_thread())
+        {
+            if (function_has_return_or_out_params(rf))
+            {
+                logger::log_error("CALL", "Refusing off-thread ProcessEvent for %s::%s — function has return/out params and Call() cannot safely deliver them off the game thread. Use a game-thread callback or CallBg for fire-and-forget functions.",
+                                  class_name.c_str(), func_name.c_str());
+                return sol::nil;
+            }
+
+            logger::log_warn("CALL", "Off-thread ProcessEvent attempt for %s::%s — routing through game-thread queue instead of calling ProcessEvent directly",
+                             class_name.c_str(), func_name.c_str());
+            if (!call_ufunction_bg(lua, obj, func_name, va))
+            {
+                logger::log_error("CALL", "Failed to queue off-thread ProcessEvent for %s::%s",
+                                  class_name.c_str(), func_name.c_str());
+            }
+            return sol::nil;
+        }
+
         // Allocate params buffer
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
         if (parms_size == 0)
         {
+            prepare_pe_crash_context("CallNoParams", obj, func, class_name, func_name, nullptr, 0, nullptr);
             // No params — just call (with crash guard)
             // Save FunctionFlags — ProcessEvent modifies them internally;
             // if we crash mid-call via siglongjmp, the flags stay corrupted
             // and ALL subsequent calls to this UFunction will also crash.
             uint32_t saved_flags = ue::ufunc_get_flags(func);
-            g_in_call_ufunction = 1;
-            int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
+            ScopedPeCrashGuard pe_guard;
+            int pe_crash_sig = pe_guard.checkpoint();
             if (pe_crash_sig != 0)
             {
                 // Restore FunctionFlags even on crash — prevents cascade failures
@@ -1527,7 +2361,8 @@ namespace lua_uobject
                 logger::log_error("CALL", "ProcessEvent CRASHED (signal %d) calling %s::%s (no params) "
                                           "— recovered, returning nil",
                                   pe_crash_sig, class_name.c_str(), func_name.c_str());
-                g_in_call_ufunction = 0;
+                log_prepared_pe_crash("CALL", pe_crash_sig, g_call_ufunction_fault_addr);
+                pe_guard.restore();
                 return sol::nil;
             }
             auto pe_fn = pe_hook::get_original();
@@ -1535,7 +2370,7 @@ namespace lua_uobject
                 pe_fn = symbols::ProcessEvent;
             pe_fn(obj, func, nullptr);
             ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_flags);
-            g_in_call_ufunction = 0;
+            pe_guard.restore();
             return sol::nil;
         }
 
@@ -1575,6 +2410,7 @@ namespace lua_uobject
         // Allocate and zero the params buffer
         std::vector<uint8_t> params_buf(parms_size, 0);
         void *params = params_buf.data();
+        std::vector<ParamDiagEntry> diag_param_meta = build_param_diag_entries(rf->params);
 
         // Track FString allocations to clean up after ProcessEvent
         std::vector<char16_t *> fstring_allocs;
@@ -1610,8 +2446,6 @@ namespace lua_uobject
 
             if (!marshaled_range_valid(parms_size, pi, class_name, func_name, "CALL"))
             {
-                for (auto *p : fstring_allocs)
-                    delete[] p;
                 return sol::nil;
             }
 
@@ -1776,7 +2610,7 @@ namespace lua_uobject
                         std::memcpy(param_ptr, src.data, copy_size);
                     }
                 }
-                // Accept Lua table — fill fields via reflection
+                // Accept Lua table — fill fields via safe direct walk (no super chain)
                 else if (arg.get_type() == sol::type::table)
                 {
                     ue::UStruct *inner_struct = nullptr;
@@ -1788,7 +2622,64 @@ namespace lua_uobject
                     }
                     if (inner_struct)
                     {
-                        lua_ustruct::fill_from_table(param_ptr, inner_struct, arg.as<sol::table>());
+                        // Validate inner_struct: PropertiesSize must match param element_size.
+                        int32_t props_size = ue::read_field<int32_t>(
+                            inner_struct, engine_versions::ustruct_layout::PROPERTIES_SIZE);
+                        ue::FField *child_props = ue::read_field<ue::FField *>(
+                            inner_struct, engine_versions::ustruct_layout::CHILD_PROPERTIES);
+
+                        bool size_ok = (props_size == static_cast<int32_t>(pi.element_size));
+                        bool chain_ok = (!child_props || ue::is_mapped_ptr(child_props));
+
+                        // Deeper chain head validation: first FField's ClassPrivate must be mapped
+                        // and its FName must look like a property class (contains "Property").
+                        if (size_ok && chain_ok && child_props)
+                        {
+                            ue::FFieldClass *fc = ue::ffield_get_class(child_props);
+                            if (!fc || !ue::is_mapped_ptr(fc))
+                            {
+                                chain_ok = false;
+                                logger::log_warn("CALL",
+                                    "StructProperty '%s': first FField ClassPrivate=%p invalid — skipping",
+                                    pi.name.c_str(), fc);
+                            }
+                            else
+                            {
+                                int32_t cls_name_idx = ue::read_field<int32_t>(fc, 0x00);
+                                std::string cls_name = reflection::fname_to_string(cls_name_idx);
+                                if (cls_name.find("Property") == std::string::npos)
+                                {
+                                    chain_ok = false;
+                                    logger::log_warn("CALL",
+                                        "StructProperty '%s': first FField class='%s' — not a property class, skipping",
+                                        pi.name.c_str(), cls_name.c_str());
+                                }
+                            }
+                        }
+
+                        if (size_ok && chain_ok)
+                        {
+                            auto own_props = reflection::walk_properties(inner_struct, false);
+                            sol::table tbl = arg.as<sol::table>();
+                            for (const auto &fp : own_props)
+                            {
+                                sol::optional<sol::object> val = tbl[fp.name];
+                                if (val && val->valid() && val->get_type() != sol::type::lua_nil)
+                                {
+                                    // TArray fields in struct params: copying a live TArray.Data
+                                    // pointer causes UE's frame destructor to free game memory.
+                                    if (fp.type == reflection::PropType::ArrayProperty)
+                                        continue;
+                                    lua_ustruct::write_field(param_ptr, fp, *val);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            logger::log_warn("CALL",
+                                "StructProperty '%s': skipped (size_ok=%d chain_ok=%d) — param left zeroed",
+                                pi.name.c_str(), (int)size_ok, (int)chain_ok);
+                        }
                     }
                 }
 
@@ -1818,11 +2709,8 @@ namespace lua_uobject
                 }
                 if (!str.empty())
                 {
-                    logger::log_info("CALL", "DIAG: TextProperty arg='%s', param_ptr=%p, offset in params=%d",
-                                     str.c_str(), param_ptr, (int)(param_ptr - params_buf.data()));
                     if (!ftext_from_string_via_kismet(param_ptr, str))
                     {
-                        logger::log_info("CALL", "DIAG: kismet failed, trying arm64 fallback");
                         // Fallback to arm64 asm
                         if (symbols::FText_FromString && symbols::FText_Ctor)
                         {
@@ -1883,14 +2771,13 @@ namespace lua_uobject
                 if (arg.is<LuaUObject>())
                 {
                     ue::UObject *obj = arg.as<LuaUObject &>().ptr;
-                    if (obj && ue::is_valid_ptr(obj) && pi.element_size >= 40 && symbols::FName_Init)
+                    if (obj && ue::is_valid_ptr(obj) && pi.element_size >= 40)
                     {
                         std::memset(param_ptr, 0, pi.element_size);
 
                         std::string full_path = reflection::get_full_name(obj);
                         if (!full_path.empty())
                         {
-                            // Split at last '.' → package path + asset name
                             size_t dot_pos = full_path.rfind('.');
                             std::string pkg_path, asset_name;
                             if (dot_pos != std::string::npos)
@@ -1904,34 +2791,25 @@ namespace lua_uobject
                                 asset_name = full_path;
                             }
 
-                            ue::FName pkg_fname = {0, 0};
-                            ue::FName asset_fname = {0, 0};
-                            {
-                                std::u16string u16pkg(pkg_path.begin(), pkg_path.end());
-                                symbols::FName_Init(&pkg_fname, u16pkg.c_str(), 0);
-                            }
-                            {
-                                std::u16string u16asset(asset_name.begin(), asset_name.end());
-                                symbols::FName_Init(&asset_fname, u16asset.c_str(), 0);
-                            }
+                            // Safe read-only FNamePool lookup — no allocation, no wrong-offset FName_Init call
+                            ue::FName pkg_fname   = { reflection::fname_string_to_index(pkg_path),   0 };
+                            ue::FName asset_fname = { reflection::fname_string_to_index(asset_name), 0 };
 
-                            // TPersistentObjectPtr layout:
+                            // TSoftObjectPtr layout (40 bytes):
                             //   +0x00: TWeakObjectPtr {ObjectIndex(4), SerialNumber(4)}
                             //   +0x08: FTopLevelAssetPath.PackageName FName (8)
                             //   +0x10: FTopLevelAssetPath.AssetName FName (8)
                             //   +0x18: FString SubPathString (16) — zeroed
-
-                            // Fill TWeakObjectPtr so TSoftObjectPtr::Get() can resolve
                             int32_t obj_index = ue::uobj_get_internal_index(obj);
                             int32_t obj_serial = reflection::get_object_serial_number(obj_index);
                             std::memcpy(param_ptr + 0, &obj_index, 4);
                             std::memcpy(param_ptr + 4, &obj_serial, 4);
-
                             std::memcpy(param_ptr + 8, &pkg_fname, 8);
                             std::memcpy(param_ptr + 16, &asset_fname, 8);
 
-                            logger::log_info("CALL", "Auto-converted UObject* → FSoftObjectPath for '%s': %s",
-                                             pi.name.c_str(), full_path.c_str());
+                            logger::log_info("CALL", "UObject* → FSoftObjectPath for '%s': %s (pkg=%d asset=%d)",
+                                             pi.name.c_str(), full_path.c_str(),
+                                             pkg_fname.ComparisonIndex, asset_fname.ComparisonIndex);
                         }
                     }
                 }
@@ -1943,6 +2821,35 @@ namespace lua_uobject
                         int32_t copy_size = (src.size < pi.element_size) ? src.size : pi.element_size;
                         std::memcpy(param_ptr, src.data, copy_size);
                     }
+                }
+                else if (arg.is<std::string>() && pi.element_size >= 40)
+                {
+                    // Lua string → FSoftObjectPath
+                    // Get() returns "PkgPath.AssetName" for SoftObjectProperty (split at last '.').
+                    // We look up the FName indices via the safe read-only FNamePool cache —
+                    // no FName_Init call, no heap allocation, no potential wrong-function crash.
+                    // FSoftObjectPath layout (40 bytes):
+                    //   +0x00  TWeakObjectPtr  { ObjectIndex(4), SerialNumber(4) }  — zeroed
+                    //   +0x08  FTopLevelAssetPath.PackageName  FName (8)
+                    //   +0x10  FTopLevelAssetPath.AssetName    FName (8)
+                    //   +0x18  FString SubPathString           (16)               — zeroed
+                    std::string path_str = arg.as<std::string>();
+                    std::memset(param_ptr, 0, pi.element_size);
+
+                    size_t dot_pos = path_str.rfind('.');
+                    std::string pkg_path   = (dot_pos != std::string::npos) ? path_str.substr(0, dot_pos) : path_str;
+                    std::string asset_name = (dot_pos != std::string::npos) ? path_str.substr(dot_pos + 1) : path_str;
+
+                    // Safe read-only FNamePool lookup — same cache used by fname_to_string / Get()
+                    int32_t pkg_idx   = reflection::fname_string_to_index(pkg_path);
+                    int32_t asset_idx = reflection::fname_string_to_index(asset_name);
+
+                    std::memcpy(param_ptr + 8,  &pkg_idx,   4);
+                    std::memcpy(param_ptr + 16, &asset_idx, 4);
+                    // FName.Number at +12 and +20 stays 0 from memset (correct for asset paths)
+
+                    logger::log_info("CALL", "String → FSoftObjectPath for '%s': %s (pkg=%d asset=%d)",
+                                     pi.name.c_str(), path_str.c_str(), pkg_idx, asset_idx);
                 }
                 // nil → zeroed (already zero from memset)
                 break;
@@ -1970,10 +2877,23 @@ namespace lua_uobject
         // and ALL subsequent calls to this UFunction will also crash.
         uint32_t saved_func_flags = ue::ufunc_get_flags(func);
 
-        // Save DestructorLink — we null it before ProcessEvent to prevent
-        // DestroyValue from freeing shallow-copied TArray Data pointers
-        // inside struct params (e.g., PFXTableCustomizationArmSkinData).
+        if ((saved_func_flags & ue::FUNC_Native) != 0)
+            (void)has_dangling_object_property_refs("CALL", obj, rc, class_name, func_name);
+        (void)has_dangling_marshaled_object_params("CALL", class_name, func_name,
+                                                   params_buf, parms_size, diag_param_meta);
+
+        // Save DestructorLink — may be nulled for non-native calls that marshal
+        // array params, to prevent DestroyValue from freeing shallow-copied
+        // TArray data pointers inside struct params.
         void *saved_dtor_link = ue::read_field<void *>(func, ue::ustruct::DESTRUCTOR_LINK_OFF());
+        const bool has_array_params = std::any_of(
+            rf->params.begin(), rf->params.end(),
+            [](const reflection::PropertyInfo &p)
+            {
+                return (p.flags & ue::CPF_Parm) &&
+                       !(p.flags & ue::CPF_ReturnParm) &&
+                       (p.type == reflection::PropType::ArrayProperty);
+            });
 
         // GUObjectArray round-trip: skip if object was freed/reallocated since captured.
         // Uses untagged (MTE-excluded) pointer read to detect stale MTE-tagged ptrs.
@@ -1981,23 +2901,24 @@ namespace lua_uobject
         {
             logger::log_warn("CALL", "Skipping %s::%s on %p — not in GUObjectArray (stale/freed)",
                              class_name.c_str(), func_name.c_str(), obj);
-            for (auto *p : fstring_allocs)
-                delete[] p;
             conv_scope.cleanup();
             return sol::nil;
         }
 
+        prepare_pe_crash_context("Call", obj, func, class_name, func_name,
+                                 params_buf.data(), params_buf.size(), &diag_param_meta);
+
         // sigsetjmp crash guard — catches SIGSEGV inside ProcessEvent
-        g_in_call_ufunction = 1;
-        g_call_ufunction_fault_addr = 0;
-        int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
+        ScopedPeCrashGuard pe_guard;
+        int pe_crash_sig = pe_guard.checkpoint();
         if (pe_crash_sig != 0)
         {
             // Restore FunctionFlags — ProcessEvent modifies them internally;
             // if left corrupted all future calls to this UFunction will also crash.
             ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
             // Restore DestructorLink
-            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+            if (has_array_params)
+                ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
             // Log crash details — every occurrence, no suppression, no state tracking
             uintptr_t fault = g_call_ufunction_fault_addr;
             uintptr_t obj_raw = reinterpret_cast<uintptr_t>(obj) & 0x00FFFFFFFFFFFFFFULL;
@@ -2011,9 +2932,8 @@ namespace lua_uobject
             else
                 logger::log_error("CALL", "  FAULT at 0x%lx — dangling sub-object ptr (obj_raw=0x%lx)",
                                   (unsigned long)fault, (unsigned long)obj_raw);
-            g_in_call_ufunction = 0;
-            for (auto *p : fstring_allocs)
-                delete[] p;
+            log_prepared_pe_crash("CALL", pe_crash_sig, fault);
+            pe_guard.restore();
             conv_scope.cleanup();
             return sol::nil;
         }
@@ -2033,7 +2953,7 @@ namespace lua_uobject
         // to silently skip for the game's own calls.
         static constexpr uint32_t FUNC_Native = 0x00000400;
         const bool is_native_func = (saved_func_flags & FUNC_Native) != 0;
-        if (!is_native_func)
+        if (!is_native_func && has_array_params)
         {
             ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
         }
@@ -2057,23 +2977,22 @@ namespace lua_uobject
         pe_fn(obj, func, params);
 
         // Restore DestructorLink only if we nulled it (non-native functions only).
-        if (!is_native_func)
+        if (!is_native_func && has_array_params)
         {
             ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
         }
 
         ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
+        pe_guard.restore();
 
         // Clean up TArray conversion buffers (must happen AFTER PE, BEFORE params_buf dies)
         conv_scope.cleanup();
         // NOTE: crash guard (g_in_call_ufunction) stays ON through return extraction
         // so that crashes in return value reading are also caught by siglongjmp.
 
-        // Clean up FString allocations
-        for (auto *p : fstring_allocs)
-        {
-            delete[] p;
-        }
+        // Intentionally leak temporary FString param buffers.
+        // ProcessEvent may free FString params internally; explicit delete[] here can
+        // double-free or cross allocator boundaries and corrupt heap.
 
         // NOTE: Do NOT call FText_Dtor on FText params after ProcessEvent.
         // ProcessEvent may share/copy the ITextData pointer into the target object.
@@ -2086,13 +3005,6 @@ namespace lua_uobject
 
         // Extract return value (still under crash guard — cleared at exit)
         // RAII guard ensures g_in_call_ufunction is cleared on ALL return paths
-        struct CallGuardCleaner
-        {
-            volatile int &f;
-            ~CallGuardCleaner() { f = 0; }
-        };
-        CallGuardCleaner _call_guard{g_in_call_ufunction};
-
         if (rf->return_prop && rf->return_prop->raw &&
             marshaled_range_valid(parms_size, *rf->return_prop, class_name, func_name, "CALLRET"))
         {
@@ -2398,8 +3310,6 @@ namespace lua_uobject
 
             if (!marshaled_range_valid(parms_size, pi, class_name, func_name, "CALLBG"))
             {
-                for (auto *p : *fstring_allocs)
-                    delete[] p;
                 return false;
             }
 
@@ -2618,6 +3528,13 @@ namespace lua_uobject
             arg_idx++;
         }
 
+        uint32_t func_flags = ue::ufunc_get_flags(func);
+        if ((func_flags & ue::FUNC_Native) != 0)
+            (void)has_dangling_object_property_refs("CALLBG", obj, rc, class_name, func_name);
+        (void)has_dangling_marshaled_object_params("CALLBG", class_name, func_name,
+                                                   *params_buf, parms_size,
+                                                   build_param_diag_entries(rf->params));
+
         // ── Enqueue to game-thread queue (throttled drain) ──
         // Params are in shared_ptr so they survive until game thread processes them.
         // Game-thread queue drain processes max 10 items per PE tick = safe.
@@ -2635,6 +3552,7 @@ namespace lua_uobject
                 (pi.flags & ue::CPF_Parm) && !(pi.flags & ue::CPF_ReturnParm))
                 item.array_param_offsets.push_back(static_cast<size_t>(pi.offset));
         }
+        item.param_meta = build_param_diag_entries(rf->params);
         enqueue_gt_call(std::move(item));
 
         return true;
@@ -2702,12 +3620,28 @@ namespace lua_uobject
         std::memcpy(params_buf->data(), raw_params,
                     std::min(static_cast<size_t>(params_len), alloc_size));
 
+        uint32_t func_flags = ue::ufunc_get_flags(func);
+        std::vector<ParamDiagEntry> diag_meta = build_param_diag_entries(rf->params);
+        if ((func_flags & ue::FUNC_Native) != 0 &&
+            has_dangling_object_property_refs("CALLBG", obj, rc, class_name, func_name))
+        {
+            logger::log_warn("CALLBG", "Continuing %s::%s despite native preflight anomalies (raw bg path)",
+                             class_name.c_str(), func_name.c_str());
+        }
+        if (has_dangling_marshaled_object_params("CALLBG", class_name, func_name,
+                                                 *params_buf, parms_size, diag_meta))
+        {
+            logger::log_warn("CALLBG", "Continuing %s::%s despite marshaled param anomalies (raw bg path)",
+                             class_name.c_str(), func_name.c_str());
+        }
+
         GtCallItem item;
         item.obj = obj;
         item.func = func;
         item.params = params_buf;
         item.class_name = class_name;
         item.func_name = func_name;
+        item.param_meta = std::move(diag_meta);
         enqueue_gt_call(std::move(item));
         return true;
     }
@@ -2758,6 +3692,13 @@ namespace lua_uobject
             return false;
         }
 
+        if (!lua_ue4ss_globals::is_game_thread())
+        {
+            logger::log_warn("CALLRAW", "Off-thread RawCall for %s::%s — routing through game-thread queue instead of calling ProcessEvent directly",
+                             class_name.c_str(), func_name.c_str());
+            return call_ufunction_bg_raw(obj, func_name, raw_params, params_len);
+        }
+
         // Allocate buffer sized to max(ParmsSize, params_len, 32)
         uint16_t parms_size = ue::ufunc_get_parms_size(func);
         size_t alloc_size = std::max({static_cast<size_t>(parms_size),
@@ -2768,23 +3709,41 @@ namespace lua_uobject
         std::memcpy(params_buf.data(), raw_params,
                     std::min(static_cast<size_t>(params_len), alloc_size));
 
-        // Save FunctionFlags — ProcessEvent modifies them internally
+        std::vector<ParamDiagEntry> raw_diag_meta = build_param_diag_entries(rf->params);
         uint32_t saved_func_flags = ue::ufunc_get_flags(func);
+        if ((saved_func_flags & ue::FUNC_Native) != 0 &&
+            has_dangling_object_property_refs("CALLRAW", obj, rc, class_name, func_name))
+        {
+            logger::log_warn("CALLRAW", "Continuing %s::%s despite native preflight anomalies", class_name.c_str(), func_name.c_str());
+        }
+        if (has_dangling_marshaled_object_params("CALLRAW", class_name, func_name,
+                                                 params_buf, parms_size, raw_diag_meta))
+        {
+            logger::log_warn("CALLRAW", "Continuing %s::%s despite marshaled param anomalies", class_name.c_str(), func_name.c_str());
+        }
+
+        // Save FunctionFlags — ProcessEvent modifies them internally
         // Save DestructorLink — null it to prevent DestroyValue on our params
         void *saved_dtor_link = ue::read_field<void *>(func, ue::ustruct::DESTRUCTOR_LINK_OFF());
+        static constexpr uint32_t FUNC_Native_Raw = 0x00000400;
+        const bool is_native_raw = (saved_func_flags & FUNC_Native_Raw) != 0;
 
         // Crash guard — if ProcessEvent crashes, recover instead of killing game
-        g_in_call_ufunction = 1;
-        int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
+        prepare_pe_crash_context("CallRaw", obj, func, class_name, func_name,
+                                 params_buf.data(), params_buf.size(), &raw_diag_meta);
+        ScopedPeCrashGuard pe_guard;
+        int pe_crash_sig = pe_guard.checkpoint();
         if (pe_crash_sig != 0)
         {
             ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
-            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+            if (!is_native_raw)
+                ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
             uintptr_t fault = g_call_ufunction_fault_addr;
             logger::log_error("CALLRAW", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p — recovered, returning false",
                               pe_crash_sig, (unsigned long)fault,
                               class_name.c_str(), func_name.c_str(), obj);
-            g_in_call_ufunction = 0;
+            log_prepared_pe_crash("CALLRAW", pe_crash_sig, fault);
+            pe_guard.restore();
             // No ConvBufScope needed — call_ufunction_bg uses raw params, no Lua conversion
             return false;
         }
@@ -2792,13 +3751,16 @@ namespace lua_uobject
         if (!pe_fn)
             pe_fn = symbols::ProcessEvent;
 
-        // Null DestructorLink to prevent DestroyValue on shallow-copied params
-        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
+        // Match the main Call() behavior: only null DestructorLink for non-native functions.
+        // Mutating shared UFunction destructor metadata for native calls is a race against the game.
+        if (!is_native_raw)
+            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
         pe_fn(obj, func, params_buf.data());
-        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+        if (!is_native_raw)
+            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
         ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
         // No ConvBufScope needed — call_ufunction_bg uses raw params, no Lua conversion
-        g_in_call_ufunction = 0;
+        pe_guard.restore();
         return true;
     }
 

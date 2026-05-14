@@ -723,13 +723,6 @@ namespace reflection
                         // Walk function parameters (properties of the UFunction itself)
                         fi.params = walk_properties(reinterpret_cast<const ue::UStruct *>(func), false);
 
-                        // ALWAYS log for functions with parms_size > 0
-                        if (fi.parms_size > 0)
-                        {
-                            logger::log_info("REFLECT", "UFunc '%s': parms_size=%d num_parms=%d walk_props=%zu",
-                                             fi.name.c_str(), fi.parms_size, fi.num_parms, fi.params.size());
-                        }
-
                         // Diagnostic: if UFunction has params but walk_properties found none,
                         // ChildProperties is likely NULL — try scanning nearby offsets
                         if (fi.params.empty() && fi.num_parms > 0 && fi.parms_size > 0)

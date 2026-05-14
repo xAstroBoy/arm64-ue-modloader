@@ -14,6 +14,7 @@
 #include <deque>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 
 #define LOGCAT_TAG "UEModLoader"
 
@@ -36,6 +37,98 @@ namespace logger
 
     // Boot timestamp
     static std::chrono::steady_clock::time_point s_boot_time;
+    static std::chrono::steady_clock::time_point s_last_file_check;
+
+    static void ensure_parent_dir(const std::string &file_path)
+    {
+        size_t slash = file_path.find_last_of('/');
+        if (slash == std::string::npos)
+            return;
+        std::string dir = file_path.substr(0, slash);
+        if (dir.empty())
+            return;
+
+        struct stat st;
+        if (stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            return;
+
+        mkdir(dir.c_str(), 0755);
+    }
+
+    // Must be called with s_mutex held.
+    static bool open_log_file_locked(bool truncate)
+    {
+        if (s_log_path.empty())
+            return false;
+
+        ensure_parent_dir(s_log_path);
+        const char *mode = truncate ? "w" : "a";
+        s_file = fopen(s_log_path.c_str(), mode);
+        if (!s_file)
+        {
+            int open_errno = errno;
+            __android_log_print(ANDROID_LOG_ERROR, LOGCAT_TAG,
+                                "Failed to open log file: %s (errno=%d)", s_log_path.c_str(), open_errno);
+
+            if (open_errno == EACCES)
+            {
+                if (unlink(s_log_path.c_str()) == 0)
+                {
+                    s_file = fopen(s_log_path.c_str(), mode);
+                    if (s_file)
+                    {
+                        __android_log_print(ANDROID_LOG_WARN, LOGCAT_TAG,
+                                            "Recovered log file by unlink+recreate: %s", s_log_path.c_str());
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    // Must be called with s_mutex held.
+    static void ensure_log_file_open_locked()
+    {
+        if (s_log_path.empty())
+            return;
+
+        // Throttle filesystem checks to avoid per-line syscall overhead.
+        auto now = std::chrono::steady_clock::now();
+        if (s_last_file_check.time_since_epoch().count() != 0)
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_last_file_check).count();
+            if (elapsed < 500 && s_file)
+                return;
+        }
+        s_last_file_check = now;
+
+        bool missing_on_path = (access(s_log_path.c_str(), F_OK) != 0);
+        if (s_file && !missing_on_path)
+            return;
+
+        if (s_file)
+        {
+            fclose(s_file);
+            s_file = nullptr;
+        }
+
+        if (open_log_file_locked(false))
+        {
+            struct timeval tv;
+            gettimeofday(&tv, nullptr);
+            struct tm tm_info;
+            localtime_r(&tv.tv_sec, &tm_info);
+            char date_buf[64];
+            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+            fprintf(s_file, "--- LOG FILE RECREATED %s ---\n", date_buf);
+            fflush(s_file);
+            __android_log_print(ANDROID_LOG_WARN, LOGCAT_TAG,
+                                "Log file was missing and has been recreated: %s", s_log_path.c_str());
+        }
+    }
 
     static void get_timestamp(char *buf, size_t len)
     {
@@ -54,50 +147,14 @@ namespace logger
         std::lock_guard<std::mutex> lock(s_mutex);
         s_log_path = log_path;
         s_boot_time = std::chrono::steady_clock::now();
+        s_last_file_check = std::chrono::steady_clock::time_point{};
         s_error_count = 0;
         s_line_count = 0;
         s_recent_lines.clear();
 
         // Overwrite (truncate) the log on every boot — user requested clean log per session
-        s_file = fopen(log_path.c_str(), "w");
-        if (!s_file)
-        {
-            int open_errno = errno;
-            __android_log_print(ANDROID_LOG_ERROR, LOGCAT_TAG,
-                                "Failed to open log file: %s (errno=%d)", log_path.c_str(), open_errno);
-
-            // Self-heal stale external-storage file ownership after reinstall/UID change.
-            // Example: old file owned by u0_a230, app now runs as u0_a231.
-            // Delete and recreate if possible.
-            if (open_errno == EACCES)
-            {
-                if (unlink(log_path.c_str()) == 0)
-                {
-                    s_file = fopen(log_path.c_str(), "w");
-                    if (s_file)
-                    {
-                        __android_log_print(ANDROID_LOG_WARN, LOGCAT_TAG,
-                                            "Recovered log file by unlink+recreate: %s", log_path.c_str());
-                    }
-                    else
-                    {
-                        __android_log_print(ANDROID_LOG_ERROR, LOGCAT_TAG,
-                                            "Recreate log file failed: %s (errno=%d)", log_path.c_str(), errno);
-                        return;
-                    }
-                }
-                else
-                {
-                    __android_log_print(ANDROID_LOG_ERROR, LOGCAT_TAG,
-                                        "unlink failed for log file: %s (errno=%d)", log_path.c_str(), errno);
-                    return;
-                }
-            }
-            else
-            {
-                return;
-            }
-        }
+        if (!open_log_file_locked(true))
+            return;
 
         // Write session header
         struct timeval tv;
@@ -125,6 +182,8 @@ namespace logger
 
     static void write_line(const char *level, const char *source, const char *msg)
     {
+        ensure_log_file_open_locked();
+
         char ts[32];
         get_timestamp(ts, sizeof(ts));
 
@@ -234,6 +293,7 @@ namespace logger
     void log_raw(const char *text)
     {
         std::lock_guard<std::mutex> lock(s_mutex);
+        ensure_log_file_open_locked();
         if (s_file)
         {
             fprintf(s_file, "%s\n", text);

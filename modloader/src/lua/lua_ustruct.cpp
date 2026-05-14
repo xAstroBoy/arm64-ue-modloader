@@ -1120,4 +1120,10 @@ namespace lua_ustruct
         }
     }
 
+    void write_field(uint8_t *struct_base, const reflection::PropertyInfo &fi,
+                     const sol::object &value)
+    {
+        write_field_value(struct_base, fi, value);
+    }
+
 } // namespace lua_ustruct

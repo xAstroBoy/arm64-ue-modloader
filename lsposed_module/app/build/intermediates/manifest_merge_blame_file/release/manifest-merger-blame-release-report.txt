@@ -1,0 +1,42 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.pfxmodloader.lsposed"
+4    android:versionCode="1"
+5    android:versionName="1.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="29"
+9        android:targetSdkVersion="34" />
+10
+11    <application
+11-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:4:5-22:19
+12        android:allowBackup="false"
+12-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:6:9-36
+13        android:extractNativeLibs="false"
+14        android:label="UE Quest ModLoader (LSPosed)" >
+14-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:5:9-53
+15
+16        <!-- Marks this APK as an Xposed/LSPosed module -->
+17        <meta-data
+17-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:9:9-11:35
+18            android:name="xposedmodule"
+18-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:10:13-40
+19            android:value="true" />
+19-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:11:13-33
+20        <meta-data
+20-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:13:9-15:111
+21            android:name="xposeddescription"
+21-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:14:13-45
+22            android:value="Loads libmodloader.so into RE4 VR and Pinball FX VR — no smali patching required" />
+22-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:15:13-109
+23
+24        <!-- Minimum Xposed API version (82 = Xposed 3.0+, works with LSPosed) -->
+25        <meta-data
+25-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:18:9-20:33
+26            android:name="xposedminversion"
+26-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:19:13-44
+27            android:value="82" />
+27-->C:\Users\xAstroBoy\Desktop\UE4-5 Quest Modloader\lsposed_module\app\src\main\AndroidManifest.xml:20:13-31
+28    </application>
+29
+30</manifest>
