@@ -1420,6 +1420,71 @@ namespace sdk_gen
         for (const auto &c : classes)
             add_struct_names(c.name, c.parent_name, c.properties);
 
+        auto short_name_of = [&](const ue::UObject *obj) -> std::string
+        {
+            if (!obj || !ue::is_valid_ptr(obj))
+                return "";
+            return reflection::get_short_name(obj);
+        };
+
+        // Ensure all names referenced by recursively-written property types are present
+        // BEFORE serializing the names table. If this runs after writing names/enums,
+        // name indices emitted later can exceed names_count and break FModel/CUE4Parse.
+        std::function<void(const ue::FProperty *)> collect_type_names_raw;
+        collect_type_names_raw = [&](const ue::FProperty *raw_prop)
+        {
+            if (!raw_prop || !ue::is_valid_ptr(raw_prop))
+                return;
+
+            reflection::PropType rtype = reflection::classify_property(
+                reinterpret_cast<const ue::FField *>(raw_prop));
+            UsmapPropertyType utype = to_usmap_type(rtype);
+
+            if (utype == UsmapPropertyType::EnumProperty)
+            {
+                ue::UEnum *enum_obj = nullptr;
+                if (rtype == reflection::PropType::EnumProperty)
+                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::ENUM_PROP_ENUM_OFF());
+                else if (rtype == reflection::PropType::ByteProperty)
+                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::BYTE_PROP_ENUM_OFF());
+                add_name(short_name_of(reinterpret_cast<const ue::UObject *>(enum_obj)));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::StructProperty)
+            {
+                ue::UStruct *inner_struct = ue::read_field<ue::UStruct *>(raw_prop, ue::fprop::STRUCT_INNER_STRUCT_OFF());
+                add_name(short_name_of(reinterpret_cast<const ue::UObject *>(inner_struct)));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::ArrayProperty)
+            {
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::ARRAY_INNER_OFF()));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::SetProperty)
+            {
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::SET_ELEMENT_PROP_OFF()));
+                return;
+            }
+
+            if (utype == UsmapPropertyType::MapProperty)
+            {
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_KEY_PROP_OFF()));
+                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_VALUE_PROP_OFF()));
+                return;
+            }
+        };
+
+        for (const auto &s : structs)
+            for (const auto &p : s.properties)
+                collect_type_names_raw(p.raw);
+        for (const auto &c : classes)
+            for (const auto &p : c.properties)
+                collect_type_names_raw(p.raw);
+
         // ── Step 2: Build payload ──
         UsmapWriter payload;
 
@@ -1450,13 +1515,6 @@ namespace sdk_gen
                 return 0;
             auto it = name_to_idx.find(n);
             return (it != name_to_idx.end()) ? it->second : 0;
-        };
-
-        auto short_name_of = [&](const ue::UObject *obj) -> std::string
-        {
-            if (!obj || !ue::is_valid_ptr(obj))
-                return "";
-            return reflection::get_short_name(obj);
         };
 
         // Helper: write a single property type recursively from live FProperty metadata
@@ -1541,62 +1599,6 @@ namespace sdk_gen
 
             // All other types (Bool, Int, Float, etc.): no extra data needed
         };
-
-        // Ensure all names referenced by recursively-written property types are present.
-        std::function<void(const ue::FProperty *)> collect_type_names_raw;
-        collect_type_names_raw = [&](const ue::FProperty *raw_prop)
-        {
-            if (!raw_prop || !ue::is_valid_ptr(raw_prop))
-                return;
-
-            reflection::PropType rtype = reflection::classify_property(
-                reinterpret_cast<const ue::FField *>(raw_prop));
-            UsmapPropertyType utype = to_usmap_type(rtype);
-
-            if (utype == UsmapPropertyType::EnumProperty)
-            {
-                ue::UEnum *enum_obj = nullptr;
-                if (rtype == reflection::PropType::EnumProperty)
-                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::ENUM_PROP_ENUM_OFF());
-                else if (rtype == reflection::PropType::ByteProperty)
-                    enum_obj = ue::read_field<ue::UEnum *>(raw_prop, ue::fprop::BYTE_PROP_ENUM_OFF());
-                add_name(short_name_of(reinterpret_cast<const ue::UObject *>(enum_obj)));
-                return;
-            }
-
-            if (utype == UsmapPropertyType::StructProperty)
-            {
-                ue::UStruct *inner_struct = ue::read_field<ue::UStruct *>(raw_prop, ue::fprop::STRUCT_INNER_STRUCT_OFF());
-                add_name(short_name_of(reinterpret_cast<const ue::UObject *>(inner_struct)));
-                return;
-            }
-
-            if (utype == UsmapPropertyType::ArrayProperty)
-            {
-                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::ARRAY_INNER_OFF()));
-                return;
-            }
-
-            if (utype == UsmapPropertyType::SetProperty)
-            {
-                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::SET_ELEMENT_PROP_OFF()));
-                return;
-            }
-
-            if (utype == UsmapPropertyType::MapProperty)
-            {
-                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_KEY_PROP_OFF()));
-                collect_type_names_raw(ue::read_field<ue::FProperty *>(raw_prop, ue::fprop::MAP_VALUE_PROP_OFF()));
-                return;
-            }
-        };
-
-        for (const auto &s : structs)
-            for (const auto &p : s.properties)
-                collect_type_names_raw(p.raw);
-        for (const auto &c : classes)
-            for (const auto &p : c.properties)
-                collect_type_names_raw(p.raw);
 
         // Structs table: u32 count, then for each struct:
         //   i32 nameIdx, i32 superIdx (-1=none), u16 propCount, u16 serializablePropCount
